@@ -151,10 +151,10 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
-        .run(|app_handle, event| match event {
+        .run(|_app_handle, event| match event {
             #[cfg(target_os = "macos")]
             tauri::RunEvent::Reopen { has_visible_windows: _, .. } => {
-                for window in app_handle.webview_windows().values() {
+                for window in _app_handle.webview_windows().values() {
                     window.show().unwrap();
                     window.set_focus().unwrap();
                 }
