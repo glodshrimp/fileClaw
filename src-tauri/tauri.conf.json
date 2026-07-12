@@ -46,7 +46,8 @@
         "language": ["zh-CN", "en-US"]
       },
       "nsis": {
-        "languages": ["zh-CN", "en-US"]
+        "languages": ["SimpChinese", "English"],
+        "displayLanguageSelector": true
       }
     }
   }
