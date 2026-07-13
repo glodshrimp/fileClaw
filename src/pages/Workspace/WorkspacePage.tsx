@@ -64,9 +64,6 @@ const WorkspacePage: React.FC = () => {
     } else {
       navigate('/projects');
     }
-    return () => {
-      setCurrentProject(null);
-    };
   }, [projectId, state.projects, setCurrentProject, navigate]);
 
   // Bind Ctrl+I / Cmd+I shortcut to switch to AI Agent chat
@@ -124,12 +121,12 @@ const WorkspacePage: React.FC = () => {
   const shortcutText = isMac ? '⌘I' : 'Ctrl+I';
 
   return (
-    <div className="flex h-full w-full bg-[#0f1117] overflow-hidden text-slate-200 select-none">
+    <div className="flex h-full w-full bg-background-primary overflow-hidden text-text-primary select-none">
       {/* Sidebar: File Tree */}
       {!isSidebarCollapsed && (
         <div 
           style={{ width: sidebarWidth }}
-          className="flex-shrink-0 flex flex-col border-r border-white/5 h-full bg-[#0f1117] relative select-none"
+          className="flex-shrink-0 flex flex-col border-r border-border-primary h-full bg-background-primary relative select-none"
         >
           {/* Resize Handle */}
           <div
@@ -137,17 +134,25 @@ const WorkspacePage: React.FC = () => {
             onMouseDown={handleMouseDown}
           />
           {/* Back to project list */}
-          <div className="p-3 border-b border-white/5 bg-slate-950/40 flex items-center justify-between">
-            <button
-              onClick={() => navigate('/projects')}
-              className="flex items-center space-x-1.5 text-xs text-slate-400 hover:text-white transition-colors"
-            >
-              <ArrowLeft className="w-3.5 h-3.5" />
-              <span>返回项目目录</span>
-            </button>
+          <div className="p-3 border-b border-border-primary bg-background-secondary/40 flex items-center justify-between">
+            <div className="flex items-center space-x-2 min-w-0">
+              <button
+                onClick={() => {
+                  setCurrentProject(null);
+                  navigate('/projects');
+                }}
+                className="p-1 rounded text-text-secondary hover:bg-background-secondary/80 hover:text-text-primary transition-colors flex-shrink-0"
+                title="返回项目目录"
+              >
+                <ArrowLeft className="w-3.5 h-3.5" />
+              </button>
+              <span className="text-xs font-bold text-text-primary font-mono truncate" title={currentProject?.name}>
+                {currentProject?.name}
+              </span>
+            </div>
             <button
               onClick={() => setSidebarCollapsed(true)}
-              className="p-1 rounded hover:bg-white/5 text-slate-400 hover:text-white transition-colors"
+              className="p-1 rounded hover:bg-background-secondary/80 text-text-secondary hover:text-text-primary transition-colors flex-shrink-0"
               title="折叠侧边栏"
             >
               <PanelLeftClose className="w-3.5 h-3.5" />
@@ -169,15 +174,15 @@ const WorkspacePage: React.FC = () => {
         </div>
 
         {/* Bottom Breadcrumbs & AI Agent bar matching the screenshot layout */}
-        <div className="h-10 bg-[#0c0d12] border-t border-white/5 px-4 flex items-center justify-between flex-shrink-0 select-none text-[11px] text-slate-400 font-sans">
+        <div className="h-10 bg-background-secondary border-t border-border-primary px-4 flex items-center justify-between flex-shrink-0 select-none text-[11px] text-text-secondary font-sans">
           {/* Left: Path Breadcrumbs */}
           <div className="flex items-center space-x-1.5 overflow-x-auto scrollbar-none py-1 flex-1 pr-4">
             {breadcrumbs.map((seg, idx) => (
               <React.Fragment key={idx}>
-                {idx > 0 && <span className="text-slate-600 font-mono text-[9px] select-none">&gt;</span>}
+                {idx > 0 && <span className="text-text-tertiary font-mono text-[9px] select-none">&gt;</span>}
                 <div 
-                  className={`border border-white/[0.06] bg-[#161a23]/60 rounded-full px-2.5 py-0.5 text-[10px] whitespace-nowrap transition-colors max-w-[150px] truncate ${
-                    idx === breadcrumbs.length - 1 ? 'text-slate-200 font-semibold border-white/10 bg-slate-800/40' : 'text-slate-400 hover:text-slate-200'
+                  className={`border border-border-primary bg-background-primary rounded-full px-2.5 py-0.5 text-[10px] whitespace-nowrap transition-colors max-w-[150px] truncate ${
+                    idx === breadcrumbs.length - 1 ? 'text-text-primary font-semibold border-primary/20 bg-primary-light/10' : 'text-text-secondary hover:text-text-primary'
                   }`}
                   title={seg}
                 >
@@ -192,7 +197,7 @@ const WorkspacePage: React.FC = () => {
             {branchLabel && (
               <button
                 onClick={() => setShowBranchModal(true)}
-                className="flex items-center space-x-1.5 px-3 py-1 bg-slate-900 border border-white/10 hover:border-white/20 rounded-full hover:bg-slate-850 text-slate-300 hover:text-white transition-all duration-150 font-semibold text-[10px] cursor-pointer shadow-lg shadow-black/25 font-mono"
+                className="flex items-center space-x-1.5 px-3 py-1 bg-background-primary border border-border-primary hover:border-text-secondary rounded-full hover:bg-background-tertiary text-text-secondary hover:text-text-primary transition-all duration-150 font-semibold text-[10px] cursor-pointer shadow-lg shadow-black/5 font-mono"
                 title="切换 Git 分支"
               >
                 <GitBranch className="w-3 h-3 text-primary" />
@@ -202,11 +207,11 @@ const WorkspacePage: React.FC = () => {
 
             <button
               onClick={() => navigate('/chat')}
-              className="flex items-center space-x-1.5 px-3 py-1 bg-slate-900 border border-white/10 hover:border-primary/45 rounded-full hover:bg-slate-850 text-slate-300 hover:text-white transition-all duration-150 font-medium text-[10px] cursor-pointer shadow-lg shadow-black/25"
+              className="flex items-center space-x-1.5 px-3 py-1 bg-background-primary border border-border-primary hover:border-primary/45 rounded-full hover:bg-background-tertiary text-text-secondary hover:text-text-primary transition-all duration-150 font-medium text-[10px] cursor-pointer shadow-lg shadow-black/5"
               title="快捷键 打开 AI 助手"
             >
               <span>Open AI agent</span>
-              <span className="px-1.5 py-0.5 bg-slate-800/80 text-slate-500 rounded text-[9px] font-mono border border-white/5 ml-0.5 select-none">{shortcutText}</span>
+              <span className="px-1.5 py-0.5 bg-background-secondary text-text-tertiary rounded text-[9px] font-mono border border-border-primary ml-0.5 select-none">{shortcutText}</span>
             </button>
           </div>
         </div>

@@ -10,6 +10,7 @@ export interface OpenFileTab {
   unsupported?: boolean;
   isTerminal?: boolean;
   isDiff?: boolean;
+  isGitGraph?: boolean;
   diffInfo?: {
     originalContent: string;
     modifiedContent: string;
@@ -61,6 +62,7 @@ interface WorkspaceState {
     originalLabel: string, 
     modifiedLabel: string
   ) => void;
+  openGitGraph: () => void;
   closeOthers: (path: string) => void;
   closeLeft: (path: string) => void;
   closeRight: (path: string) => void;
@@ -71,6 +73,17 @@ interface WorkspaceState {
   runGitAdd: (filePath: string) => Promise<void>;
   runGitRestore: (filePath: string) => Promise<void>;
   runGitInit: () => Promise<void>;
+
+  fileExplorerRefreshKey: number;
+  refreshFileExplorer: () => void;
+
+  copiedFilePath: string | null;
+  setCopiedFilePath: (path: string | null) => void;
+
+  selectedFilePaths: string[];
+  setSelectedFilePaths: (paths: string[]) => void;
+  lastSelectedFilePath: string | null;
+  setLastSelectedFilePath: (path: string | null) => void;
 }
 
 export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
@@ -83,6 +96,14 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   sidebarWidth: 240,
   setSidebarWidth: (width) => set({ sidebarWidth: width }),
 
+  copiedFilePath: null,
+  setCopiedFilePath: (path) => set({ copiedFilePath: path }),
+
+  selectedFilePaths: [],
+  setSelectedFilePaths: (paths) => set({ selectedFilePaths: paths }),
+  lastSelectedFilePath: null,
+  setLastSelectedFilePath: (path) => set({ lastSelectedFilePath: path }),
+
   // Git State Init
   gitBranch: null,
   gitRoots: [],
@@ -90,12 +111,17 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   gitFileStatuses: {},
   gitDirtyFolders: {},
 
+  fileExplorerRefreshKey: 0,
+  refreshFileExplorer: () => set((state) => ({ fileExplorerRefreshKey: (state.fileExplorerRefreshKey || 0) + 1 })),
+
   setCurrentProject: (project) => {
     set({
       currentProject: project,
       openTabs: [],
       activeTabPath: null,
       expandedFolders: project ? { [project.path]: true } : {},
+      selectedFilePaths: [],
+      lastSelectedFilePath: null,
       gitBranch: null,
       gitRoots: [],
       gitRepoBranches: {},
@@ -268,6 +294,30 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       openTabs: [...state.openTabs, newTab],
       activeTabPath: tabId,
       gitBranch: getBranchForPath(path, state.gitRoots, state.gitRepoBranches)
+    }));
+  },
+
+  openGitGraph: () => {
+    const { openTabs } = get();
+    const tabId = 'git-graph';
+    const existingTab = openTabs.find((t) => t.path === tabId);
+    
+    if (existingTab) {
+      set({ activeTabPath: tabId });
+      return;
+    }
+
+    const newTab: OpenFileTab = {
+      path: tabId,
+      name: 'Git Graph',
+      content: '',
+      isDirty: false,
+      isGitGraph: true
+    };
+
+    set((state) => ({
+      openTabs: [...state.openTabs, newTab],
+      activeTabPath: tabId
     }));
   },
 

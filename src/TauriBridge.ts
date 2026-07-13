@@ -86,7 +86,7 @@ let currentAbortController: AbortController | null = null;
 
 // Global API Bridge definition
 const electronAPI: any = {
-  platform: 'darwin', // Mock platform, can use invoke('get_platform') if needed
+  platform: navigator.userAgent.includes('Windows') ? 'win32' : navigator.userAgent.includes('Mac') ? 'darwin' : 'linux',
   minimize: async () => await getCurrentWindow().minimize(),
   maximize: async () => await getCurrentWindow().toggleMaximize(),
   isMaximized: async () => await getCurrentWindow().isMaximized(),
@@ -296,6 +296,8 @@ const electronAPI: any = {
   localCreateNode: (parentPath: string, name: string, isDir: boolean) => invoke('local_create_node', { parentPath, name, isDir }),
   localDeleteNode: (filePath: string) => invoke('local_delete_node', { filePath }),
   localCopyFile: (srcPath: string, destPath: string) => invoke('local_copy_file', { srcPath, destPath }),
+  localWriteFileToClipboard: (path: string) => invoke('local_write_file_to_clipboard', { path }),
+  localReadFileFromClipboard: () => invoke('local_read_file_from_clipboard'),
   readFileBase64: (filePath: string) => invoke('read_file_base64', { filePath }),
   selectDirectory: () => invoke('select_directory'),
   selectFiles: () => invoke('select_files'),
@@ -558,6 +560,7 @@ const electronAPI: any = {
   gitRemotes: (repoPath: string) => invoke('git_remotes', { repoPath }),
   gitSetRemoteUrl: (repoPath: string, name: string, url: string) => invoke('git_set_remote_url', { repoPath, name, url }),
   gitHistory: (repoPath: string, filePath?: string) => invoke('git_history', { repoPath, filePath }),
+  gitLogGraph: (repoPath: string) => invoke('git_log_graph', { repoPath }),
   gitUnpushedCommits: (repoPath: string, remote: string, branch: string) => invoke('git_unpushed_commits', { repoPath, remote, branch }),
   gitCommitFiles: (repoPath: string, hash: string) => invoke('git_commit_files', { repoPath, hash }),
   gitShowFile: (repoPath: string, hash: string, filePath: string) => invoke('git_show_file', { repoPath, hash, filePath }),

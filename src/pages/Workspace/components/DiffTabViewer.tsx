@@ -1,5 +1,6 @@
 import React from 'react';
 import { DiffEditor } from '@monaco-editor/react';
+import { useTheme } from '../../../contexts/ThemeContext';
 
 interface DiffTabViewerProps {
   path: string;
@@ -11,7 +12,8 @@ interface DiffTabViewerProps {
 }
 
 const getLanguage = (fileName: string) => {
-  const ext = fileName.split('.').pop()?.toLowerCase();
+  const cleanName = fileName.replace(/^Diff:\s*/i, '');
+  const ext = cleanName.split('.').pop()?.toLowerCase();
   switch (ext) {
     case 'ts':
     case 'tsx':
@@ -22,11 +24,16 @@ const getLanguage = (fileName: string) => {
     case 'json':
       return 'json';
     case 'html':
+    case 'vue': // Fallback to html for vue files
       return 'html';
     case 'css':
+    case 'scss':
+    case 'less':
       return 'css';
     case 'rs':
       return 'rust';
+    case 'go':
+      return 'go';
     case 'java':
     case 'class':
       return 'java';
@@ -39,6 +46,21 @@ const getLanguage = (fileName: string) => {
     case 'yaml':
     case 'yml':
       return 'yaml';
+    case 'sh':
+    case 'bash':
+    case 'zsh':
+      return 'shell';
+    case 'sql':
+      return 'sql';
+    case 'c':
+    case 'cpp':
+    case 'h':
+    case 'hpp':
+      return 'cpp';
+    case 'ini':
+    case 'conf':
+    case 'toml':
+      return 'ini';
     default:
       return 'plaintext';
   }
@@ -51,21 +73,22 @@ export const DiffTabViewer: React.FC<DiffTabViewerProps> = ({
   originalLabel,
   modifiedLabel,
 }) => {
+  const { theme } = useTheme();
   return (
-    <div className="flex flex-col h-full w-full min-h-0 bg-[#1e1e1e]">
+    <div className="flex flex-col h-full w-full min-h-0 bg-background-primary">
       {/* Visual Header displaying version tags */}
-      <div className="flex border-b border-white/5 bg-[#151b26] text-xs font-mono select-none flex-shrink-0">
-        <div className="w-1/2 p-2 border-r border-white/5 flex items-center justify-between px-4 text-slate-400">
+      <div className="flex border-b border-border-primary bg-background-secondary text-xs font-mono select-none flex-shrink-0">
+        <div className="w-1/2 p-2 border-r border-border-primary flex items-center justify-between px-4 text-text-secondary">
           <span className="font-bold text-rose-400 bg-rose-500/10 border border-rose-500/20 px-2 py-0.5 rounded text-[10px]">
             {originalLabel}
           </span>
-          <span className="truncate max-w-[80%] text-slate-400">{name}</span>
+          <span className="truncate max-w-[80%] text-text-secondary">{name}</span>
         </div>
-        <div className="w-1/2 p-2 flex items-center justify-between px-4 text-slate-400">
+        <div className="w-1/2 p-2 flex items-center justify-between px-4 text-text-secondary">
           <span className="font-bold text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2 py-0.5 rounded text-[10px]">
             {modifiedLabel}
           </span>
-          <span className="truncate max-w-[80%] text-slate-400">{name}</span>
+          <span className="truncate max-w-[80%] text-text-secondary">{name}</span>
         </div>
       </div>
 
@@ -75,9 +98,9 @@ export const DiffTabViewer: React.FC<DiffTabViewerProps> = ({
           original={originalContent}
           modified={modifiedContent}
           language={getLanguage(name)}
-          theme="vs-dark"
+          theme={theme === 'dark' ? 'vs-dark' : 'light'}
           loading={
-            <div className="absolute inset-0 flex items-center justify-center bg-[#1e1e1e] text-xs font-mono text-slate-500">
+            <div className="absolute inset-0 flex items-center justify-center bg-background-primary text-xs font-mono text-text-tertiary">
               Loading diff viewer...
             </div>
           }

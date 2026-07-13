@@ -8,17 +8,21 @@ import {
   MessageSquare,
   PanelLeftClose,
   PanelLeftOpen,
+  Code,
 } from 'lucide-react';
 import { useApp } from '../../contexts/AppContext';
+import { useWorkspaceStore } from '../../contexts/useWorkspaceStore';
 
 const Sidebar: React.FC = () => {
   const { state, dispatch } = useApp();
+  const currentProject = useWorkspaceStore((s) => s.currentProject);
   const isCollapsed = state.sidebarCollapsed;
   const toggleCollapse = () => dispatch({ type: 'SET_SIDEBAR_COLLAPSED', payload: !isCollapsed });
 
 
   const navItems = [
     { to: '/projects', icon: FolderOpen, label: '项目目录' },
+    ...(currentProject ? [{ to: `/workspace/${currentProject.id}`, icon: Code, label: `工作区 (${currentProject.name})` }] : []),
     { to: '/tracking', icon: Activity, label: '项目追踪' },
     { to: '/ssh', icon: Server, label: 'SSH 终端' },
     { to: '/chat', icon: MessageSquare, label: 'AI 助手' },
@@ -51,7 +55,7 @@ const Sidebar: React.FC = () => {
                 }`} />
                 {/* Label — width-animated instead of conditional mount for smooth transition */}
                 <span
-                  className={`font-medium text-[12px] overflow-hidden whitespace-nowrap transition-all duration-300 ${
+                  className={`font-medium text-[12px] overflow-hidden whitespace-nowrap truncate transition-all duration-300 ${
                     isCollapsed ? 'w-0 opacity-0' : 'w-auto opacity-100'
                   }`}
                 >

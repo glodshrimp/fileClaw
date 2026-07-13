@@ -226,6 +226,8 @@ declare global {
       localCreateNode: (parentPath: string, name: string, isDir: boolean) => Promise<{ success: boolean; path: string }>;
       localDeleteNode: (filePath: string) => Promise<{ success: boolean }>;
       localCopyFile: (srcPath: string, destPath: string) => Promise<boolean>;
+      localWriteFileToClipboard: (path: string) => Promise<boolean>;
+      localReadFileFromClipboard: () => Promise<string>;
 
       // Git APIs
       gitInit: (repoPath: string) => Promise<void>;
@@ -248,6 +250,7 @@ declare global {
       gitRemotes: (repoPath: string) => Promise<Array<[string, string]>>;
       gitSetRemoteUrl: (repoPath: string, name: string, url: string) => Promise<void>;
       gitHistory: (repoPath: string, filePath?: string) => Promise<any[]>;
+      gitLogGraph: (repoPath: string) => Promise<any[]>;
       gitUnpushedCommits: (repoPath: string, remote: string, branch: string) => Promise<{ hash: string; author: string; date: string; message: string }[]>;
       gitCommitFiles: (repoPath: string, hash: string) => Promise<{ path: string; status: string }[]>;
       gitShowFile: (repoPath: string, hash: string, filePath: string) => Promise<string>;

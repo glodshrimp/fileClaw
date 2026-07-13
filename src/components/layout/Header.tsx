@@ -1,26 +1,35 @@
 import React, { useState, useEffect } from 'react';
 import { useLocation } from 'react-router-dom';
-import { Bell, HelpCircle, Minus, Square, X, Copy, Activity } from 'lucide-react';
+import { Bell, HelpCircle, Minus, Square, X, Activity } from 'lucide-react';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 
-// Stable platform check — electronAPI is injected synchronously by preload
-const IS_MAC = (window as any).electronAPI?.platform === 'darwin';
+// Stable platform check
+const IS_MAC = navigator.userAgent.includes('Mac');
 
 const Header: React.FC = () => {
   const location = useLocation();
   const [isMaximized, setIsMaximized] = useState(false);
 
   useEffect(() => {
-    const checkMaximized = async () => {
-      if ((window as any).electronAPI?.isMaximized) {
-        const maximized = await (window as any).electronAPI.isMaximized();
-        setIsMaximized(maximized);
+    let checkMaximized = async () => {
+      try {
+        const isMax = await getCurrentWindow().isMaximized();
+        setIsMaximized(isMax);
+      } catch (err) {
+        console.warn('Failed to check maximized state:', err);
       }
     };
 
     checkMaximized();
-    // 简单轮询或者依赖窗口事件，Electron 也可以通过 IPC 发送事件，但这里先简单处理
-    const interval = setInterval(checkMaximized, 1000);
-    return () => clearInterval(interval);
+
+    // Listen to resize events to update the maximize/restore icon dynamically
+    const unlisten = getCurrentWindow().onResized(() => {
+      checkMaximized();
+    });
+
+    return () => {
+      unlisten.then(fn => fn());
+    };
   }, []);
 
   const getPageTitle = () => {
@@ -40,24 +49,41 @@ const Header: React.FC = () => {
     }
   };
 
-  const handleMinimize = () => {
-    (window as any).electronAPI?.minimize();
-  };
-
-  const handleMaximize = async () => {
-    if ((window as any).electronAPI?.maximize) {
-      const maximized = await (window as any).electronAPI.maximize();
-      setIsMaximized(maximized);
+  const handleMinimize = async () => {
+    try {
+      await getCurrentWindow().minimize();
+    } catch (err) {
+      console.error('Failed to minimize window:', err);
     }
   };
 
-  const handleClose = () => {
-    (window as any).electronAPI?.close();
+  const handleMaximize = async () => {
+    try {
+      const win = getCurrentWindow();
+      const isMax = await win.isMaximized();
+      if (isMax) {
+        await win.unmaximize();
+        setIsMaximized(false);
+      } else {
+        await win.maximize();
+        setIsMaximized(true);
+      }
+    } catch (err) {
+      console.error('Failed to toggle maximize:', err);
+    }
+  };
+
+  const handleClose = async () => {
+    try {
+      await getCurrentWindow().close();
+    } catch (err) {
+      console.error('Failed to close window:', err);
+    }
   };
 
   return (
     <header
-      className="h-10 bg-background border-b border-border flex items-center justify-between select-none flex-shrink-0"
+      className="h-10 bg-background border-b border-border flex items-center justify-between select-none flex-shrink-0 relative"
       data-tauri-drag-region="deep"
       style={{ WebkitAppRegion: 'drag' } as any}
     >
@@ -82,7 +108,7 @@ const Header: React.FC = () => {
 
       {/* Right side: utilities + window controls */}
       <div
-        className="flex items-center"
+        className="flex items-center h-full"
         data-tauri-drag-region="false"
         style={{ WebkitAppRegion: 'no-drag' } as any}
       >
@@ -97,28 +123,30 @@ const Header: React.FC = () => {
 
         {/* 窗口控制按钮 - 仅在 Windows/Linux 上显示 */}
         {!IS_MAC && (
-          <div className="flex items-center">
+          <div className="flex items-center h-full">
             <button
               onClick={handleMinimize}
-              className="p-2 hover:bg-background-secondary transition-colors"
+              className="w-[46px] h-full flex items-center justify-center hover:bg-text-primary/5 active:bg-text-primary/10 transition-colors"
               title="最小化"
             >
-              <Minus className="w-4 h-4 text-text-secondary" />
+              <Minus className="w-3.5 h-3.5 text-text-secondary" />
             </button>
             <button
               onClick={handleMaximize}
-              className="p-2 hover:bg-background-secondary transition-colors"
+              className="w-[46px] h-full flex items-center justify-center hover:bg-text-primary/5 active:bg-text-primary/10 transition-colors"
               title={isMaximized ? "还原" : "最大化"}
             >
               {isMaximized ? (
-                <Copy className="w-3.5 h-3.5 text-text-secondary transform rotate-180" />
+                <svg className="w-3.5 h-3.5 text-text-secondary" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
+                  <path d="M3,1 L9,1 L9,7 M1,3 L7,3 L7,9 L1,9 Z" />
+                </svg>
               ) : (
-                <Square className="w-3.5 h-3.5 text-text-secondary" />
+                <Square className="w-3 h-3 text-text-secondary" />
               )}
             </button>
             <button
               onClick={handleClose}
-              className="p-2 hover:bg-red-500 hover:text-white transition-colors group"
+              className="w-[46px] h-full flex items-center justify-center hover:bg-[#e81123] hover:text-white transition-colors group"
               title="关闭"
             >
               <X className="w-4 h-4 text-text-secondary group-hover:text-white" />

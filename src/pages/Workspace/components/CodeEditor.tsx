@@ -6,13 +6,15 @@ import { html } from '@codemirror/lang-html';
 import { css } from '@codemirror/lang-css';
 import { oneDark } from '@codemirror/theme-one-dark';
 import { useWorkspaceStore } from '../../../contexts/useWorkspaceStore';
-import { X, Save, Edit, PanelLeftOpen } from 'lucide-react';
+import { useTheme } from '../../../contexts/ThemeContext';
+import { X, Save, Edit, PanelLeftOpen, GitBranch } from 'lucide-react';
 import { getFileIcon } from '../../../utils/fileIcon';
 import { vue } from '@codemirror/lang-vue';
 import { java } from '@codemirror/lang-java';
 import { rust } from '@codemirror/lang-rust';
 import Terminal from '../../../components/ssh/Terminal';
 import { DiffTabViewer } from './DiffTabViewer';
+import { GitGraphTab } from './git/GitGraphTab';
 
 interface TabContextMenuProps {
   x: number;
@@ -71,6 +73,7 @@ const TabContextMenu: React.FC<TabContextMenuProps> = ({ x, y, items, onClose })
 };
 
 export const CodeEditor: React.FC = () => {
+  const { theme } = useTheme();
   const { 
     openTabs, 
     activeTabPath, 
@@ -188,9 +191,15 @@ export const CodeEditor: React.FC = () => {
   const renderEditorBody = () => {
     if (!activeTab) return null;
 
+    if (activeTab.isGitGraph) {
+      return (
+        <GitGraphTab />
+      );
+    }
+
     if (activeTab.isTerminal) {
       return (
-        <div className="flex-1 h-full bg-[#0f1117] relative flex flex-col min-h-0">
+        <div className="flex-1 h-full bg-background-primary relative flex flex-col min-h-0">
           <Terminal
             sshId={activeTab.path}
             isConnected={true}
@@ -224,22 +233,22 @@ export const CodeEditor: React.FC = () => {
       };
 
       return (
-        <div className="flex-1 h-full bg-[#0f1117] flex flex-col items-center justify-center text-slate-500 font-mono text-xs select-none p-6 text-center">
-          <div className="w-16 h-16 rounded-2xl bg-slate-950/40 border border-white/5 flex items-center justify-center mb-4 shadow-xl">
+        <div className="flex-1 h-full bg-background-primary flex flex-col items-center justify-center text-text-secondary font-mono text-xs select-none p-6 text-center">
+          <div className="w-16 h-16 rounded-2xl bg-background-secondary/40 border border-border-primary flex items-center justify-center mb-4 shadow-xl">
             {getFileIcon(activeTab.name, "w-8 h-8")}
           </div>
-          <h4 className="text-sm font-bold text-slate-300 mb-1.5 truncate max-w-[80%]">{activeTab.name}</h4>
-          <p className="text-[11px] text-slate-400 mb-4 select-all break-all max-w-[90%] font-mono">
+          <h4 className="text-sm font-bold text-text-primary mb-1.5 truncate max-w-[80%]">{activeTab.name}</h4>
+          <p className="text-[11px] text-text-secondary mb-4 select-all break-all max-w-[90%] font-mono">
             {activeTab.path}
           </p>
-          <div className="px-3.5 py-2 bg-slate-950/30 rounded-xl border border-white/5 text-[10px] space-y-1 text-left min-w-[200px]">
+          <div className="px-3.5 py-2 bg-background-secondary/30 rounded-xl border border-border-primary text-[10px] space-y-1 text-left min-w-[200px]">
             <div className="flex justify-between gap-4">
-              <span className="text-slate-500">文件大小:</span>
-              <span className="text-slate-300 font-bold">{formatBytes(activeTab.size || 0)}</span>
+              <span className="text-text-tertiary">文件大小:</span>
+              <span className="text-text-secondary font-bold">{formatBytes(activeTab.size || 0)}</span>
             </div>
             <div className="flex justify-between gap-4">
-              <span className="text-slate-500">文件类型:</span>
-              <span className="text-slate-300 uppercase font-bold">{activeTab.name.split('.').pop() || '未知'}</span>
+              <span className="text-text-tertiary">文件类型:</span>
+              <span className="text-text-secondary uppercase font-bold">{activeTab.name.split('.').pop() || '未知'}</span>
             </div>
           </div>
           <p className="text-[10px] text-red-400 mt-6 bg-red-500/10 px-3 py-1 rounded-full border border-red-500/10">
@@ -255,7 +264,7 @@ export const CodeEditor: React.FC = () => {
 
     if (isPdf) {
       return (
-        <div className="flex-1 overflow-hidden relative min-h-0 h-full w-full bg-[#0f1117]">
+        <div className="flex-1 overflow-hidden relative min-h-0 h-full w-full bg-background-primary">
           <iframe
             src={`data:application/pdf;base64,${activeTab.content}`}
             className="w-full h-full border-none bg-slate-900/10"
@@ -274,11 +283,11 @@ export const CodeEditor: React.FC = () => {
       };
 
       return (
-        <div className="flex-1 overflow-auto relative min-h-0 h-full w-full flex items-center justify-center p-8 bg-slate-950/40">
+        <div className="flex-1 overflow-auto relative min-h-0 h-full w-full flex items-center justify-center p-8 bg-background-secondary/40">
           <img
             src={`data:${getMimeType(activeTab.name)};base64,${activeTab.content}`}
             alt={activeTab.name}
-            className="max-w-full max-h-full object-contain shadow-2xl rounded-lg border border-white/5"
+            className="max-w-full max-h-full object-contain shadow-2xl rounded-lg border border-border-primary"
           />
         </div>
       );
@@ -300,14 +309,14 @@ export const CodeEditor: React.FC = () => {
         <CodeMirror
           value={editorVal}
           height="100%"
-          theme={oneDark}
+          theme={theme === 'dark' ? oneDark : 'light'}
           extensions={getLanguageExtension(activeTab.name)}
           onChange={handleEditorChange}
           style={{
             fontSize: `${localStorage.getItem('editorFontSize') || '14'}px`,
             fontFamily: localStorage.getItem('editorFontFamily') || 'Monaco, "Fira Code", monospace'
           }}
-          className="h-full bg-slate-900/40 focus:outline-none"
+          className="h-full bg-transparent focus:outline-none"
         />
       </div>
     );
@@ -316,14 +325,14 @@ export const CodeEditor: React.FC = () => {
   const showTabList = openTabs.length > 0 || isSidebarCollapsed;
 
   return (
-    <div className="flex-1 h-full bg-[#0f1117] flex flex-col min-w-0 overflow-hidden relative">
+    <div className="flex-1 h-full bg-background-primary flex flex-col min-w-0 overflow-hidden relative">
       {/* File Tab List */}
       {showTabList && (
-        <div className="flex bg-[#0f1117] border-b border-white/5 overflow-x-auto select-none scrollbar-none flex-shrink-0 h-9">
+        <div className="flex bg-background-primary border-b border-border-primary overflow-x-auto select-none scrollbar-none flex-shrink-0 h-9">
           {isSidebarCollapsed && (
             <button
               onClick={() => setSidebarCollapsed(false)}
-              className="px-3 border-r border-white/5 hover:bg-white/5 text-slate-400 hover:text-white transition-all flex items-center justify-center flex-shrink-0"
+              className="px-3 border-r border-border-primary hover:bg-background-secondary/80 text-text-secondary hover:text-text-primary transition-all flex items-center justify-center flex-shrink-0"
               title="展开资源管理器"
             >
               <PanelLeftOpen className="w-4 h-4" />
@@ -334,8 +343,8 @@ export const CodeEditor: React.FC = () => {
             return (
               <div
                 key={tab.path}
-                className={`flex items-center space-x-2 px-4 py-2 border-r border-white/5 cursor-pointer text-xs transition-all relative ${
-                  isActive ? 'bg-slate-900/60 text-white border-t-2 border-t-primary' : 'text-slate-400 hover:text-slate-200 hover:bg-white/5'
+                className={`flex items-center space-x-2 px-4 py-2 border-r border-border-primary cursor-pointer text-xs transition-all relative ${
+                  isActive ? 'bg-background-secondary/60 text-text-primary border-t-2 border-t-primary font-semibold' : 'text-text-secondary hover:text-text-primary hover:bg-background-secondary/80'
                 }`}
                 onClick={() => setActiveTab(tab.path)}
                 onContextMenu={(e) => {
@@ -343,7 +352,13 @@ export const CodeEditor: React.FC = () => {
                   setCtxMenu({ x: e.clientX, y: e.clientY, tabPath: tab.path });
                 }}
               >
-                <span className="flex-shrink-0">{getFileIcon(tab.name, "w-3.5 h-3.5")}</span>
+                <span className="flex-shrink-0">
+                  {tab.isGitGraph ? (
+                    <GitBranch className="w-3.5 h-3.5 text-primary flex-shrink-0" />
+                  ) : (
+                    getFileIcon(tab.name, "w-3.5 h-3.5")
+                  )}
+                </span>
                 <span className="font-mono truncate max-w-[120px]">{tab.name}</span>
                 {tab.isDirty && <span className="w-1.5 h-1.5 rounded-full bg-primary flex-shrink-0" title="未保存" />}
                 <button
@@ -351,7 +366,7 @@ export const CodeEditor: React.FC = () => {
                     e.stopPropagation();
                     closeFile(tab.path);
                   }}
-                  className="p-0.5 rounded hover:bg-white/10 text-slate-500 hover:text-slate-300 transition-colors flex-shrink-0"
+                  className="p-0.5 rounded hover:bg-background-secondary/85 text-text-tertiary hover:text-text-primary transition-colors flex-shrink-0"
                 >
                   <X className="w-3 h-3" />
                 </button>
@@ -365,10 +380,10 @@ export const CodeEditor: React.FC = () => {
       {activeTabPath && activeTab ? (
         renderEditorBody()
       ) : (
-        <div className="flex-1 h-full bg-[#0f1117] flex flex-col items-center justify-center text-slate-500 font-mono text-xs select-none">
-          <Edit className="w-12 h-12 mb-3 text-slate-700/60" />
+        <div className="flex-1 h-full bg-background-primary flex flex-col items-center justify-center text-text-tertiary font-mono text-xs select-none">
+          <Edit className="w-12 h-12 mb-3 text-text-tertiary/60" />
           <p>双击左侧文件开始编写代码</p>
-          <p className="text-[10px] text-slate-600 mt-1">快捷键: 双击文件打开 • Ctrl+S 保存</p>
+          <p className="text-[10px] text-text-tertiary mt-1">快捷键: 双击文件打开 • Ctrl+S 保存</p>
         </div>
       )}
 

@@ -5,6 +5,7 @@ import ProjectSystemsDrawer from '../components/project/ProjectSystemsDrawer';
 import { useApp } from '../contexts/AppContext';
 import { Project } from '../types';
 import DeleteConfirmModal from '../components/DeleteConfirmModal';
+import { useWorkspaceStore } from '../contexts/useWorkspaceStore';
 
 const ProjectsPage: React.FC = () => {
   const navigate = useNavigate();
@@ -50,6 +51,12 @@ const ProjectsPage: React.FC = () => {
       if (editingProject) {
         await window.electronAPI?.updateProject(editingProject.id, projectData);
         dispatch({ type: 'UPDATE_PROJECT', payload: projectData });
+        
+        // Update active workspace if the edited project is the current project
+        const activeProj = useWorkspaceStore.getState().currentProject;
+        if (activeProj && activeProj.id === editingProject.id) {
+          useWorkspaceStore.setState({ currentProject: projectData });
+        }
       } else {
         await window.electronAPI?.addProject(projectData);
         dispatch({ type: 'ADD_PROJECT', payload: projectData });
@@ -86,6 +93,12 @@ const ProjectsPage: React.FC = () => {
       // @ts-ignore
       await window.electronAPI?.deleteProject(deleteTargetId);
       dispatch({ type: 'DELETE_PROJECT', payload: deleteTargetId });
+
+      // Clear workspace if the deleted project is currently active
+      const activeProj = useWorkspaceStore.getState().currentProject;
+      if (activeProj && activeProj.id === deleteTargetId) {
+        useWorkspaceStore.getState().setCurrentProject(null);
+      }
     } catch (error) {
       console.error('Failed to delete project:', error);
     } finally {

@@ -54,6 +54,11 @@ pub fn run() {
 
             // Set window size to 75% of primary monitor resolution
             if let Some(window) = app.get_webview_window("main") {
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = window.set_decorations(false);
+                }
+
                 if let Ok(Some(monitor)) = window.primary_monitor() {
                     let size = monitor.size();
                     let w = (size.width as f64 * 0.75) as u32;
@@ -87,6 +92,8 @@ pub fn run() {
             fs::local_delete_node,
             fs::local_create_node,
             fs::local_copy_file,
+            fs::local_write_file_to_clipboard,
+            fs::local_read_file_from_clipboard,
             fs::read_file_base64,
             fs::select_directory,
             fs::select_files,
@@ -148,6 +155,7 @@ pub fn run() {
             git::git_unpushed_commits,
             git::git_commit_files,
             git::git_show_file,
+            git::git_log_graph,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

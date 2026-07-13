@@ -158,6 +158,110 @@ pub fn local_copy_file(src_path: String, dest_path: String) -> Result<bool, Stri
     Ok(true)
 }
 
+#[tauri::command]
+pub fn local_write_file_to_clipboard(path: String) -> Result<bool, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!("set the clipboard to (POSIX file \"{}\")", path);
+        let output = std::process::Command::new("osascript")
+            .args(&["-e", &script])
+            .output()
+            .map_err(|e| format!("Failed to execute osascript: {}", e))?;
+        
+        if !output.status.success() {
+            let err_msg = String::from_utf8_lossy(&output.stderr).to_string();
+            return Err(format!("AppleScript failed: {}", err_msg));
+        }
+        return Ok(true);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let script = format!("Set-Clipboard -Path \"{}\"", path);
+        let output = std::process::Command::new("powershell")
+            .args(&["-Command", &script])
+            .output()
+            .map_err(|e| format!("Failed to execute powershell: {}", e))?;
+        
+        if !output.status.success() {
+            let err_msg = String::from_utf8_lossy(&output.stderr).to_string();
+            return Err(format!("PowerShell failed: {}", err_msg));
+        }
+        return Ok(true);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let output = std::process::Command::new("sh")
+            .args(&["-c", &format!("echo -n \"{}\" | xclip -selection clipboard", path)])
+            .output()
+            .map_err(|e| e.to_string())?;
+        return Ok(output.status.success());
+    }
+}
+
+#[tauri::command]
+pub fn local_read_file_from_clipboard() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("osascript")
+            .args(&[
+                "-e", "try",
+                "-e", "return POSIX path of (the clipboard as «class furl»)",
+                "-e", "on error",
+                "-e", "try",
+                "-e", "return the clipboard as text",
+                "-e", "on error",
+                "-e", "return \"\"",
+                "-e", "end try",
+                "-e", "end try"
+            ])
+            .output()
+            .map_err(|e| format!("Failed to execute osascript: {}", e))?;
+        
+        let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path_str.is_empty() && std::path::Path::new(&path_str).exists() {
+            return Ok(path_str);
+        }
+        return Ok(String::new());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let output = std::process::Command::new("powershell")
+            .args(&["-Command", "(Get-Clipboard -Format FileDropList).Path"])
+            .output()
+            .map_err(|e| format!("Failed to execute powershell: {}", e))?;
+        
+        let mut path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if path_str.is_empty() {
+            let txt_output = std::process::Command::new("powershell")
+                .args(&["-Command", "Get-Clipboard -Format Text"])
+                .output()
+                .map_err(|e| format!("Failed to execute powershell text fallback: {}", e))?;
+            path_str = String::from_utf8_lossy(&txt_output.stdout).trim().to_string();
+        }
+        
+        if !path_str.is_empty() && std::path::Path::new(&path_str).exists() {
+            return Ok(path_str);
+        }
+        return Ok(String::new());
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let output = std::process::Command::new("sh")
+            .args(&["-c", "xclip -selection clipboard -o"])
+            .output()
+            .map_err(|e| e.to_string())?;
+        let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path_str.is_empty() && std::path::Path::new(&path_str).exists() {
+            return Ok(path_str);
+        }
+        return Ok(String::new());
+    }
+}
+
 fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> std::io::Result<()> {
     std::fs::create_dir_all(&dst)?;
     for entry in std::fs::read_dir(src)? {

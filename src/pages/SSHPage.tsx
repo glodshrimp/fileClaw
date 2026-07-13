@@ -415,13 +415,13 @@ const SSHPage: React.FC = () => {
 
       {/* ── Session tab bar (shows whenever sessions exist) ── */}
       {sessions.length > 0 && (
-        <div className="flex items-center bg-gray-900 border-b border-gray-700/60 overflow-x-auto flex-shrink-0 select-none">
+        <div className="flex items-center bg-background-secondary border-b border-border-primary overflow-x-auto flex-shrink-0 select-none">
           {/* SSH list tab */}
           <button
             onClick={() => setActiveSessionKey(null)}
-            className={`flex items-center space-x-1.5 px-3 py-1 text-[11px] font-medium border-r border-gray-700/60 transition-colors flex-shrink-0 relative h-8 ${!activeSessionKey
-                ? 'text-white bg-gray-800'
-                : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800/60'
+            className={`flex items-center space-x-1.5 px-3 py-1 text-[11px] font-medium border-r border-border-primary transition-colors flex-shrink-0 relative h-8 ${!activeSessionKey
+                ? 'text-text-primary bg-background-primary'
+                : 'text-text-secondary hover:text-text-primary hover:bg-background-primary/80'
               }`}
           >
             {!activeSessionKey && <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-blue-500 rounded-t" />}
@@ -435,9 +435,9 @@ const SSHPage: React.FC = () => {
               key={s.key}
               onClick={() => setActiveSessionKey(s.key)}
               onDoubleClick={() => s.connStatus === 'connected' && handleConnect(s.ssh)}
-              className={`group flex items-center space-x-2 px-3 py-1 text-[11px] font-medium border-r border-gray-700/60 cursor-pointer transition-colors flex-shrink-0 min-w-0 max-w-[180px] relative h-8 ${s.key === activeSessionKey
-                  ? 'text-white bg-gray-800'
-                  : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800/60'
+              className={`group flex items-center space-x-2 px-3 py-1 text-[11px] font-medium border-r border-border-primary cursor-pointer transition-colors flex-shrink-0 min-w-0 max-w-[180px] relative h-8 ${s.key === activeSessionKey
+                  ? 'text-text-primary bg-background-primary'
+                  : 'text-text-secondary hover:text-text-primary hover:bg-background-primary/80'
                 }`}
             >
               {/* Active indicator line */}
@@ -452,7 +452,7 @@ const SSHPage: React.FC = () => {
               {/* Close button */}
               <button
                 onClick={(e) => { e.stopPropagation(); requestClose(s.key); }}
-                className="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-gray-600 text-gray-400 hover:text-white transition-all flex-shrink-0 ml-1"
+                className="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-background-secondary text-text-secondary hover:text-text-primary transition-all flex-shrink-0 ml-1"
               >
                 <X className="w-2.5 h-2.5" />
               </button>
@@ -829,18 +829,18 @@ const SSHPage: React.FC = () => {
             className={`absolute inset-0 flex flex-col transition-opacity ${s.key === activeSessionKey ? 'opacity-100 z-10' : 'opacity-0 z-0 pointer-events-none'
               }`}
           >
-            {/* Session sub-header — seamless continuation of the dark tab bar */}
-            <div className="flex items-center justify-between px-3 py-1 bg-gray-800/95 border-b border-gray-700/60 flex-shrink-0">
+            {/* Session sub-header — seamless continuation of the tab bar */}
+            <div className="flex items-center justify-between px-3 py-1 bg-background-secondary/95 border-b border-border-primary flex-shrink-0">
               <div className="flex items-center space-x-3">
                               {/* Terminal / SFTP switcher */}
-                <div className="flex items-center space-x-0.5 bg-gray-900/60 p-0.5 rounded-lg border border-gray-700/30">
+                <div className="flex items-center space-x-0.5 bg-background-primary/60 p-0.5 rounded-lg border border-border-primary">
                   {/* Terminal button */}
                   <button
                     onClick={() => setSessionTab(s.key, 'terminal')}
                     disabled={s.connStatus !== 'connected' && s.connStatus !== 'reconnecting'}
                     className={`px-2.5 py-1 rounded-md text-[10px] font-medium transition-colors flex items-center space-x-1 disabled:opacity-30 ${s.activeTab === 'terminal'
-                        ? 'bg-gray-700 text-white shadow-sm'
-                        : 'text-gray-400 hover:text-gray-200 hover:bg-gray-700/50'
+                        ? 'bg-background-tertiary text-text-primary shadow-sm'
+                        : 'text-text-secondary hover:text-text-primary hover:bg-background-tertiary/60'
                       }`}
                   >
                     <TerminalIcon className="w-3 h-3" />
@@ -854,8 +854,8 @@ const SSHPage: React.FC = () => {
                         onClick={() => setSessionTab(s.key, 'sftp')}
                         disabled={(s.connStatus !== 'connected' && s.connStatus !== 'reconnecting') || s.localMode}
                         className={`px-2.5 py-1 rounded-md text-[10px] font-medium transition-colors flex items-center space-x-1 disabled:opacity-30 ${s.activeTab === 'sftp'
-                            ? 'bg-gray-700 text-white shadow-sm'
-                            : 'text-gray-400 hover:text-gray-200 hover:bg-gray-700/50'
+                            ? 'bg-background-tertiary text-text-primary shadow-sm'
+                            : 'text-text-secondary hover:text-text-primary hover:bg-background-tertiary/60'
                           }`}
                       >
                         <Folder className="w-3 h-3" />
@@ -903,7 +903,7 @@ const SSHPage: React.FC = () => {
             <div className="flex-1 overflow-hidden relative">
               {/* Connecting / error overlay */}
               {(s.connStatus === 'connecting' || s.connStatus === 'error') && (
-                <div className="absolute inset-0 z-20 bg-[#1a1a2e] flex flex-col items-center justify-center">
+                <div className="absolute inset-0 z-20 bg-background-primary flex flex-col items-center justify-center">
                   {s.connStatus === 'connecting' && (
                     <>
                       <div className="relative flex items-center justify-center mb-8">
@@ -913,14 +913,14 @@ const SSHPage: React.FC = () => {
                           <Server className="w-7 h-7 text-blue-400" />
                         </div>
                       </div>
-                      <p className="text-white text-lg font-semibold mb-1">正在连接</p>
+                      <p className="text-text-primary text-lg font-semibold mb-1">正在连接</p>
                       <p className="text-blue-300 font-mono text-sm mb-6">{s.ssh.username}@{s.ssh.host}:{s.ssh.port}</p>
                       <div className="flex items-center space-x-1.5">
                         {[0, 1, 2].map(i => (
                           <div key={i} className="w-2 h-2 rounded-full bg-blue-500 animate-bounce" style={{ animationDelay: `${i * 0.15}s` }} />
                         ))}
                       </div>
-                      <p className="text-gray-500 text-xs mt-4">建立 SSH 握手中，请稍候</p>
+                      <p className="text-text-tertiary text-xs mt-4">建立 SSH 握手中，请稍候</p>
                     </>
                   )}
                   {s.connStatus === 'error' && (
@@ -928,11 +928,11 @@ const SSHPage: React.FC = () => {
                       <div className="w-16 h-16 rounded-full bg-red-600/20 border border-red-500/40 flex items-center justify-center mb-6">
                         <AlertCircle className="w-8 h-8 text-red-400" />
                       </div>
-                      <p className="text-white text-lg font-semibold mb-2">
+                      <p className="text-text-primary text-lg font-semibold mb-2">
                         {s.connError.includes('Closed') || s.connError.includes('异常断开') ? '连接已断开' : '连接失败'}
                       </p>
                       <p className="text-red-400 text-sm mb-1 font-mono">{s.ssh.username}@{s.ssh.host}:{s.ssh.port}</p>
-                      <p className="text-gray-400 text-xs max-w-xs text-center mt-2 mb-8">{s.connError}</p>
+                      <p className="text-text-secondary text-xs max-w-xs text-center mt-2 mb-8">{s.connError}</p>
                       <div className="flex space-x-3">
                         <button onClick={() => retryConnect(s.key)} className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-medium transition-colors">
                           重新连接
@@ -950,7 +950,7 @@ const SSHPage: React.FC = () => {
                           <Monitor className="w-4 h-4" />
                           <span>本地终端</span>
                         </button>
-                        <button onClick={() => requestClose(s.key)} className="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-gray-200 rounded-lg text-sm font-medium transition-colors">
+                        <button onClick={() => requestClose(s.key)} className="px-4 py-2 bg-background-tertiary hover:bg-background-secondary text-text-primary rounded-lg text-sm font-medium transition-colors">
                           关闭会话
                         </button>
                       </div>
@@ -983,7 +983,7 @@ const SSHPage: React.FC = () => {
                         return (
                           <div
                             key={j.id}
-                            className="flex flex-col gap-1 px-3 py-2 rounded-lg bg-gray-900/90 border border-gray-700/60 backdrop-blur-sm shadow-xl w-60"
+                            className="flex flex-col gap-1 px-3 py-2 rounded-lg bg-card border border-border-primary backdrop-blur-sm shadow-xl w-60"
                             onClick={() => setSessionTab(s.key, 'sftp')}
                             style={{ pointerEvents: 'auto', cursor: 'pointer' }}
                             title="点击切换到 SFTP 查看详情"
@@ -992,13 +992,13 @@ const SSHPage: React.FC = () => {
                               {j.direction === 'upload'
                                 ? <Upload className="w-3 h-3 text-blue-400 flex-shrink-0" />
                                 : <Download className="w-3 h-3 text-green-400 flex-shrink-0" />}
-                              <span className="text-[11px] text-white truncate flex-1">{j.name}</span>
+                              <span className="text-[11px] text-text-primary truncate flex-1">{j.name}</span>
                               {j.progress !== undefined && (
-                                <span className="text-[10px] text-gray-400 flex-shrink-0">{j.progress}%</span>
+                                <span className="text-[10px] text-text-secondary flex-shrink-0">{j.progress}%</span>
                               )}
                             </div>
                             {j.progress !== undefined && (
-                              <div className="w-full bg-gray-700 rounded-full h-0.5 overflow-hidden">
+                              <div className="w-full bg-background-secondary rounded-full h-0.5 overflow-hidden">
                                 <div
                                   className="h-full bg-blue-500 transition-all duration-300 ease-out"
                                   style={{ width: `${j.progress}%` }}
@@ -1008,7 +1008,7 @@ const SSHPage: React.FC = () => {
                             {(j.currentFile || speedLabel) && (
                               <div className="flex items-center justify-between gap-1">
                                 {j.currentFile && (
-                                  <span className="text-[9px] text-gray-500 truncate flex-1">{j.currentFile}</span>
+                                  <span className="text-[9px] text-text-tertiary truncate flex-1">{j.currentFile}</span>
                                 )}
                                 {speedLabel && (
                                   <span className="text-[9px] font-mono text-blue-400/80 flex-shrink-0 bg-blue-500/10 px-1 rounded">

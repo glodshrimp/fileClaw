@@ -505,3 +505,52 @@ pub fn git_show_file(repo_path: String, hash: String, file_path: String) -> Resu
     let ref_spec = format!("{}:{}", revision, file_path);
     run_git_cmd(&repo_path, &["show", &ref_spec])
 }
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct GitGraphCommit {
+    pub hash: String,
+    pub parents: Vec<String>,
+    pub author: String,
+    pub email: String,
+    pub date: String,
+    pub refs: String,
+    pub message: String,
+}
+
+#[tauri::command]
+pub fn git_log_graph(repo_path: String) -> Result<Vec<GitGraphCommit>, String> {
+    let raw = run_git_cmd(&repo_path, &[
+        "log",
+        "--all",
+        "--date-order",
+        "-n", "200",
+        "--pretty=format:%H%x09%P%x09%an%x09%ae%x09%ad%x09%D%x09%s",
+        "--date=short"
+    ])?;
+    
+    let mut list = Vec::new();
+    for line in raw.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() >= 7 {
+            let parents = if parts[1].trim().is_empty() {
+                Vec::new()
+            } else {
+                parts[1].split_whitespace().map(|s| s.to_string()).collect()
+            };
+            
+            let message = parts[6..].join("\t");
+            
+            list.push(GitGraphCommit {
+                hash: parts[0].to_string(),
+                parents,
+                author: parts[2].to_string(),
+                email: parts[3].to_string(),
+                date: parts[4].to_string(),
+                refs: parts[5].to_string(),
+                message,
+            });
+        }
+    }
+    Ok(list)
+}

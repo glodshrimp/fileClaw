@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useWorkspaceStore } from '../../../contexts/useWorkspaceStore';
-import { Folder, FolderOpen, FileText, ChevronRight, ChevronDown, Plus, FileJson, FileCode, FileImage, Search, X } from 'lucide-react';
+import { Folder, FolderOpen, FileText, ChevronRight, ChevronDown, Plus, FileJson, FileCode, FileImage, Search, X, RotateCw } from 'lucide-react';
 import DeleteConfirmModal from '../../../components/DeleteConfirmModal';
 import { copyToClipboard } from '../../../utils/copy';
 import { getFileIcon as getFileIconUtil, getFolderIcon } from '../../../utils/fileIcon';
@@ -99,7 +99,7 @@ const FileExplorerContextMenu: React.FC<ContextMenuProps> = ({ x, y, items, onCl
   return (
     <div
       ref={ref}
-      className={`fixed z-[9999] bg-[#151b26] rounded-xl shadow-2xl border border-white/10 py-1.5 min-w-[180px] select-none transition-opacity duration-75 ${
+      className={`fixed z-[9999] bg-card rounded-xl shadow-2xl border border-border-primary py-1.5 min-w-[180px] select-none transition-opacity duration-75 ${
         isPositioned ? 'opacity-100' : 'opacity-0'
       }`}
       style={{ left: coords.left, top: coords.top }}
@@ -107,7 +107,7 @@ const FileExplorerContextMenu: React.FC<ContextMenuProps> = ({ x, y, items, onCl
     >
       {items.map((it, i) => {
         if (it.divider) {
-          return <div key={i} className="my-1 border-t border-white/5" />;
+          return <div key={i} className="my-1 border-t border-border-primary" />;
         }
 
         const hasChildren = !!it.children?.length;
@@ -142,21 +142,21 @@ const FileExplorerContextMenu: React.FC<ContextMenuProps> = ({ x, y, items, onCl
               }}
               className={`w-full text-left px-4 py-1.5 text-xs transition-colors flex items-center justify-between ${
                 it.disabled
-                  ? 'text-slate-600 cursor-not-allowed opacity-50'
+                  ? 'text-text-tertiary/60 cursor-not-allowed opacity-50'
                   : it.danger
-                    ? 'text-[#f87171] hover:bg-[#ef4444]/10'
-                    : 'text-slate-200 hover:bg-white/5'
+                    ? 'text-rose-500 hover:bg-rose-500/10'
+                    : 'text-text-primary hover:bg-background-secondary/80'
               }`}
             >
               <span>{it.label}</span>
-              {hasChildren && <span className="text-[9px] text-slate-500 font-mono ml-2">▶</span>}
+              {hasChildren && <span className="text-[9px] text-text-tertiary font-mono ml-2">▶</span>}
             </button>
 
             {hasChildren && activeSubmenuIndex === i && (() => {
               const submenuOpenUp = i >= items.length / 2;
               return (
                 <div
-                  className="absolute bg-[#151b26] rounded-xl shadow-2xl border border-white/10 py-1.5 min-w-[180px] z-[10000]"
+                  className="absolute bg-card rounded-xl shadow-2xl border border-border-primary py-1.5 min-w-[180px] z-[10000]"
                   style={{
                     left: submenuOpenLeft ? 'auto' : '98%',
                     right: submenuOpenLeft ? '98%' : 'auto',
@@ -166,7 +166,7 @@ const FileExplorerContextMenu: React.FC<ContextMenuProps> = ({ x, y, items, onCl
                 >
                   {it.children!.map((sub: MenuItem, si: number) =>
                     sub.divider ? (
-                      <div key={si} className="my-1 border-t border-white/5" />
+                      <div key={si} className="my-1 border-t border-border-primary" />
                     ) : (
                       <button
                         key={si}
@@ -179,10 +179,10 @@ const FileExplorerContextMenu: React.FC<ContextMenuProps> = ({ x, y, items, onCl
                         }}
                         className={`w-full text-left px-4 py-1.5 text-xs transition-colors ${
                           sub.disabled
-                            ? 'text-slate-600 cursor-not-allowed opacity-50'
+                            ? 'text-text-tertiary/60 cursor-not-allowed opacity-50'
                             : sub.danger
-                              ? 'text-[#f87171] hover:bg-[#ef4444]/10'
-                              : 'text-slate-200 hover:bg-white/5'
+                              ? 'text-rose-500 hover:bg-rose-500/10'
+                              : 'text-text-primary hover:bg-background-secondary/80'
                         }`}
                       >
                         {sub.label}
@@ -199,6 +199,34 @@ const FileExplorerContextMenu: React.FC<ContextMenuProps> = ({ x, y, items, onCl
   );
 };
 
+const getUniqueDestPath = async (srcPath: string, destDir: string): Promise<string> => {
+  const separator = srcPath.includes('\\') ? '\\' : '/';
+  const fileName = srcPath.substring(Math.max(srcPath.lastIndexOf('/'), srcPath.lastIndexOf('\\')) + 1);
+  
+  // Read target directory files
+  let existingFiles: string[] = [];
+  try {
+    const list = await window.electronAPI.localListDir(destDir);
+    existingFiles = list.map((f: any) => f.name.toLowerCase());
+  } catch (err) {
+    console.error('Failed to list destination directory:', err);
+  }
+
+  const dotIndex = fileName.lastIndexOf('.');
+  const baseName = dotIndex === -1 ? fileName : fileName.substring(0, dotIndex);
+  const ext = dotIndex === -1 ? '' : fileName.substring(dotIndex); // e.g. ".txt"
+
+  let candidateName = fileName;
+  let counter = 0;
+  
+  while (existingFiles.includes(candidateName.toLowerCase())) {
+    counter++;
+    candidateName = counter === 1 ? `${baseName}_copy${ext}` : `${baseName}_copy_${counter}${ext}`;
+  }
+
+  return `${destDir}${separator}${candidateName}`;
+};
+
 const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefreshParent }) => {
   const { 
     expandedFolders, 
@@ -210,7 +238,14 @@ const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefresh
     gitDirtyFolders,
     currentProject,
     gitBranch,
-    gitRoots
+    gitRoots,
+    fileExplorerRefreshKey,
+    copiedFilePath,
+    setCopiedFilePath,
+    selectedFilePaths,
+    setSelectedFilePaths,
+    lastSelectedFilePath,
+    setLastSelectedFilePath
   } = useWorkspaceStore();
   const isExpanded = !!expandedFolders[path];
   const [children, setChildren] = useState<FileEntry[] | null>(null);
@@ -220,6 +255,7 @@ const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefresh
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
   const [activeGitModal, setActiveGitModal] = useState<'commit' | 'branches' | 'remotes' | 'stash' | 'history' | 'rollback' | 'push' | 'pull' | null>(null);
+  const [canPaste, setCanPaste] = useState(false);
 
   const rootPath = currentProject?.codePath || currentProject?.path || '';
   
@@ -292,15 +328,45 @@ const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefresh
     if (isDir && isExpanded) {
       loadChildren();
     }
-  }, [path, isExpanded]);
+  }, [path, isExpanded, fileExplorerRefreshKey]);
 
-  const handleToggle = (e: React.MouseEvent) => {
+  const handleRowClick = (e: React.MouseEvent) => {
     e.stopPropagation();
-    toggleFolder(path);
-  };
 
-  const handleFileClick = () => {
-    if (!isDir) {
+    // 1. Shift-click selection range
+    if (e.shiftKey && lastSelectedFilePath) {
+      const elements = Array.from(document.querySelectorAll('[data-file-path]'));
+      const visiblePaths = elements.map(el => el.getAttribute('data-file-path')).filter(Boolean) as string[];
+      const idxStart = visiblePaths.indexOf(lastSelectedFilePath);
+      const idxEnd = visiblePaths.indexOf(path);
+      
+      if (idxStart !== -1 && idxEnd !== -1) {
+        const min = Math.min(idxStart, idxEnd);
+        const max = Math.max(idxStart, idxEnd);
+        const rangePaths = visiblePaths.slice(min, max + 1);
+        setSelectedFilePaths(rangePaths);
+      }
+      return;
+    }
+
+    // 2. Ctrl/Cmd-click selection toggle
+    if (e.metaKey || e.ctrlKey) {
+      if (selectedFilePaths.includes(path)) {
+        setSelectedFilePaths(selectedFilePaths.filter(p => p !== path));
+      } else {
+        setSelectedFilePaths([...selectedFilePaths, path]);
+      }
+      setLastSelectedFilePath(path);
+      return;
+    }
+
+    // 3. Normal click
+    setSelectedFilePaths([path]);
+    setLastSelectedFilePath(path);
+
+    if (isDir) {
+      toggleFolder(path);
+    } else {
       openFile(path, name);
     }
   };
@@ -327,8 +393,18 @@ const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefresh
 
   const handleConfirmDelete = async () => {
     try {
-      await window.electronAPI.localDeleteNode(path);
+      const targetPaths = selectedFilePaths.includes(path) ? selectedFilePaths : [path];
+      for (const p of targetPaths) {
+        await window.electronAPI.localDeleteNode(p);
+      }
+      
+      // Clear selections
+      setSelectedFilePaths([]);
+      setLastSelectedFilePath(null);
+      
       if (onRefreshParent) onRefreshParent();
+      const { refreshGitStatus } = useWorkspaceStore.getState();
+      await refreshGitStatus();
     } catch (err: any) {
       alert('删除失败: ' + err.message);
     } finally {
@@ -340,7 +416,7 @@ const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefresh
     return getFileIconUtil(fileName);
   };
 
-  const isSelected = activeTabPath === path;
+  const isSelected = selectedFilePaths.includes(path) || (selectedFilePaths.length === 0 && activeTabPath === path);
 
   const buildMenuItems = () => {
     const items: MenuItem[] = [];
@@ -411,18 +487,71 @@ const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefresh
       {
         label: 'Copy Path',
         onClick: (e: React.MouseEvent) => {
-          copyToClipboard(path, e);
+          const targetPaths = selectedFilePaths.includes(path) ? selectedFilePaths : [path];
+          copyToClipboard(targetPaths.join('\n'), e);
         }
       },
       {
         label: 'Copy Relative Path',
         onClick: (e: React.MouseEvent) => {
           const rootPath = currentProject?.codePath || currentProject?.path || '';
-          let relPath = path.substring(rootPath.length);
-          if (relPath.startsWith('/') || relPath.startsWith('\\')) {
-            relPath = relPath.substring(1);
+          const targetPaths = selectedFilePaths.includes(path) ? selectedFilePaths : [path];
+          const relPaths = targetPaths.map(p => {
+            let rel = p.substring(rootPath.length);
+            if (rel.startsWith('/') || rel.startsWith('\\')) {
+              rel = rel.substring(1);
+            }
+            return rel || '.';
+          });
+          copyToClipboard(relPaths.join('\n'), e);
+        }
+      },
+      { divider: true },
+      {
+        label: 'Copy File',
+        onClick: async () => {
+          try {
+            await window.electronAPI.localWriteFileToClipboard(path);
+          } catch (err: any) {
+            console.error('Failed to copy file to system clipboard:', err);
           }
-          copyToClipboard(relPath || '.', e);
+          setCopiedFilePath(path);
+        }
+      },
+      {
+        label: 'Paste',
+        disabled: !canPaste,
+        onClick: async () => {
+          let systemClipboardPath = '';
+          try {
+            systemClipboardPath = await window.electronAPI.localReadFileFromClipboard();
+          } catch (e) {
+            console.warn('Failed to read system clipboard file path:', e);
+          }
+
+          const sourcePath = systemClipboardPath ? systemClipboardPath.trim() : copiedFilePath;
+
+          if (!sourcePath) {
+            alert('剪贴板中无有效的文件复制记录');
+            return;
+          }
+
+          const destDir = isDir ? path : path.substring(0, Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\')));
+
+          try {
+            const finalDestPath = await getUniqueDestPath(sourcePath, destDir);
+            const success = await window.electronAPI.localCopyFile(sourcePath, finalDestPath);
+            if (success) {
+              const { refreshFileExplorer, refreshGitStatus } = useWorkspaceStore.getState();
+              refreshFileExplorer();
+              await refreshGitStatus();
+            } else {
+              alert('粘贴文件失败：复制操作未成功完成');
+            }
+          } catch (err: any) {
+            console.error('Failed to copy and paste file:', err);
+            alert('粘贴文件失败: ' + err.message);
+          }
         }
       },
       { divider: true }
@@ -556,6 +685,13 @@ const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefresh
           onClick: () => {
             setActiveGitModal('history');
           }
+        },
+        {
+          label: 'Show Git Graph',
+          onClick: () => {
+            const { openGitGraph } = useWorkspaceStore.getState();
+            openGitGraph();
+          }
         }
       ] : [
         {
@@ -588,27 +724,43 @@ const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefresh
   return (
     <div className="select-none">
       <div
-        className={`group flex items-center justify-between py-1 px-2 hover:bg-white/5 rounded cursor-pointer transition-colors text-[11px] ${
+        data-file-path={path}
+        className={`group flex items-center justify-between py-1 px-2 hover:bg-background-secondary/85 text-text-primary rounded cursor-pointer transition-colors text-[11px] ${
           isSelected ? 'bg-primary/20 border-l-2 border-primary pl-[6px]' : ''
         }`}
         style={{ paddingLeft: `${depth * 12 + (isSelected ? 6 : 8)}px` }}
-        onClick={isDir ? handleToggle : handleFileClick}
-        onContextMenu={(e) => {
+        onClick={handleRowClick}
+        onContextMenu={async (e) => {
           e.preventDefault();
           e.stopPropagation();
+          
+          if (!selectedFilePaths.includes(path)) {
+            setSelectedFilePaths([path]);
+            setLastSelectedFilePath(path);
+          }
+
+          let systemClipboardPath = '';
+          try {
+            systemClipboardPath = await window.electronAPI.localReadFileFromClipboard();
+          } catch (err) {
+            console.warn('Failed to read system clipboard file path:', err);
+          }
+
+          setCanPaste(!!(systemClipboardPath || copiedFilePath));
+          
           setCtxMenu({ x: e.clientX, y: e.clientY });
         }}
       >
         <div className="flex items-center space-x-1.5 min-w-0 flex-1">
           {isDir ? (
             <>
-              {isExpanded ? <ChevronDown className="w-3 h-3 text-slate-500" /> : <ChevronRight className="w-3 h-3 text-slate-500" />}
+              {isExpanded ? <ChevronDown className="w-3 h-3 text-text-tertiary" /> : <ChevronRight className="w-3 h-3 text-text-tertiary" />}
               {getFolderIcon(name, isExpanded)}
             </>
           ) : (
             getFileIcon(name)
           )}
-          <span className={`truncate ${statusColorClass || (isSelected ? 'text-primary font-medium' : 'text-slate-300 group-hover:text-white')}`}>
+          <span className={`truncate ${statusColorClass || (isSelected ? 'text-primary font-medium' : 'text-text-secondary group-hover:text-text-primary')}`}>
             {name}
           </span>
         </div>
@@ -619,14 +771,14 @@ const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefresh
             <>
               <button
                 onClick={(e) => { e.stopPropagation(); setIsCreating('file'); }}
-                className="p-0.5 hover-gradient-primary rounded text-slate-400"
+                className="p-0.5 hover:bg-background-secondary rounded text-text-tertiary hover:text-text-primary"
                 title="新建文件"
               >
                 <Plus className="w-3 h-3" />
               </button>
               <button
                 onClick={(e) => { e.stopPropagation(); setIsCreating('folder'); }}
-                className="p-0.5 hover-gradient-primary rounded text-slate-400"
+                className="p-0.5 hover:bg-background-secondary rounded text-text-tertiary hover:text-text-primary"
                 title="新建文件夹"
               >
                 <Folder className="w-3 h-3" />
@@ -676,8 +828,8 @@ const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefresh
         isOpen={isDeleteModalOpen}
         onConfirm={handleConfirmDelete}
         onCancel={() => setIsDeleteModalOpen(false)}
-        title={`确定要删除 ${name} 吗？`}
-        description={isDir ? "删除该目录将同时递归删除其包含的全部子目录与文件，此操作不可恢复。" : "此文件将被从本地硬盘中彻底删除，且无法恢复。"}
+        title={selectedFilePaths.includes(path) && selectedFilePaths.length > 1 ? `确定要删除这 ${selectedFilePaths.length} 个选中的项目吗？` : `确定要删除 ${name} 吗？`}
+        description={isDir || (selectedFilePaths.includes(path) && selectedFilePaths.length > 1) ? "选中项目将同时递归删除其包含的全部子目录与文件，此操作不可恢复。" : "此文件将被从本地硬盘中彻底删除，且无法恢复。"}
       />
 
       {ctxMenu && (
@@ -828,9 +980,9 @@ export const FileExplorer: React.FC = () => {
   const rootPath = currentProject.codePath || currentProject.path;
 
   return (
-    <div className="flex flex-col h-full bg-[#0f1117] border-r border-white/5 select-none w-full">
-      <div className="p-3 border-b border-white/5 flex items-center justify-between flex-shrink-0 bg-slate-950/20">
-        <h3 className="text-xs font-bold text-white uppercase tracking-wider font-mono">资源管理器</h3>
+    <div className="flex flex-col h-full bg-background-primary border-r border-border-primary select-none w-full">
+      <div className="p-3 border-b border-border-primary flex items-center justify-between flex-shrink-0 bg-background-secondary/20">
+        <h3 className="text-xs font-bold text-text-primary uppercase tracking-wider font-mono">资源管理器</h3>
         <div className="flex items-center space-x-1.5">
           <button
             onClick={async () => {
@@ -846,7 +998,7 @@ export const FileExplorer: React.FC = () => {
                 console.error('Failed to change code directory:', err);
               }
             }}
-            className="p-1 rounded text-slate-400 hover:bg-white/5 hover:text-white transition-colors"
+            className="p-1 rounded text-text-secondary hover:bg-background-secondary/80 hover:text-text-primary transition-colors"
             title={`开发代码路径: ${rootPath}`}
           >
             <Settings className="w-3.5 h-3.5" />
@@ -858,34 +1010,48 @@ export const FileExplorer: React.FC = () => {
               if (showSearch) setSearchQuery('');
             }}
             className={`p-1 rounded transition-colors ${
-              showSearch ? 'bg-primary/20 text-primary' : 'text-slate-400 hover:bg-white/5 hover:text-white'
+              showSearch ? 'bg-primary/20 text-primary' : 'text-text-secondary hover:bg-background-secondary/80 hover:text-text-primary'
             }`}
             title="搜索文件"
           >
             <Search className="w-3.5 h-3.5" />
           </button>
-          <span className="text-[10px] font-mono text-slate-500 max-w-[80px] truncate" title={currentProject.name}>
-            {currentProject.name}
-          </span>
+
+          <button
+            onClick={async (e) => {
+              const icon = e.currentTarget.querySelector('svg');
+              if (icon) {
+                icon.classList.add('animate-spin');
+                setTimeout(() => icon.classList.remove('animate-spin'), 600);
+              }
+              const { refreshFileExplorer, refreshGitStatus } = useWorkspaceStore.getState();
+              refreshFileExplorer();
+              await refreshGitStatus();
+            }}
+            className="p-1 rounded text-text-secondary hover:bg-background-secondary/80 hover:text-text-primary transition-colors duration-200"
+            title="刷新目录"
+          >
+            <RotateCw className="w-3.5 h-3.5" />
+          </button>
         </div>
       </div>
 
       {showSearch && (
-        <div className="p-2 border-b border-white/5 bg-slate-950/40 flex-shrink-0">
+        <div className="p-2 border-b border-border-primary bg-background-secondary/40 flex-shrink-0">
           <div className="relative">
             <input
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               placeholder="搜索项目文件..."
-              className="w-full bg-slate-900 border border-white/10 focus:border-primary/50 text-xs text-white rounded px-2.5 py-1.5 pl-7 focus:outline-none placeholder-slate-500 font-mono transition-all"
+              className="w-full bg-background-primary border border-border-primary focus:border-primary/50 text-xs text-text-primary rounded px-2.5 py-1.5 pl-7 focus:outline-none placeholder-text-tertiary font-mono transition-all"
               autoFocus
             />
-            <Search className="w-3.5 h-3.5 text-slate-500 absolute left-2.5 top-2.5" />
+            <Search className="w-3.5 h-3.5 text-text-tertiary absolute left-2.5 top-2.5" />
             {searchQuery && (
               <button 
                 onClick={() => setSearchQuery('')}
-                className="absolute right-2.5 top-2.5 text-slate-500 hover:text-slate-300"
+                className="absolute right-2.5 top-2.5 text-text-tertiary hover:text-text-primary"
               >
                 <X className="w-3 h-3" />
               </button>
@@ -897,11 +1063,11 @@ export const FileExplorer: React.FC = () => {
       <div className="flex-1 overflow-y-auto p-1.5 scrollbar-thin">
         {showSearch && searchQuery.trim() ? (
           searching ? (
-            <div className="p-4 text-center text-slate-500 text-xs font-mono">
+            <div className="p-4 text-center text-text-tertiary text-xs font-mono">
               正在搜索中...
             </div>
           ) : searchResults.length === 0 ? (
-            <div className="p-4 text-center text-slate-500 text-xs font-mono">
+            <div className="p-4 text-center text-text-tertiary text-xs font-mono">
               未找到匹配文件
             </div>
           ) : (
@@ -914,17 +1080,17 @@ export const FileExplorer: React.FC = () => {
                       openFile(item.path, item.name);
                     }
                   }}
-                  className="flex items-center space-x-2 px-2 py-1.5 rounded hover:bg-white/5 cursor-pointer transition-colors text-xs text-slate-300 hover:text-white"
+                  className="flex items-center space-x-2 px-2 py-1.5 rounded hover:bg-background-secondary cursor-pointer transition-colors text-xs text-text-secondary hover:text-text-primary"
                 >
                   {item.isDir ? (
-                    <Folder className="w-3.5 h-3.5 text-blue-400 flex-shrink-0" />
+                    <Folder className="w-3.5 h-3.5 text-primary flex-shrink-0" />
                   ) : (
                     getFileIconUtil(item.name)
                   )}
                   
                   <div className="flex flex-col min-w-0 flex-1">
                     <span className="font-mono truncate">{item.name}</span>
-                    <span className="text-[9px] text-slate-500 truncate font-mono select-all">
+                    <span className="text-[9px] text-text-tertiary truncate font-mono select-all">
                       {item.path.substring(rootPath.length + 1) || item.path}
                     </span>
                   </div>
