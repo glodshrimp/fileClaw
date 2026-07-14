@@ -4,6 +4,7 @@ import { Activity, Wifi, Clock, Cpu } from 'lucide-react';
 import { useApp } from '../../contexts/AppContext';
 import { TransferJob } from '../../types';
 import StatusFooter from '../ssh/StatusFooter';
+import packageJson from '../../../package.json';
 
 /**
  * Global application footer — always visible at the bottom of the window.
@@ -100,7 +101,7 @@ const Footer: React.FC = () => {
           <div className="flex-1" />
 
           {/* Version */}
-          <span className="text-text-tertiary/50 hidden sm:inline">v1.0.0</span>
+          <span className="text-text-tertiary/50 hidden sm:inline">v{packageJson.version}</span>
 
           <span className="w-px h-3 bg-border hidden sm:block" />
 

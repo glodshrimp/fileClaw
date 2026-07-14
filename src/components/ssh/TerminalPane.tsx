@@ -163,6 +163,7 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
   const [copiedToast, setCopiedToast] = useState(false);
   const toastTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+
   const showCopiedToast = useCallback(() => {
     setCopiedToast(true);
     if (toastTimeoutRef.current) clearTimeout(toastTimeoutRef.current);
@@ -247,10 +248,6 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
       };
     }
 
-    if (isDefaultShell) {
-      shellReadyRef.current = true;
-      return;
-    }
     let cancelled = false;
     (async () => {
       try {
@@ -265,7 +262,7 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
       // Close the shell when pane unmounts
       window.electronAPI.sshCloseShell(sshId, shellId);
     };
-  }, [sshId, shellId, isDefaultShell, isLocal, cwd]);
+  }, [sshId, shellId, isLocal, cwd]);
 
   // ── Initialize xterm ────────────────────────────────────────────────────────
 
@@ -408,7 +405,9 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
     if (isLocal) {
       // Local PTY mode — listen on pty-output channel
       removeOutputListener = window.electronAPI.onPtyOutput(shellId, (outputData: string) => {
-        if (typeof outputData === 'string') term.write(outputData);
+        if (typeof outputData === 'string') {
+          term.write(outputData);
+        }
       });
       // Listen for PTY exit to show a message
       removePtyExitListener = window.electronAPI.onPtyExit(shellId, (code: number) => {
@@ -418,7 +417,9 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
       // SSH mode — for default shell, listen on sshId; for extra shells, listen on shellId
       const outputChannel = isDefaultShell ? sshId : shellId;
       removeOutputListener = window.electronAPI.onSshOutput(outputChannel, (outputData: string) => {
-        if (typeof outputData === 'string') term.write(outputData);
+        if (typeof outputData === 'string') {
+          term.write(outputData);
+        }
       });
     }
 
@@ -603,6 +604,7 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
     >
       {/* Contextual control buttons */}
       <div className="absolute top-1.5 right-1.5 z-30 flex items-center space-x-1">
+
         {!isMaximized && onToggleMaximize && showCloseBtn && (
           <button
             onClick={(e) => { e.stopPropagation(); onToggleMaximize(); }}

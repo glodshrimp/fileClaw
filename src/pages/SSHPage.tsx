@@ -97,6 +97,7 @@ const SSHPage: React.FC = () => {
         type: 'UPDATE_SSH_SESSION',
         payload: { ...s, connStatus: 'error', connError: '连接异常断开，后台已尝试3次自动重连均失败，请检查网络后手动重试。' }
       });
+      window.electronAPI.emitSshOutput(key, `\r\n\x1b[31m[系统提示: 已尝试3次自动重连均失败，停止重连。请检查网络后手动重试。]\x1b[0m\r\n`);
       dispatch({ type: 'ABORT_SESSION_TRANSFER_JOBS', payload: { sshId: key } });
       delete reconnectAttemptsRef.current[key];
       return;
@@ -106,6 +107,7 @@ const SSHPage: React.FC = () => {
     reconnectAttemptsRef.current[key] = nextAttempt;
 
     console.log(`[SSH Auto-reconnect] Attempting auto-reconnect #${nextAttempt} for session ${key} in 5 seconds...`);
+    window.electronAPI.emitSshOutput(key, `\r\n\x1b[33m[系统提示: 正在进行第 ${nextAttempt} 次自动重连...]\x1b[0m\r\n`);
 
     dispatch({
       type: 'UPDATE_SSH_SESSION',
@@ -133,6 +135,7 @@ const SSHPage: React.FC = () => {
         .then(async (res) => {
           if (res.success) {
             console.log(`[SSH Auto-reconnect] Session ${key} successfully reconnected!`);
+            window.electronAPI.emitSshOutput(key, `\r\n\x1b[32m[系统提示: SSH 连接第 ${nextAttempt} 次重连成功!]\x1b[0m\r\n`);
             delete reconnectAttemptsRef.current[key];
 
             dispatch({
@@ -155,11 +158,13 @@ const SSHPage: React.FC = () => {
             }
           } else {
             console.log(`[SSH Auto-reconnect] Session ${key} reconnect attempt #${nextAttempt} failed: ${res.error}`);
+            window.electronAPI.emitSshOutput(key, `\r\n\x1b[31m[系统提示: 第 ${nextAttempt} 次重连失败: ${res.error || '未知原因'}]\x1b[0m\r\n`);
             autoSilentReconnect(key);
           }
         })
         .catch((err: any) => {
           console.error(`[SSH Auto-reconnect] Session ${key} reconnect attempt #${nextAttempt} caught error:`, err);
+          window.electronAPI.emitSshOutput(key, `\r\n\x1b[31m[系统提示: 第 ${nextAttempt} 次重连异常: ${err?.message || err || '未知异常'}]\x1b[0m\r\n`);
           autoSilentReconnect(key);
         });
     }, 5000);

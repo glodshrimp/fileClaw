@@ -262,6 +262,7 @@ declare global {
       onSshError: (id: string, callback: (error: string) => void) => () => void;
       onSshClosed: (id: string, callback: () => void) => () => void;
       onSftpProgress?: (callback: (data: { jid: string; file: string; transferred: number; total: number }) => void) => () => void;
+      emitSshOutput: (id: string, data: string) => Promise<void>;
 
       // 本地终端 (PTY)
       ptySpawn: (id: string, cwd?: string) => Promise<{success: boolean, shell?: string, error?: string}>;

@@ -925,7 +925,8 @@ const SftpBrowser: React.FC<SftpBrowserProps> = ({ sshId }) => {
       const h = await window.electronAPI.localHomeDir();
       setHomeDir(h);
       const cachedLocal = pathCache[sshId]?.local;
-      loadLocal(cachedLocal || h);
+      const defaultDir = localJoin(h, 'Documents');
+      loadLocal(cachedLocal || defaultDir);
     })();
     
     const cachedRemote = pathCache[sshId]?.remote;
@@ -1081,6 +1082,8 @@ const SftpBrowser: React.FC<SftpBrowserProps> = ({ sshId }) => {
     }
 
     const payload = dragRef.current;
+    dragRef.current = null; // Reset immediately to prevent double-processing from Tauri's window event
+    
     window.electronAPI.printFrontendLog?.(`[React Drop] dragRef payload: ${payload ? JSON.stringify({ side: payload.side, name: payload.item.name }) : 'null'}`);
     if (!payload || payload.side === targetSide) return;
 
@@ -1098,8 +1101,6 @@ const SftpBrowser: React.FC<SftpBrowserProps> = ({ sshId }) => {
         loadLocal(targetPath);
       } catch (err: any) { finishJob(jid, err.message || String(err)); }
     }
-
-    dragRef.current = null;
   };
 
   // ── Modal helpers ──

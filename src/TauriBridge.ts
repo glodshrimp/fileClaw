@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
+import { listen, emit } from '@tauri-apps/api/event';
 import { Low } from 'lowdb';
 import { TauriLowdbAdapter } from './db/TauriLowdbAdapter';
 import { createOpenAI } from '@ai-sdk/openai';
@@ -345,9 +345,6 @@ const electronAPI: any = {
       password: options.password || null,
       keyPath: options.keyPath || null,
     });
-    if (res && res.success) {
-      await invoke('ssh_open_shell', { id, shellId: id });
-    }
     return res;
   },
   sshDisconnect: (id: string) => invoke('ssh_disconnect', { id }),
@@ -385,6 +382,7 @@ const electronAPI: any = {
       }).catch(console.error);
     };
   },
+  emitSshOutput: (id: string, data: string) => emit(`ssh-output-${id}`, data),
   onSshClosed: (id: string, callback: () => void) => {
     let active = true;
     const unlistenPromise = listen(`ssh-closed-${id}`, () => {

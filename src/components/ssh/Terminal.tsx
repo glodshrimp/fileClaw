@@ -415,6 +415,9 @@ const Terminal: React.FC<TerminalProps> = ({ sshId, isConnected, mode = 'ssh', c
     }, 100);
   }, []);
 
+  // ── Refit when toolbar visibility changes (h-0 ↔ h-6 transition) ──────────
+  // (No longer needed — toolbar is now absolutely positioned and doesn't affect layout)
+
   // ── Render tree recursively ─────────────────────────────────────────────────
 
   const renderNode = useCallback(
@@ -533,14 +536,14 @@ const Terminal: React.FC<TerminalProps> = ({ sshId, isConnected, mode = 'ssh', c
       onMouseEnter={() => totalPanes === 1 && setShowToolbar(true)}
       onMouseLeave={() => setShowToolbar(false)}
     >
-      {/* ── Split toolbar ── */}
+      {/* ── Split toolbar (floating overlay) ── */}
       <div
-        className={`flex items-center px-1.5 py-0 gap-0.5 border-b flex-shrink-0 transition-all duration-200 ${
+        className={`absolute top-0 left-0 right-0 z-20 flex items-center px-1.5 py-0 gap-0.5 border-b backdrop-blur-md transition-all duration-200 ${
           totalPanes > 1 || showToolbar
             ? 'opacity-100 h-6 border-white/[0.06]'
             : 'opacity-0 h-0 border-transparent overflow-hidden pointer-events-none'
         }`}
-        style={{ background: 'rgba(15, 17, 23, 0.95)' }}
+        style={{ background: 'rgba(15, 17, 23, 0.85)' }}
         onMouseEnter={() => setShowToolbar(true)}
       >
         {/* Split buttons */}
