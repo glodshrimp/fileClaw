@@ -975,7 +975,11 @@ const SftpBrowser: React.FC<SftpBrowserProps> = ({ sshId }) => {
           // The event.payload.position from Tauri is already in logical coordinates
           // on macOS (and potentially other platforms depending on Tauri version),
           // so dividing by devicePixelRatio causes incorrect element resolution.
-          const el = document.elementFromPoint(pos.x, pos.y);
+          // On Windows, the position is in physical pixels, so we MUST divide by devicePixelRatio
+          // to get the correct logical coordinates for document.elementFromPoint.
+          const isWindows = navigator.userAgent.toLowerCase().includes('win');
+          const dpr = isWindows ? (window.devicePixelRatio || 1) : 1;
+          const el = document.elementFromPoint(pos.x / dpr, pos.y / dpr);
           if (!el) return null;
           
           const paneLocal = el.closest('[data-pane-side="local"]');
