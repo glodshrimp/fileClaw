@@ -805,7 +805,7 @@ pub async fn sftp_upload(
         }
         
         // Perform copy loop in blocking fashion (Tauri commands can block if spawned on pool)
-        let mut buffer = [0u8; 131072]; // Optimized 128KB buffer chunks
+        let mut buffer = vec![0u8; 1048576].into_boxed_slice(); // Optimized 1MB heap-allocated buffer
         let mut transferred = 0;
         
         #[derive(Serialize, Clone)]
@@ -904,7 +904,7 @@ pub async fn sftp_download(
             cancel_lock.remove(&jid);
         }
         
-        let mut buffer = [0u8; 131072]; // Optimized 128KB buffer chunks
+        let mut buffer = vec![0u8; 1048576].into_boxed_slice(); // Optimized 1MB heap-allocated buffer
         let mut transferred = 0;
         
         #[derive(Serialize, Clone)]
