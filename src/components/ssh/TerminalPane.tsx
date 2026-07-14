@@ -227,7 +227,7 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
 
   // ── Open shell (non-default panes) or spawn local PTY ───────────────────────
 
-  useEffect(() => {
+   useEffect(() => {
     if (isLocal) {
       // Local mode: spawn PTY process
       let cancelled = false;
@@ -237,7 +237,13 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
           if (res && !res.success) {
             console.error(`[TerminalPane] Failed to spawn local PTY:`, res.error);
           }
-          if (!cancelled) shellReadyRef.current = true;
+          if (!cancelled) {
+            shellReadyRef.current = true;
+            // Force-sync terminal dimensions now that the PTY is ready.
+            // The earlier setTimeout(100ms) resize likely fired before spawn completed.
+            lastSizeRef.current = { cols: 0, rows: 0 };
+            handleResizeRef.current();
+          }
         } catch (err) {
           console.error(`[TerminalPane] Failed to spawn local PTY ${shellId}:`, err);
         }
@@ -252,7 +258,14 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
     (async () => {
       try {
         await window.electronAPI.sshOpenShell(sshId, shellId);
-        if (!cancelled) shellReadyRef.current = true;
+        if (!cancelled) {
+          shellReadyRef.current = true;
+          // Force-sync terminal dimensions now that the SSH shell is ready.
+          // The earlier setTimeout(100ms) resize likely fired before the shell
+          // was fully established, so the PTY still has default 80×24 size.
+          lastSizeRef.current = { cols: 0, rows: 0 };
+          handleResizeRef.current();
+        }
       } catch (err) {
         console.error(`[TerminalPane] Failed to open shell ${shellId}:`, err);
       }
@@ -304,17 +317,74 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
     }
 
     fitAddon.fit();
-    setTimeout(() => term.focus(), 100);
 
     xtermRef.current = term;
     fitAddonRef.current = fitAddon;
     searchAddonRef.current = searchAddon;
 
+    // Trigger initial resize sync and focus
+    setTimeout(() => {
+      handleResizeRef.current();
+      term.focus();
+    }, 100);
+
     // ── Font scaling ──────────────────────────────────────────────────────────
     const MIN_FONT_SIZE = 10;
     const MAX_FONT_SIZE = 24;
 
+    // Boolean flag to suppress the very next onData event after we directly
+    // sent a character from the keydown handler.  This prevents the duplicate
+    // that occurs when WKWebView's hidden textarea still fires an input event
+    // despite our event.preventDefault().
+    let suppressOnData = false;
+
     term.attachCustomKeyEventHandler((event) => {
+      // ── Bypass macOS IME composition for Escape and Shift+key characters ────
+      // On macOS with Chinese IME (e.g. Pinyin), the Shift key doubles as an
+      // input-method toggle.  The first Shift+<key> press is consumed by the
+      // IME to switch modes, so the character never reaches xterm's hidden
+      // textarea.  We intercept at keydown and write directly to the backend.
+      if (event.type === 'keydown') {
+        // 1. Escape – always intercept
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          event.stopPropagation();
+          suppressOnData = true;
+          setTimeout(() => { suppressOnData = false; }, 0);
+          const data = '\x1b';
+          if (isLocal) {
+            window.electronAPI.ptyWrite(shellId, data);
+          } else if (isDefaultShell) {
+            window.electronAPI.sshWrite(sshId, data);
+          } else {
+            window.electronAPI.sshWriteShell(sshId, shellId, data);
+          }
+          onInputData?.(data);
+          return false;
+        }
+
+        // 2. Shift + printable character (e.g. Shift+; → ":", Shift+1 → "!")
+        //    Only when no Ctrl/Meta/Alt modifiers are held (those have their
+        //    own handlers below).
+        if (event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey
+            && event.key.length === 1) {
+          event.preventDefault();
+          event.stopPropagation();
+          suppressOnData = true;
+          setTimeout(() => { suppressOnData = false; }, 0);
+          const data = event.key;  // already the shifted character (e.g. ":", "!", "A")
+          if (isLocal) {
+            window.electronAPI.ptyWrite(shellId, data);
+          } else if (isDefaultShell) {
+            window.electronAPI.sshWrite(sshId, data);
+          } else {
+            window.electronAPI.sshWriteShell(sshId, shellId, data);
+          }
+          onInputData?.(data);
+          return false;
+        }
+      }
+
       if ((event.ctrlKey || event.metaKey) && event.type === 'keydown') {
         if (event.key === '=' || event.key === '+') {
           event.preventDefault();
@@ -369,6 +439,12 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
 
     // ── I/O wiring ────────────────────────────────────────────────────────────
     const onDataDisposable = term.onData((data) => {
+      // Suppress duplicate character from WKWebView/IME after we already
+      // sent it directly from the keydown handler above.
+      if (suppressOnData) {
+        suppressOnData = false;
+        return;
+      }
       if (!isLocal && !isDefaultShell && !shellReadyRef.current) return;
       if (isLocal) {
         window.electronAPI.ptyWrite(shellId, data);

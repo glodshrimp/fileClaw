@@ -418,6 +418,7 @@ pub async fn ssh_open_shell(
                             while written < bytes.len() {
                                 match channel.write(&bytes[written..]) {
                                     Ok(n) if n > 0 => {
+                                        println!("[SSH Debug] channel.write wrote {} bytes: {:?}", n, &bytes[written..written+n]);
                                         written += n;
                                     }
                                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock 
@@ -425,7 +426,8 @@ pub async fn ssh_open_shell(
                                         // Timeout or would block during write, wait a moment and retry
                                         thread::sleep(std::time::Duration::from_millis(1));
                                     }
-                                    _ => {
+                                    res => {
+                                        println!("[SSH Debug] channel.write non-success result: {:?}", res);
                                         write_failed = true;
                                         break;
                                     }
@@ -434,7 +436,8 @@ pub async fn ssh_open_shell(
                             if write_failed {
                                 break;
                             }
-                            let _ = channel.flush();
+                            let flush_res = channel.flush();
+                            println!("[SSH Debug] channel.flush returned: {:?}", flush_res);
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -515,6 +518,7 @@ pub fn ssh_write_shell(
     shell_id: String,
     data: String,
 ) -> Result<(), String> {
+    println!("[SSH Debug] ssh_write_shell shell_id={}: {:?}", shell_id, data);
     let write_tx = {
         let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
         let ssh_session = sessions.get(&id).ok_or_else(|| "No active SSH connection".to_string())?;

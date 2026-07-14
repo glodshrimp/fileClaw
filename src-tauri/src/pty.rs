@@ -9,6 +9,7 @@ use tauri::{AppHandle, Emitter};
 pub struct PtySession {
     writer: Box<dyn Write + Send>,
     _child: Box<dyn portable_pty::Child + Send + Sync>,
+    master: Box<dyn portable_pty::MasterPty + Send>,
 }
 
 #[derive(Default)]
@@ -86,10 +87,11 @@ pub fn pty_spawn(
     let mut reader = pty_pair.master.try_clone_reader()
         .map_err(|e| format!("Failed to clone PTY master reader: {}", e))?;
 
-    // Create session
+    // Create session (store master handle for resize support)
     let session = PtySession {
         writer,
         _child: child,
+        master: pty_pair.master,
     };
     sessions.insert(id.clone(), session);
 
@@ -137,15 +139,20 @@ pub fn pty_write(state: tauri::State<'_, PtyState>, id: String, data: String) ->
 
 #[tauri::command]
 pub fn pty_resize(
-    _state: tauri::State<'_, PtyState>,
-    _id: String,
-    _cols: u16,
-    _rows: u16,
+    state: tauri::State<'_, PtyState>,
+    id: String,
+    cols: u16,
+    rows: u16,
 ) -> Result<(), String> {
-    // Resizing dynamic portable-pty master window isn't strictly required
-    // for standard operation but we can expose it if supported, or stub it out cleanly.
-    // Standard terminal sizes will default to the current viewport cols/rows.
-    // For simplicity and stability, we stub this out or log it.
+    let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
+    if let Some(session) = sessions.get(&id) {
+        session.master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        }).map_err(|e| format!("Failed to resize PTY: {}", e))?;
+    }
     Ok(())
 }
 

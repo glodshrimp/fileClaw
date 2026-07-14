@@ -536,9 +536,9 @@ const Terminal: React.FC<TerminalProps> = ({ sshId, isConnected, mode = 'ssh', c
       onMouseEnter={() => totalPanes === 1 && setShowToolbar(true)}
       onMouseLeave={() => setShowToolbar(false)}
     >
-      {/* ── Split toolbar (floating overlay) ── */}
+      {/* ── Split toolbar (normal flow, pushes terminal content down) ── */}
       <div
-        className={`absolute top-0 left-0 right-0 z-20 flex items-center px-1.5 py-0 gap-0.5 border-b backdrop-blur-md transition-all duration-200 ${
+        className={`flex-shrink-0 flex items-center px-1.5 py-0 gap-0.5 border-b backdrop-blur-md transition-all duration-200 ${
           totalPanes > 1 || showToolbar
             ? 'opacity-100 h-6 border-white/[0.06]'
             : 'opacity-0 h-0 border-transparent overflow-hidden pointer-events-none'
