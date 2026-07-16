@@ -7,7 +7,7 @@ import { css } from '@codemirror/lang-css';
 import { oneDark } from '@codemirror/theme-one-dark';
 import { useWorkspaceStore } from '../../../contexts/useWorkspaceStore';
 import { useTheme } from '../../../contexts/ThemeContext';
-import { X, Save, Edit, PanelLeftOpen, GitBranch } from 'lucide-react';
+import { X, Save, Edit, PanelLeftOpen, GitBranch, Eye, AlertTriangle, FileText } from 'lucide-react';
 import { getFileIcon } from '../../../utils/fileIcon';
 import { vue } from '@codemirror/lang-vue';
 import { java } from '@codemirror/lang-java';
@@ -15,6 +15,12 @@ import { rust } from '@codemirror/lang-rust';
 import Terminal from '../../../components/ssh/Terminal';
 import { DiffTabViewer } from './DiffTabViewer';
 import { GitGraphTab } from './git/GitGraphTab';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+// @ts-ignore
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
+// @ts-ignore
+import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
 
 interface TabContextMenuProps {
   x: number;
@@ -86,7 +92,8 @@ export const CodeEditor: React.FC = () => {
     closeAllTabs,
     closeOthers,
     closeLeft,
-    closeRight
+    closeRight,
+    openMarkdownPreview
   } = useWorkspaceStore();
 
   const activeTab = openTabs.find((t) => t.path === activeTabPath);
@@ -191,6 +198,68 @@ export const CodeEditor: React.FC = () => {
   const renderEditorBody = () => {
     if (!activeTab) return null;
 
+    if (activeTab.isMarkdownPreview) {
+      const originalTab = openTabs.find(t => t.path === activeTab.previewSourcePath);
+      const previewContent = originalTab ? originalTab.content : activeTab.content;
+
+      return (
+        <div className="flex-1 overflow-auto relative min-h-0 h-full w-full bg-background-primary p-8 select-text">
+          {/* Quick edit button to jump back */}
+          {activeTab.previewSourcePath && (
+            <button
+              onClick={() => setActiveTab(activeTab.previewSourcePath!)}
+              className="absolute top-3 right-5 z-20 px-2.5 py-1 text-[10px] font-bold bg-primary hover:bg-primary-hover text-white rounded-md shadow-md shadow-primary/25 flex items-center space-x-1.5 transition-all uppercase"
+            >
+              <Edit className="w-3.5 h-3.5" />
+              <span>编辑 // EDIT</span>
+            </button>
+          )}
+
+          <div className="max-w-3xl mx-auto prose prose-sm dark:prose-invert max-w-none prose-p:leading-relaxed prose-pre:p-0 prose-pre:bg-transparent text-text-primary">
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
+              components={{
+                code({ node, inline, className, children, ...props }: any) {
+                  const match = /language-(\w+)/.exec(className || '');
+                  return !inline && match ? (
+                    <div className="rounded-lg overflow-hidden my-4 border border-border shadow-sm">
+                      <div className="bg-background-tertiary px-4 py-1.5 border-b border-border flex justify-between items-center text-[10px] text-text-tertiary uppercase font-mono">
+                        <span>{match[1]}</span>
+                      </div>
+                      <SyntaxHighlighter
+                        style={vscDarkPlus}
+                        language={match[1]}
+                        PreTag="div"
+                        customStyle={{ margin: 0, background: 'transparent', padding: '1rem', fontSize: '12px' }}
+                        {...props}
+                      >
+                        {String(children).replace(/\n$/, '')}
+                      </SyntaxHighlighter>
+                    </div>
+                  ) : (
+                    <code className="bg-background-tertiary px-1.5 py-0.5 rounded text-primary font-mono text-xs border border-border">
+                      {children}
+                    </code>
+                  );
+                },
+                table({ children }) {
+                  return <div className="overflow-x-auto my-4 rounded-lg border border-border"><table className="min-w-full divide-y divide-border">{children}</table></div>;
+                },
+                th({ children }) {
+                  return <th className="px-4 py-2 bg-background-tertiary text-left text-xs font-bold uppercase tracking-wider text-text-secondary">{children}</th>;
+                },
+                td({ children }) {
+                  return <td className="px-4 py-2 border-t border-border text-sm font-sans text-text-primary">{children}</td>;
+                }
+              }}
+            >
+              {previewContent}
+            </ReactMarkdown>
+          </div>
+        </div>
+      );
+    }
+
     if (activeTab.isGitGraph) {
       return (
         <GitGraphTab />
@@ -232,6 +301,9 @@ export const CodeEditor: React.FC = () => {
         return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
       };
 
+      const fileExt = activeTab.name.split('.').pop()?.toLowerCase();
+      const isOfficeFile = ['docx', 'doc', 'xlsx', 'xls'].includes(fileExt || '');
+
       return (
         <div className="flex-1 h-full bg-background-primary flex flex-col items-center justify-center text-text-secondary font-mono text-xs select-none p-6 text-center">
           <div className="w-16 h-16 rounded-2xl bg-background-secondary/40 border border-border-primary flex items-center justify-center mb-4 shadow-xl">
@@ -241,19 +313,30 @@ export const CodeEditor: React.FC = () => {
           <p className="text-[11px] text-text-secondary mb-4 select-all break-all max-w-[90%] font-mono">
             {activeTab.path}
           </p>
-          <div className="px-3.5 py-2 bg-background-secondary/30 rounded-xl border border-border-primary text-[10px] space-y-1 text-left min-w-[200px]">
+          <div className="px-3.5 py-2 bg-background-secondary/30 rounded-xl border border-border-primary text-[10px] space-y-1 text-left min-w-[200px] mb-6">
             <div className="flex justify-between gap-4">
               <span className="text-text-tertiary">文件大小:</span>
               <span className="text-text-secondary font-bold">{formatBytes(activeTab.size || 0)}</span>
             </div>
             <div className="flex justify-between gap-4">
               <span className="text-text-tertiary">文件类型:</span>
-              <span className="text-text-secondary uppercase font-bold">{activeTab.name.split('.').pop() || '未知'}</span>
+              <span className="text-text-secondary uppercase font-bold">{fileExt || '未知'}</span>
             </div>
           </div>
-          <p className="text-[10px] text-red-400 mt-6 bg-red-500/10 px-3 py-1 rounded-full border border-red-500/10">
-            ⚠️ 该文件格式不支持预览
-          </p>
+
+          {isOfficeFile ? (
+            <button
+              onClick={() => window.electronAPI.openPath(activeTab.path)}
+              className="px-5 py-2.5 bg-primary hover:bg-primary-hover text-white rounded-xl shadow-lg shadow-primary/20 flex items-center space-x-2 font-semibold text-xs transition-all uppercase cursor-pointer"
+            >
+              <FileText className="w-4 h-4" />
+              <span>使用外部应用打开 (WPS Office / Office)</span>
+            </button>
+          ) : (
+            <p className="text-[10px] text-red-400 bg-red-500/10 px-3 py-1 rounded-full border border-red-500/10">
+              ⚠️ 该文件格式不支持预览
+            </p>
+          )}
         </div>
       );
     }
@@ -303,6 +386,19 @@ export const CodeEditor: React.FC = () => {
           >
             <Save className="w-3.5 h-3.5" />
             <span>保存 // SAVE</span>
+          </button>
+        )}
+
+        {/* Floating Preview Button */}
+        {activeTab.name.toLowerCase().endsWith('.md') && activeTabPath && (
+          <button
+            onClick={() => openMarkdownPreview(activeTabPath, activeTab.name)}
+            className={`absolute top-3 z-20 px-2.5 py-1 text-[10px] font-bold bg-background-secondary hover:bg-background-tertiary text-text-primary rounded-md shadow-md border border-border flex items-center space-x-1.5 transition-all opacity-70 hover:opacity-100 uppercase ${
+              activeTab.isDirty ? 'right-32' : 'right-5'
+            }`}
+          >
+            <Eye className="w-3.5 h-3.5" />
+            <span>预览 // PREVIEW</span>
           </button>
         )}
 

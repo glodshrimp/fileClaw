@@ -136,6 +136,7 @@ const SSHPage: React.FC = () => {
           if (res.success) {
             console.log(`[SSH Auto-reconnect] Session ${key} successfully reconnected!`);
             window.electronAPI.emitSshOutput(key, `\r\n\x1b[32m[系统提示: SSH 连接第 ${nextAttempt} 次重连成功!]\x1b[0m\r\n`);
+            window.electronAPI.emitSshReconnected(key);
             delete reconnectAttemptsRef.current[key];
 
             dispatch({

@@ -263,6 +263,8 @@ declare global {
       onSshClosed: (id: string, callback: () => void) => () => void;
       onSftpProgress?: (callback: (data: { jid: string; file: string; transferred: number; total: number }) => void) => () => void;
       emitSshOutput: (id: string, data: string) => Promise<void>;
+      emitSshReconnected: (id: string) => Promise<void>;
+      onSshReconnected: (id: string, callback: () => void) => () => void;
 
       // 本地终端 (PTY)
       ptySpawn: (id: string, cwd?: string) => Promise<{success: boolean, shell?: string, error?: string}>;
@@ -283,6 +285,7 @@ declare global {
       saveChatSession: (session: any) => Promise<boolean>;
       deleteChatSession: (id: string) => Promise<boolean>;
       openDirectory: (path: string) => Promise<void>;
+      openPath: (path: string) => Promise<void>;
       openExternal: (url: string) => Promise<void>;
       getDbPath: () => Promise<string>;
       initProjectDirectory: (path: string) => Promise<{success: boolean, error?: string}>;

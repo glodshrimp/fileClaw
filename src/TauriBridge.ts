@@ -302,6 +302,7 @@ const electronAPI: any = {
   selectDirectory: () => invoke('select_directory'),
   selectFiles: () => invoke('select_files'),
   openDirectory: (path: string) => invoke('open_directory', { dirPath: path }),
+  openPath: (path: string) => invoke('open_directory', { dirPath: path }),
   openExternal: (url: string) => invoke('opener_open_url', { url }), // Use tauri-plugin-opener standard command
 
   // PTY shell commands
@@ -383,6 +384,19 @@ const electronAPI: any = {
     };
   },
   emitSshOutput: (id: string, data: string) => emit(`ssh-output-${id}`, data),
+  emitSshReconnected: (id: string) => emit(`ssh-reconnected-${id}`, {}),
+  onSshReconnected: (id: string, callback: () => void) => {
+    let active = true;
+    const unlistenPromise = listen(`ssh-reconnected-${id}`, () => {
+      if (active) callback();
+    });
+    return () => {
+      active = false;
+      unlistenPromise.then(unlistenFn => {
+        if (typeof unlistenFn === 'function') unlistenFn();
+      }).catch(console.error);
+    };
+  },
   onSshClosed: (id: string, callback: () => void) => {
     let active = true;
     const unlistenPromise = listen(`ssh-closed-${id}`, () => {

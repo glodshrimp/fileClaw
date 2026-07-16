@@ -17,6 +17,8 @@ export interface OpenFileTab {
     originalLabel: string;
     modifiedLabel: string;
   };
+  isMarkdownPreview?: boolean;
+  previewSourcePath?: string;
 }
 
 const getBranchForPath = (path: string | null, roots: string[], repoBranches: Record<string, string>): string | null => {
@@ -63,6 +65,7 @@ interface WorkspaceState {
     modifiedLabel: string
   ) => void;
   openGitGraph: () => void;
+  openMarkdownPreview: (sourcePath: string, name: string) => void;
   closeOthers: (path: string) => void;
   closeLeft: (path: string) => void;
   closeRight: (path: string) => void;
@@ -152,29 +155,39 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     }
 
     try {
-      const res = await window.electronAPI.readFileBase64(path);
-      let content = '';
-      const ext = name.split('.').pop()?.toLowerCase();
-      const isPdf = ext === 'pdf';
-      const isImage = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'ico'].includes(ext || '');
-      const isSupported = res.type === 'text' || isPdf || isImage;
-
-      if (res.data) {
-        if (res.type === 'text') {
-          content = res.data;
-        } else if (isPdf || isImage) {
-          content = res.data; // Keep raw base64 string for PDF and images
-        } else {
-          content = ''; // Unsupported binary: don't load data
-        }
-      }
-
+      // 1. Get file size
       let size = 0;
       try {
         const stat = await window.electronAPI.localStat(path);
         size = stat.size || 0;
       } catch (err) {
         console.error('Failed to get file stat:', err);
+      }
+
+      const ext = name.split('.').pop()?.toLowerCase();
+      const isOffice = ['docx', 'doc', 'xlsx', 'xls'].includes(ext || '');
+
+      let content = '';
+      let unsupported = true;
+
+      if (isOffice) {
+        // Bypass reading file content into memory for Word and Excel files
+        unsupported = true;
+        content = '';
+      } else {
+        const res = await window.electronAPI.readFileBase64(path);
+        const isPdf = ext === 'pdf';
+        const isImage = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'ico'].includes(ext || '');
+        const isSupported = res.type === 'text' || isPdf || isImage;
+        unsupported = !isSupported;
+
+        if (res.data) {
+          if (res.type === 'text') {
+            content = res.data;
+          } else if (isPdf || isImage) {
+            content = res.data; // Keep base64 data for PDF and images
+          }
+        }
       }
       
       const newTab: OpenFileTab = {
@@ -183,7 +196,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         content,
         isDirty: false,
         size,
-        unsupported: !isSupported,
+        unsupported,
       };
 
       set((state) => ({
@@ -318,6 +331,34 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     set((state) => ({
       openTabs: [...state.openTabs, newTab],
       activeTabPath: tabId
+    }));
+  },
+
+  openMarkdownPreview: (sourcePath, name) => {
+    const { openTabs } = get();
+    const previewPath = `preview://${sourcePath}`;
+    const existingTab = openTabs.find((t) => t.path === previewPath);
+
+    if (existingTab) {
+      set({ activeTabPath: previewPath });
+      return;
+    }
+
+    const sourceTab = openTabs.find((t) => t.path === sourcePath);
+    const content = sourceTab ? sourceTab.content : '';
+
+    const newTab: OpenFileTab = {
+      path: previewPath,
+      name: `Preview: ${name}`,
+      content,
+      isDirty: false,
+      isMarkdownPreview: true,
+      previewSourcePath: sourcePath
+    };
+
+    set((state) => ({
+      openTabs: [...state.openTabs, newTab],
+      activeTabPath: previewPath
     }));
   },
 

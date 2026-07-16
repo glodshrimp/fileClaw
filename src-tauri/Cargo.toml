@@ -1,6 +1,6 @@
 [package]
 name = "fileclaw-app"
-version = "0.2.0"
+version = "0.2.1"
 description = "A Tauri-based Project and SSH Management tool"
 authors = ["you"]
 edition = "2021"

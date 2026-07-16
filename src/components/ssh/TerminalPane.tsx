@@ -225,6 +225,18 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
     };
   }, []);
 
+  const [reconnectTrigger, setReconnectTrigger] = useState(0);
+
+  useEffect(() => {
+    if (isLocal) return;
+    const removeListener = window.electronAPI.onSshReconnected(sshId, () => {
+      setReconnectTrigger(prev => prev + 1);
+    });
+    return () => {
+      removeListener();
+    };
+  }, [sshId, isLocal]);
+
   // ── Open shell (non-default panes) or spawn local PTY ───────────────────────
 
    useEffect(() => {
@@ -275,7 +287,7 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
       // Close the shell when pane unmounts
       window.electronAPI.sshCloseShell(sshId, shellId);
     };
-  }, [sshId, shellId, isLocal, cwd]);
+  }, [sshId, shellId, isLocal, cwd, reconnectTrigger]);
 
   // ── Initialize xterm ────────────────────────────────────────────────────────
 
