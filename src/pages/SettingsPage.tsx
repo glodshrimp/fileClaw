@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import {
   Download, Upload, Database, RefreshCw, Info, Palette, Sun, Moon, Bot,
   Cpu, Globe, Server, Plus, Edit2, Trash2, Check, X, Key, Eye, EyeOff, Sparkles,
-  Copy, AlertTriangle
+  Copy, AlertTriangle, GitBranch
 } from 'lucide-react';
 import { useApp } from '../contexts/AppContext';
 import { useTheme } from '../contexts/ThemeContext';
@@ -250,7 +250,7 @@ const ModelModal: React.FC<ModelModalProps> = ({ editing, defaultProvider, onSav
 const SettingsPage: React.FC = () => {
   const { theme, setTheme } = useTheme();
   const { state, dispatch } = useApp();
-  const [activeTab, setActiveTab] = useState<'preference' | 'ai' | 'data' | 'about'>('preference');
+  const [activeTab, setActiveTab] = useState<'preference' | 'ai' | 'git' | 'data' | 'about'>('preference');
 
   const [termFontSize, setTermFontSize] = useState(() => parseInt(localStorage.getItem('termFontSize') || '14', 10));
   const [termFontFamily, setTermFontFamily] = useState(() => localStorage.getItem('termFontFamily') || 'Consolas, "Fira Code", monospace');
@@ -280,6 +280,13 @@ const SettingsPage: React.FC = () => {
   const [isSavingProxy, setIsSavingProxy] = useState(false);
   const [copying, setCopying] = useState(false);
 
+  // Git 设置状态
+  const [gitPath, setGitPathState] = useState('');
+  const [gitVersion, setGitVersion] = useState<string | null>(null);
+  const [gitTestStatus, setGitTestStatus] = useState<'idle' | 'testing' | 'success' | 'error'>('idle');
+  const [gitTestError, setGitTestError] = useState<string | null>(null);
+  const [isSavingGit, setIsSavingGit] = useState(false);
+
   // 模态框与防呆确认状态
   const [modalOpen, setModalOpen] = useState(false);
   const [editingModel, setEditingModel] = useState<AIModelConfig | null>(null);
@@ -292,7 +299,42 @@ const SettingsPage: React.FC = () => {
   useEffect(() => {
     // @ts-ignore
     window.electronAPI?.getDbPath().then((path: string) => setDbPath(path));
+    // @ts-ignore
+    window.electronAPI?.getGitSettings().then((settings: any) => {
+      if (settings) {
+        setGitPathState(settings.gitPath || '');
+      }
+    });
   }, []);
+
+  const handleSaveGitPath = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setIsSavingGit(true);
+    try {
+      // @ts-ignore
+      await window.electronAPI?.updateGitSettings({ gitPath });
+      await handleTestGit(gitPath);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setIsSavingGit(false);
+    }
+  };
+
+  const handleTestGit = async (path: string) => {
+    setGitTestStatus('testing');
+    setGitTestError(null);
+    try {
+      // @ts-ignore
+      const version = await window.electronAPI?.testGitPath(path);
+      setGitVersion(version);
+      setGitTestStatus('success');
+    } catch (err: any) {
+      setGitVersion(null);
+      setGitTestStatus('error');
+      setGitTestError(err.message || String(err));
+    }
+  };
 
   // ── 数据操作 ──────────────────────────────────────────
   const saveSettings = async (partial: Partial<typeof state.aiSettings>) => {
@@ -491,6 +533,17 @@ const SettingsPage: React.FC = () => {
           >
             <Database className="w-4 h-4" />
             <span>数据与安全</span>
+          </button>
+          <button
+            onClick={() => setActiveTab('git')}
+            className={`flex items-center gap-2.5 px-4 py-2.5 rounded-xl text-sm font-semibold transition-all whitespace-nowrap md:w-full ${
+              activeTab === 'git'
+                ? 'bg-primary text-white shadow-md shadow-primary/20'
+                : 'text-text-secondary hover:text-text-primary hover:bg-background-tertiary/60'
+            }`}
+          >
+            <GitBranch className="w-4 h-4" />
+            <span>Git 版本控制</span>
           </button>
           <button
             onClick={() => setActiveTab('about')}
@@ -910,6 +963,104 @@ const SettingsPage: React.FC = () => {
                     <Upload className="w-3.5 h-3.5" />
                     <span>{isImporting ? '还原导入中...' : '选择并还原'}</span>
                   </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Git 版本控制 */}
+          {activeTab === 'git' && (
+            <div className="space-y-6 animate-in fade-in slide-in-from-left-4 duration-200">
+              <div>
+                <h3 className="text-lg font-bold text-text-primary">Git 版本控制</h3>
+                <p className="text-xs text-text-tertiary mt-1">管理项目的版本控制依赖，支持自定义本地 Git 可执行文件路径</p>
+              </div>
+
+              <div className="bg-background-secondary border border-border/80 rounded-xl p-5 space-y-6">
+                <form onSubmit={handleSaveGitPath} className="space-y-4">
+                  <div className="space-y-2">
+                    <label className="text-xs font-semibold text-text-secondary block">
+                      Git 可执行文件路径 (Custom Git Executable Path)
+                    </label>
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        value={gitPath}
+                        onChange={(e) => setGitPathState(e.target.value)}
+                        placeholder="默认为 'git'（使用系统环境变量）"
+                        className="flex-1 px-3.5 py-2 bg-background border border-border rounded-xl text-xs text-text-primary focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary transition-all"
+                      />
+                      <button
+                        type="submit"
+                        disabled={isSavingGit}
+                        className="bg-primary hover:bg-primary-hover text-white text-xs font-semibold px-4 py-2 rounded-xl transition-all disabled:opacity-50 flex items-center gap-1.5 cursor-pointer"
+                      >
+                        {isSavingGit ? '保存中...' : '保存并测试'}
+                      </button>
+                    </div>
+                    <p className="text-[10px] text-text-tertiary leading-normal">
+                      如果您的系统中没有配置 Git 的环境变量，或者需要使用特定路径的 Git 客户端（如 Portable 版），请在此填入 Git 可执行文件的完整路径（如 Windows 下的 <code className="bg-background px-1 py-0.5 rounded border border-border">C:\Program Files\Git\bin\git.exe</code>）。
+                    </p>
+                  </div>
+                </form>
+
+                {/* 测试结果 */}
+                <div className="border-t border-border/50 pt-4 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold text-text-secondary">Git 状态测试</span>
+                    <button
+                      type="button"
+                      onClick={() => handleTestGit(gitPath)}
+                      className="text-primary hover:text-primary-hover text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${gitTestStatus === 'testing' ? 'animate-spin' : ''}`} />
+                      <span>立即测试</span>
+                    </button>
+                  </div>
+
+                  {gitTestStatus === 'success' && (
+                    <div className="bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-xs px-3.5 py-3 rounded-xl flex flex-col gap-1">
+                      <div className="flex items-center gap-1.5 font-semibold">
+                        <Check className="w-4 h-4 text-emerald-500" />
+                        <span>测试成功！Git 可用</span>
+                      </div>
+                      {gitVersion && <span className="text-[10px] opacity-80">版本信息: {gitVersion}</span>}
+                    </div>
+                  )}
+
+                  {gitTestStatus === 'error' && (
+                    <div className="bg-red-500/10 border border-red-500/20 text-red-400 text-xs px-3.5 py-3 rounded-xl flex flex-col gap-1">
+                      <div className="flex items-center gap-1.5 font-semibold">
+                        <AlertTriangle className="w-4 h-4 text-red-500" />
+                        <span>未检测到有效的 Git</span>
+                      </div>
+                      {gitTestError && <span className="text-[10px] leading-relaxed opacity-80 whitespace-pre-wrap">{gitTestError}</span>}
+                    </div>
+                  )}
+
+                  {gitTestStatus === 'idle' && (
+                    <div className="bg-background-tertiary/20 border border-border/40 text-text-tertiary text-xs px-3.5 py-3 rounded-xl text-center">
+                      点击“立即测试”或输入路径并保存来测试 Git 的连通性。
+                    </div>
+                  )}
+                </div>
+
+                {/* 引导指南 */}
+                <div className="border-t border-border/50 pt-4 space-y-2">
+                  <h4 className="text-xs font-semibold text-text-secondary">如何在您的系统中安装 Git？</h4>
+                  <div className="text-[11px] text-text-tertiary space-y-2 leading-relaxed">
+                    <p>
+                      <strong>Windows:</strong><br />
+                      访问官方网站 <a href="https://git-scm.com/download/win" target="_blank" rel="noreferrer" className="text-primary hover:underline">Git for Windows</a> 下载并安装。在安装向导中，请务必勾选 <em>"Git from the command line and also from 3rd-party software"</em> 选项，以便自动配置环境变量。
+                    </p>
+                    <p>
+                      <strong>macOS:</strong><br />
+                      打开终端（Terminal）并运行以下命令，系统会自动提示安装 Apple 开发工具（包含 Git）：<br />
+                      <code className="block bg-background p-2 rounded border border-border text-[10px] font-mono mt-1 select-all">xcode-select --install</code>
+                      或者，您可以通过 Homebrew 安装：<br />
+                      <code className="block bg-background p-2 rounded border border-border text-[10px] font-mono mt-1 select-all">brew install git</code>
+                    </p>
+                  </div>
                 </div>
               </div>
             </div>

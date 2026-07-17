@@ -7,7 +7,12 @@ import MessageList from './components/MessageList';
 import ChatInput from './components/ChatInput';
 import DeleteConfirmModal from '../../components/DeleteConfirmModal';
 
-const ChatPage: React.FC = () => {
+interface ChatPageProps {
+  isSidebarMode?: boolean;
+  onClose?: () => void;
+}
+
+const ChatPage: React.FC<ChatPageProps> = ({ isSidebarMode = false, onClose }) => {
   const { state, dispatch } = useApp();
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
@@ -262,14 +267,28 @@ const ChatPage: React.FC = () => {
       console.error('Failed to abort:', err);
     }
   };
-
   const handleRetry = () => {
     const lastUserMessage = [...messages].reverse().find(m => m.role === 'user');
     if (lastUserMessage) {
-      // Find the files associated with the user message if any
       const files = lastUserMessage.files?.map(f => ({ ...f, data: '', path: '' })) || [];
       handleSend(lastUserMessage.content, files as any);
     }
+  };
+
+  const handleDeleteMessage = (id: string) => {
+    setMessages(prev => {
+      const idx = prev.findIndex(m => m.id === id);
+      if (idx === -1) return prev;
+      
+      const targetMessage = prev[idx];
+      if (targetMessage.role === 'user') {
+        const nextMessage = prev[idx + 1];
+        if (nextMessage && nextMessage.role === 'assistant') {
+          return prev.filter((_, i) => i !== idx && i !== idx + 1);
+        }
+      }
+      return prev.filter((_, i) => i !== idx);
+    });
   };
 
   const clearChat = () => {
@@ -277,7 +296,11 @@ const ChatPage: React.FC = () => {
   };
 
   return (
-    <div className="flex h-[calc(100vh-40px)] -m-6 overflow-hidden bg-background relative animate-in fade-in duration-300">
+    <div className={`flex overflow-hidden bg-background relative ${
+      isSidebarMode 
+        ? 'w-full h-full' 
+        : 'h-[calc(100vh-40px)] -m-6 animate-in fade-in duration-300'
+    }`}>
       {/* 敏感工具命令执行二次授权卡片 — 高端磨砂玻璃风格 */}
       {pendingConfirmation && (
         <div className="absolute inset-0 z-[999] flex items-center justify-center bg-black/60 backdrop-blur-md animate-in fade-in duration-200">
@@ -349,7 +372,7 @@ const ChatPage: React.FC = () => {
         onCreateNewSession={createNewSession}
       />
 
-      <div className="flex-1 flex flex-col p-6 min-w-0">
+      <div className={`flex-1 flex flex-col min-w-0 ${isSidebarMode ? 'p-3' : 'p-6'}`}>
         <ChatHeader
           model={state.aiSettings.models.find(m => m.id === state.aiSettings.activeModelId)?.model ?? ''}
           provider={state.aiSettings.models.find(m => m.id === state.aiSettings.activeModelId)?.provider}
@@ -360,6 +383,9 @@ const ChatPage: React.FC = () => {
           onOpenHistory={() => setIsHistoryModalOpen(true)}
           onNewChat={createNewSession}
           onClearChat={clearChat}
+          isSidebarMode={isSidebarMode}
+          onClose={onClose}
+          sessionTitle={sessions.find(s => s.id === currentSessionId)?.title || '新会话'}
         />
 
         <MessageList
@@ -367,6 +393,7 @@ const ChatPage: React.FC = () => {
           isLoading={isLoading}
           messagesEndRef={messagesEndRef}
           onRetry={handleRetry}
+          onDeleteMessage={handleDeleteMessage}
         />
 
         <ChatInput

@@ -1,7 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { useLocation } from 'react-router-dom';
-import { Bell, HelpCircle, Minus, Square, X, Activity } from 'lucide-react';
+import { Bell, HelpCircle, Minus, Square, X, Activity, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen } from 'lucide-react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { useWorkspaceStore } from '../../contexts/useWorkspaceStore';
 
 // Stable platform check
 const IS_MAC = navigator.userAgent.includes('Mac');
@@ -9,6 +10,12 @@ const IS_MAC = navigator.userAgent.includes('Mac');
 const Header: React.FC = () => {
   const location = useLocation();
   const [isMaximized, setIsMaximized] = useState(false);
+
+  const isWorkspacePage = location.pathname.startsWith('/workspace');
+  const isSidebarCollapsed = useWorkspaceStore((s) => s.isSidebarCollapsed);
+  const setSidebarCollapsed = useWorkspaceStore((s) => s.setSidebarCollapsed);
+  const isAiSidebarOpen = useWorkspaceStore((s) => s.isAiSidebarOpen);
+  const setAiSidebarOpen = useWorkspaceStore((s) => s.setAiSidebarOpen);
 
   useEffect(() => {
     let checkMaximized = async () => {
@@ -112,11 +119,45 @@ const Header: React.FC = () => {
         data-tauri-drag-region="false"
         style={{ WebkitAppRegion: 'no-drag' } as any}
       >
-        <div className="flex items-center space-x-2 mr-4 border-r border-border pr-4">
-          <button className="p-1.5 hover:bg-background-secondary rounded-md transition-colors">
-            <Bell className="w-4 h-4 text-text-secondary" />
-          </button>
-          <button className="p-1.5 hover:bg-background-secondary rounded-md transition-colors">
+        <div className="flex items-center space-x-1.5 mr-4 border-r border-border pr-4">
+          {isWorkspacePage ? (
+            <>
+              <button
+                type="button"
+                onClick={() => setSidebarCollapsed(!isSidebarCollapsed)}
+                className={`p-1.5 rounded-md transition-all cursor-pointer flex items-center justify-center ${
+                  !isSidebarCollapsed ? 'bg-primary/10 text-primary hover:bg-primary/15' : 'hover:bg-background-secondary text-text-secondary'
+                }`}
+                title={isSidebarCollapsed ? "展开文件侧边栏" : "折叠文件侧边栏"}
+              >
+                {isSidebarCollapsed ? (
+                  <PanelLeftOpen className="w-4 h-4" />
+                ) : (
+                  <PanelLeftClose className="w-4 h-4" />
+                )}
+              </button>
+              
+              <button
+                type="button"
+                onClick={() => setAiSidebarOpen(!isAiSidebarOpen)}
+                className={`p-1.5 rounded-md transition-all cursor-pointer flex items-center justify-center ${
+                  isAiSidebarOpen ? 'bg-primary/10 text-primary hover:bg-primary/15' : 'hover:bg-background-secondary text-text-secondary'
+                }`}
+                title={isAiSidebarOpen ? "关闭 AI 助手" : "打开 AI 助手"}
+              >
+                {isAiSidebarOpen ? (
+                  <PanelRightClose className="w-4 h-4" />
+                ) : (
+                  <PanelRightOpen className="w-4 h-4" />
+                )}
+              </button>
+            </>
+          ) : (
+            <button type="button" className="p-1.5 hover:bg-background-secondary rounded-md transition-colors">
+              <Bell className="w-4 h-4 text-text-secondary" />
+            </button>
+          )}
+          <button type="button" className="p-1.5 hover:bg-background-secondary rounded-md transition-colors">
             <HelpCircle className="w-4 h-4 text-text-secondary" />
           </button>
         </div>

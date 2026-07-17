@@ -1,6 +1,9 @@
 use std::process::Command;
 use std::collections::{HashMap, HashSet};
 use serde::Serialize;
+use std::sync::Mutex;
+
+static GIT_PATH: Mutex<String> = Mutex::new(String::new());
 
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -11,19 +14,67 @@ pub struct GitCommitInfo {
     pub message: String,
 }
 
+
+#[tauri::command]
+pub fn set_git_path(path: String) {
+    if let Ok(mut guard) = GIT_PATH.lock() {
+        *guard = path.trim().to_string();
+    }
+}
+
+#[tauri::command]
+pub fn test_git_path(path: String) -> Result<String, String> {
+    let cmd = if path.trim().is_empty() { "git" } else { path.trim() };
+    let output = Command::new(cmd)
+        .arg("--version")
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                format!("未找到可执行文件 \"{}\"", cmd)
+            } else {
+                format!("测试失败: {}", e)
+            }
+        })?;
+        
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn get_git_command() -> String {
+    if let Ok(guard) = GIT_PATH.lock() {
+        if !guard.is_empty() {
+            return guard.clone();
+        }
+    }
+    "git".to_string()
+}
+
 fn run_git_cmd(repo_path: &str, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
+    let git_cmd = get_git_command();
+    let output = Command::new(&git_cmd)
         .args(args)
         .current_dir(repo_path)
         .output()
-        .map_err(|e| format!("Failed to execute git command: {}", e))?;
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                format!(
+                    "未找到 Git 可执行文件（当前尝试运行: \"{}\"）。\n请确保系统已安装 Git 并配置了环境变量，或者在「设置」中配置正确的 Git 可执行文件路径。",
+                    git_cmd
+                )
+            } else {
+                format!("执行 Git 命令失败: {}", e)
+            }
+        })?;
     
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
         let err_msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if err_msg.is_empty() {
-            Err("Git command failed with non-zero exit status".to_string())
+            Err("Git 命令执行失败，退出码非零".to_string())
         } else {
             Err(err_msg)
         }

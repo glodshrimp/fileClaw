@@ -383,19 +383,48 @@ pub async fn select_files(app_handle: tauri::AppHandle) -> Result<Vec<SelectedFi
 }
 
 #[tauri::command]
-pub fn open_directory(dir_path: String) -> Result<(), String> {
-    // Open directories using shell default launcher.
-    // On macOS, open. On Windows, explorer. On Linux, xdg-open.
-    #[cfg(target_os = "macos")]
-    let cmd = "open";
-    #[cfg(target_os = "windows")]
-    let cmd = "explorer";
-    #[cfg(target_os = "linux")]
-    let cmd = "xdg-open";
+pub fn open_directory(app_handle: tauri::AppHandle, dir_path: String) -> Result<(), String> {
+    // Normalize path separators on Windows to avoid explorer.exe parsing issues/freezes
+    let normalized_path = if cfg!(target_os = "windows") {
+        dir_path.replace("/", "\\")
+    } else {
+        dir_path
+    };
 
-    std::process::Command::new(cmd)
-        .arg(&dir_path)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("Failed to open directory: {}", e))
+    use tauri_plugin_opener::OpenerExt;
+    app_handle
+        .opener()
+        .open_path(&normalized_path, None::<&str>)
+        .map_err(|e| format!("Failed to open path: {}", e))
 }
+
+#[tauri::command]
+pub fn execute_bash_command(command: String, cwd: Option<String>) -> Result<String, String> {
+    let mut cmd = if cfg!(target_os = "windows") {
+        let mut c = std::process::Command::new("powershell");
+        c.args(&["-Command", &command]);
+        c
+    } else {
+        let mut c = std::process::Command::new("sh");
+        c.args(&["-c", &command]);
+        c
+    };
+
+    if let Some(ref path) = cwd {
+        if !path.is_empty() {
+            cmd.current_dir(path);
+        }
+    }
+
+    let output = cmd.output().map_err(|e| format!("Failed to execute command: {}", e))?;
+    
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    
+    if output.status.success() {
+        Ok(stdout)
+    } else {
+        Err(format!("Exit code {}:\nStdout: {}\nStderr: {}", output.status.code().unwrap_or(-1), stdout, stderr))
+    }
+}
+

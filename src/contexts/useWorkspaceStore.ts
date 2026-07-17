@@ -38,6 +38,8 @@ interface WorkspaceState {
   setSidebarCollapsed: (collapsed: boolean) => void;
   sidebarWidth: number;
   setSidebarWidth: (width: number) => void;
+  isAiSidebarOpen: boolean;
+  setAiSidebarOpen: (open: boolean) => void;
   
   // Git State
   gitBranch: string | null;
@@ -98,6 +100,8 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   setSidebarCollapsed: (collapsed) => set({ isSidebarCollapsed: collapsed }),
   sidebarWidth: 240,
   setSidebarWidth: (width) => set({ sidebarWidth: width }),
+  isAiSidebarOpen: false,
+  setAiSidebarOpen: (open) => set({ isAiSidebarOpen: open }),
 
   copiedFilePath: null,
   setCopiedFilePath: (path) => set({ copiedFilePath: path }),

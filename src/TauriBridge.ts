@@ -3,8 +3,9 @@ import { listen, emit } from '@tauri-apps/api/event';
 import { Low } from 'lowdb';
 import { TauriLowdbAdapter } from './db/TauriLowdbAdapter';
 import { createOpenAI } from '@ai-sdk/openai';
-import { generateText } from 'ai';
+import { generateText, tool, stepCountIs } from 'ai';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { z } from 'zod';
 
 // Helper to log to Tauri terminal
 async function logToBackend(msg: string) {
@@ -17,6 +18,26 @@ async function logToBackend(msg: string) {
 
 // Initialize lowdb on the frontend
 let db: Low<any>;
+
+// Tools confirmation states
+let confirmCallback: ((data: { toolId: string; toolName: string; args: any }) => void) | null = null;
+let resolveConfirmation: ((approved: boolean) => void) | null = null;
+
+const requestUserApproval = (toolName: string, args: any): Promise<boolean> => {
+  return new Promise((resolve) => {
+    if (confirmCallback) {
+      const toolId = Date.now().toString();
+      resolveConfirmation = resolve;
+      confirmCallback({
+        toolId,
+        toolName,
+        args,
+      });
+    } else {
+      resolve(true); // Fallback: auto-approve
+    }
+  });
+};
 
 async function getDb() {
   if (!db) {
@@ -34,6 +55,9 @@ async function getDb() {
         models: [],
         activeModelId: null,
         proxy: '',
+      },
+      gitSettings: {
+        gitPath: '',
       }
     });
     
@@ -52,6 +76,13 @@ async function getDb() {
     db.data.globalTodos = db.data.globalTodos || [];
     db.data.chatSessions = db.data.chatSessions || [];
     db.data.aiSettings = db.data.aiSettings || { models: [], activeModelId: null };
+    db.data.gitSettings = db.data.gitSettings || { gitPath: '' };
+    
+    try {
+      await invoke('set_git_path', { path: db.data.gitSettings.gitPath || '' });
+    } catch (err) {
+      await logToBackend(`Failed to initialize git path in Rust: ${err}`);
+    }
     
     await logToBackend(`getDb: Initialization finished. projects count=${db.data.projects.length}, sshInfo count=${db.data.sshInfo.length}`);
   }
@@ -303,6 +334,7 @@ const electronAPI: any = {
   selectFiles: () => invoke('select_files'),
   openDirectory: (path: string) => invoke('open_directory', { dirPath: path }),
   openPath: (path: string) => invoke('open_directory', { dirPath: path }),
+  executeBashCommand: (command: string, cwd?: string) => invoke('execute_bash_command', { command, cwd }),
   openExternal: (url: string) => invoke('opener_open_url', { url }), // Use tauri-plugin-opener standard command
 
   // PTY shell commands
@@ -493,7 +525,7 @@ const electronAPI: any = {
     }
   },
 
-  // AI Chat powered by Vercel AI SDK on client side
+  // AI Chat powered by Vercel AI SDK on client side with tool calling
   aiChat: async (apiKey: string, model: string, messages: any[], provider?: string, baseURL?: string) => {
     currentAbortController = new AbortController();
     
@@ -523,6 +555,103 @@ const electronAPI: any = {
           content: m.content
         })),
         abortSignal: currentAbortController.signal,
+        stopWhen: stepCountIs(10),
+        tools: {
+          listDirectory: tool({
+            description: 'List contents of a local directory',
+            inputSchema: z.object({
+              path: z.string().describe('The absolute path of the directory to list'),
+            }),
+            execute: async ({ path }) => {
+              try {
+                return await electronAPI.localListDir(path);
+              } catch (e: any) {
+                return `Error listing directory: ${e.message || String(e)}`;
+              }
+            }
+          }),
+          readFile: tool({
+            description: 'Read the text contents of a file',
+            inputSchema: z.object({
+              path: z.string().describe('The absolute path of the file to read'),
+            }),
+            execute: async ({ path }) => {
+              try {
+                const res = await electronAPI.readFileBase64(path);
+                if (res.type === 'text') {
+                  return res.data;
+                } else {
+                  return `[Binary file, base64 data length: ${res.data.length}]`;
+                }
+              } catch (e: any) {
+                return `Error reading file: ${e.message || String(e)}`;
+              }
+            }
+          }),
+          writeFile: tool({
+            description: 'Create or overwrite a file with content',
+            inputSchema: z.object({
+              path: z.string().describe('The absolute path of the file to write'),
+              content: z.string().describe('The file content to write'),
+            }),
+            execute: async ({ path, content }) => {
+              try {
+                await electronAPI.localWriteFile(path, content);
+                return `Successfully wrote to file at ${path}`;
+              } catch (e: any) {
+                return `Error writing file: ${e.message || String(e)}`;
+              }
+            }
+          }),
+          deleteNode: tool({
+            description: 'Delete a file or directory',
+            inputSchema: z.object({
+              path: z.string().describe('The absolute path of the node to delete'),
+            }),
+            execute: async ({ path }) => {
+              try {
+                await electronAPI.localDeleteNode(path);
+                return `Successfully deleted node at ${path}`;
+              } catch (e: any) {
+                return `Error deleting node: ${e.message || String(e)}`;
+              }
+            }
+          }),
+          executeCommand: tool({
+            description: 'Execute a bash/shell command locally to compile, test, or run scripts (requires user approval)',
+            inputSchema: z.object({
+              command: z.string().describe('The command string to execute'),
+              cwd: z.string().optional().describe('The current working directory to execute the command in'),
+            }),
+            execute: async ({ command, cwd }) => {
+              const approved = await requestUserApproval('execute_command', { command, cwd });
+              if (!approved) {
+                return 'Command execution rejected by user.';
+              }
+              try {
+                return await electronAPI.executeBashCommand(command, cwd);
+              } catch (e: any) {
+                return `Command failed:\n${e.message || String(e)}`;
+              }
+            }
+          }),
+          updateProjectMemory: tool({
+            description: 'Record or update project-level context in a memory file (TERAX.md) at the root of the project to track goals, decisions, and system structures',
+            inputSchema: z.object({
+              projectPath: z.string().describe('The root path of the project'),
+              memoryContent: z.string().describe('The updated memory content in markdown format'),
+            }),
+            execute: async ({ projectPath, memoryContent }) => {
+              const memoryPath = projectPath + (projectPath.includes('\\') ? '\\' : '/') + 'TERAX.md';
+              try {
+                await electronAPI.localWriteFile(memoryPath, memoryContent);
+                return `Successfully updated project memory file (TERAX.md) at ${memoryPath}`;
+              } catch (e: any) {
+                return `Error updating project memory: ${e.message || String(e)}`;
+              }
+            }
+          })
+        }
       });
 
       return {
@@ -580,14 +709,38 @@ const electronAPI: any = {
   gitStashList: (repoPath: string) => invoke('git_stash_list', { repoPath }),
   gitStashPop: (repoPath: string, index: number) => invoke('git_stash_pop', { repoPath, index }),
 
-  // Mock sensitivity execution listener for agents
+  // Git Settings APIs
+  getGitSettings: async () => {
+    const db = await getDb();
+    return db.data.gitSettings || { gitPath: '' };
+  },
+  updateGitSettings: async (settings: any) => {
+    const db = await getDb();
+    const current = db.data.gitSettings || { gitPath: '' };
+    const updated = { ...current, ...settings };
+    db.data.gitSettings = updated;
+    await db.write();
+    try {
+      await invoke('set_git_path', { path: updated.gitPath || '' });
+    } catch (err) {
+      console.error('Failed to sync git path to Rust:', err);
+    }
+    return true;
+  },
+  testGitPath: (path: string) => invoke('test_git_path', { path }),
+
+  // Sensitivity execution listener for agents
   onConfirmToolExecution: (callback: (data: any) => void) => {
-    // Since Tauri 2 agent commands will run securely in sandbox or confirmed via user,
-    // this can return a no-op cleanup callback
-    return () => {};
+    confirmCallback = callback;
+    return () => {
+      confirmCallback = null;
+    };
   },
   respondToToolExecution: async (toolId: string, approved: boolean) => {
-    // No-op
+    if (resolveConfirmation) {
+      resolveConfirmation(approved);
+      resolveConfirmation = null;
+    }
   }
 };
 

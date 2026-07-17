@@ -286,6 +286,7 @@ declare global {
       deleteChatSession: (id: string) => Promise<boolean>;
       openDirectory: (path: string) => Promise<void>;
       openPath: (path: string) => Promise<void>;
+      executeBashCommand: (command: string, cwd?: string) => Promise<string>;
       openExternal: (url: string) => Promise<void>;
       getDbPath: () => Promise<string>;
       initProjectDirectory: (path: string) => Promise<{success: boolean, error?: string}>;
@@ -299,6 +300,11 @@ declare global {
       aiAbort: () => Promise<boolean>;
       onConfirmToolExecution: (callback: (data: { toolId: string; toolName: string; args: any }) => void) => () => void;
       respondToToolExecution: (toolId: string, approved: boolean) => Promise<void>;
+
+      // Git 设置
+      getGitSettings: () => Promise<{ gitPath: string }>;
+      updateGitSettings: (settings: { gitPath: string }) => Promise<boolean>;
+      testGitPath: (path: string) => Promise<string>;
 
       // 插件系统与系统层
       platform: string;

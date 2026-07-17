@@ -6,6 +6,7 @@ import { FileExplorer } from './components/FileExplorer';
 import { CodeEditor } from './components/CodeEditor';
 import { ArrowLeft, PanelLeftClose, GitBranch } from 'lucide-react';
 import { BranchesDialog } from './components/git/BranchesDialog';
+import ChatPage from '../ChatPage';
 
 const WorkspacePage: React.FC = () => {
   const { projectId } = useParams<{ projectId: string }>();
@@ -22,6 +23,9 @@ const WorkspacePage: React.FC = () => {
   const gitRoots = useWorkspaceStore((s) => s.gitRoots);
   const gitRepoBranches = useWorkspaceStore((s) => s.gitRepoBranches);
   const [showBranchModal, setShowBranchModal] = React.useState(false);
+  const showAiSidebar = useWorkspaceStore((s) => s.isAiSidebarOpen);
+  const setShowAiSidebar = useWorkspaceStore((s) => s.setAiSidebarOpen);
+  const [aiSidebarWidth, setAiSidebarWidth] = React.useState(400);
 
   const branchLabel = React.useMemo(() => {
     if (!gitBranch || gitRoots.length === 0) return null;
@@ -66,17 +70,77 @@ const WorkspacePage: React.FC = () => {
     }
   }, [projectId, state.projects, setCurrentProject, navigate]);
 
-  // Bind Ctrl+I / Cmd+I shortcut to switch to AI Agent chat
+  const openAndAttachSelection = () => {
+    setShowAiSidebar(true);
+    const selection = window.getSelection()?.toString();
+    if (selection && selection.trim()) {
+      let activeFileName = '';
+      if (activeTabPath) {
+        activeFileName = activeTabPath.split(/[\/\\]/).pop() || '';
+      }
+      
+      const attached = {
+        name: activeFileName ? `${activeFileName} (选区)` : '代码选区',
+        path: activeTabPath || 'selection',
+        type: 'text',
+        data: selection,
+        mimeType: 'text/plain',
+      };
+      
+      setTimeout(() => {
+        const event = new CustomEvent('attach-file-to-agent', { detail: attached });
+        window.dispatchEvent(event);
+      }, 100);
+    }
+  };
+
+  const handleAiMouseDown = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = aiSidebarWidth;
+
+    const handleMouseMove = (moveEvent: MouseEvent) => {
+      const deltaX = moveEvent.clientX - startX;
+      const newWidth = Math.max(280, Math.min(800, startWidth - deltaX));
+      setAiSidebarWidth(newWidth);
+    };
+
+    const handleMouseUp = () => {
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseup', handleMouseUp);
+    };
+
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('mouseup', handleMouseUp);
+  };
+
+  // Bind Ctrl+I / Cmd+I shortcut to toggle AI Agent sidebar and capture selection
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'i') {
         e.preventDefault();
-        navigate('/chat');
+        if (!showAiSidebar) {
+          openAndAttachSelection();
+          setShowAiSidebar(true);
+        } else {
+          setShowAiSidebar(false);
+        }
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [navigate]);
+  }, [activeTabPath, aiSidebarWidth, showAiSidebar, setShowAiSidebar]);
+
+  // Automatically open the sidebar when a file is attached to the agent from elsewhere
+  useEffect(() => {
+    const handleAttachFileGlobal = () => {
+      setShowAiSidebar(true);
+    };
+    window.addEventListener('attach-file-to-agent', handleAttachFileGlobal);
+    return () => {
+      window.removeEventListener('attach-file-to-agent', handleAttachFileGlobal);
+    };
+  }, []);
 
   if (!currentProject) {
     return (
@@ -206,8 +270,16 @@ const WorkspacePage: React.FC = () => {
             )}
 
             <button
-              onClick={() => navigate('/chat')}
-              className="flex items-center space-x-1.5 px-3 py-1 bg-background-primary border border-border-primary hover:border-primary/45 rounded-full hover:bg-background-tertiary text-text-secondary hover:text-text-primary transition-all duration-150 font-medium text-[10px] cursor-pointer shadow-lg shadow-black/5"
+              onClick={() => {
+                if (!showAiSidebar) {
+                  openAndAttachSelection();
+                } else {
+                  setShowAiSidebar(false);
+                }
+              }}
+              className={`flex items-center space-x-1.5 px-3 py-1 bg-background-primary border rounded-full hover:bg-background-tertiary text-text-secondary hover:text-text-primary transition-all duration-150 font-medium text-[10px] cursor-pointer shadow-lg shadow-black/5 ${
+                showAiSidebar ? 'border-primary/60 bg-primary-light/5 text-primary' : 'border-border-primary hover:border-primary/45'
+              }`}
               title="快捷键 打开 AI 助手"
             >
               <span>Open AI agent</span>
@@ -216,6 +288,23 @@ const WorkspacePage: React.FC = () => {
           </div>
         </div>
       </div>
+
+      {/* Right Sidebar: AI Assistant Side Panel */}
+      {showAiSidebar && (
+        <div 
+          style={{ width: aiSidebarWidth }}
+          className="flex-shrink-0 flex flex-col border-l border-border-primary h-full bg-background-primary relative select-none animate-in slide-in-from-right duration-200"
+        >
+          {/* Resize Handle */}
+          <div
+            className="absolute top-0 left-[-3px] bottom-0 w-[6px] cursor-col-resize hover:bg-primary/30 active:bg-primary z-50 transition-colors"
+            onMouseDown={handleAiMouseDown}
+          />
+          <div className="flex-1 min-h-0">
+            <ChatPage isSidebarMode={true} onClose={() => setShowAiSidebar(false)} />
+          </div>
+        </div>
+      )}
 
       {showBranchModal && (
         <BranchesDialog

@@ -98,6 +98,7 @@ pub fn run() {
             fs::select_directory,
             fs::select_files,
             fs::open_directory,
+            fs::execute_bash_command,
             
             // PTY Commands
             pty::pty_spawn,
@@ -156,6 +157,8 @@ pub fn run() {
             git::git_commit_files,
             git::git_show_file,
             git::git_log_graph,
+            git::set_git_path,
+            git::test_git_path,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
