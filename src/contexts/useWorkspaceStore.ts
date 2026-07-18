@@ -415,7 +415,11 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     const projectPath = currentProject.codePath || currentProject.path;
 
     try {
-      const roots = await window.electronAPI.gitDiscoverRoots(projectPath);
+      let { gitRoots } = get();
+      if (!gitRoots || gitRoots.length === 0) {
+        gitRoots = await window.electronAPI.gitDiscoverRoots(projectPath);
+      }
+      const roots = gitRoots;
       if (roots.length === 0) {
         set({
           gitBranch: null,

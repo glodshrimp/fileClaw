@@ -21,6 +21,7 @@ interface FileEntry {
   size: number;
   mtime: number;
   ctime: number;
+  path: string;
 }
 
 interface FileNodeProps {
@@ -228,26 +229,24 @@ const getUniqueDestPath = async (srcPath: string, destDir: string): Promise<stri
 };
 
 const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefreshParent }) => {
-  const { 
-    expandedFolders, 
-    toggleFolder, 
-    openFile, 
-    activeTabPath, 
-    openTerminal,
-    gitFileStatuses,
-    gitDirtyFolders,
-    currentProject,
-    gitBranch,
-    gitRoots,
-    fileExplorerRefreshKey,
-    copiedFilePath,
-    setCopiedFilePath,
-    selectedFilePaths,
-    setSelectedFilePaths,
-    lastSelectedFilePath,
-    setLastSelectedFilePath
-  } = useWorkspaceStore();
-  const isExpanded = !!expandedFolders[path];
+  // Fine-grained selectors to prevent re-rendering the whole tree on selection/expansion changes
+  const isExpanded = useWorkspaceStore((s) => !!s.expandedFolders[path]);
+  const isSelected = useWorkspaceStore((s) => s.selectedFilePaths.includes(path) || (s.selectedFilePaths.length === 0 && s.activeTabPath === path));
+  const folderStatus = useWorkspaceStore((s) => s.gitDirtyFolders[path]);
+  const statusXY = useWorkspaceStore((s) => s.gitFileStatuses[path]);
+  const fileExplorerRefreshKey = useWorkspaceStore((s) => s.fileExplorerRefreshKey);
+  const copiedFilePath = useWorkspaceStore((s) => s.copiedFilePath);
+  const gitRoots = useWorkspaceStore((s) => s.gitRoots);
+  const activeTabPath = useWorkspaceStore((s) => s.activeTabPath);
+
+  // Actions are stable and will not cause re-renders
+  const toggleFolder = useWorkspaceStore((s) => s.toggleFolder);
+  const openFile = useWorkspaceStore((s) => s.openFile);
+  const openTerminal = useWorkspaceStore((s) => s.openTerminal);
+  const currentProject = useWorkspaceStore((s) => s.currentProject);
+  const setCopiedFilePath = useWorkspaceStore((s) => s.setCopiedFilePath);
+  const setSelectedFilePaths = useWorkspaceStore((s) => s.setSelectedFilePaths);
+  const setLastSelectedFilePath = useWorkspaceStore((s) => s.setLastSelectedFilePath);
   const [children, setChildren] = useState<FileEntry[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [isCreating, setIsCreating] = useState<'file' | 'folder' | null>(null);
@@ -284,7 +283,6 @@ const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefresh
       || name.startsWith('.');
 
     if (isDir) {
-      const folderStatus = gitDirtyFolders[path];
       if (folderStatus) {
         if (folderStatus.notAdded) return 'text-[#f87171]'; // Red for not add
         if (folderStatus.modified) return 'text-[#60a5fa]'; // Blue for modified
@@ -293,7 +291,6 @@ const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefresh
       }
       if (isCommonIgnored) return 'text-slate-500';
     } else {
-      const statusXY = gitFileStatuses[path];
       if (statusXY) {
         if (statusXY === '??') return 'text-[#fb923c]'; // Orange/Yellow for untracked
         if (statusXY === '!!') return 'text-slate-500'; // Gray for ignored
@@ -332,6 +329,8 @@ const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefresh
 
   const handleRowClick = (e: React.MouseEvent) => {
     e.stopPropagation();
+
+    const { selectedFilePaths, lastSelectedFilePath } = useWorkspaceStore.getState();
 
     // 1. Shift-click selection range
     if (e.shiftKey && lastSelectedFilePath) {
@@ -393,6 +392,7 @@ const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefresh
 
   const handleConfirmDelete = async () => {
     try {
+      const { selectedFilePaths } = useWorkspaceStore.getState();
       const targetPaths = selectedFilePaths.includes(path) ? selectedFilePaths : [path];
       for (const p of targetPaths) {
         await window.electronAPI.localDeleteNode(p);
@@ -415,8 +415,6 @@ const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefresh
   const getFileIcon = (fileName: string) => {
     return getFileIconUtil(fileName);
   };
-
-  const isSelected = selectedFilePaths.includes(path) || (selectedFilePaths.length === 0 && activeTabPath === path);
 
   const buildMenuItems = () => {
     const items: MenuItem[] = [];
@@ -487,6 +485,7 @@ const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefresh
       {
         label: 'Copy Path',
         onClick: (e: React.MouseEvent) => {
+          const { selectedFilePaths } = useWorkspaceStore.getState();
           const targetPaths = selectedFilePaths.includes(path) ? selectedFilePaths : [path];
           copyToClipboard(targetPaths.join('\n'), e);
         }
@@ -495,6 +494,7 @@ const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefresh
         label: 'Copy Relative Path',
         onClick: (e: React.MouseEvent) => {
           const rootPath = currentProject?.codePath || currentProject?.path || '';
+          const { selectedFilePaths } = useWorkspaceStore.getState();
           const targetPaths = selectedFilePaths.includes(path) ? selectedFilePaths : [path];
           const relPaths = targetPaths.map(p => {
             let rel = p.substring(rootPath.length);
@@ -586,10 +586,8 @@ const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefresh
 
     const canAdd = (() => {
       if (isDir) {
-        const folderStatus = gitDirtyFolders[path];
         return folderStatus ? (folderStatus.notAdded || folderStatus.untracked) : false;
       } else {
-        const statusXY = gitFileStatuses[path];
         if (!statusXY) return false;
         if (statusXY === '??') return true;
         const Y = statusXY[1] || ' ';
@@ -597,7 +595,7 @@ const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefresh
       }
     })();
 
-    const hasChanges = isDir ? !!gitDirtyFolders[path] : !!gitFileStatuses[path];
+    const hasChanges = isDir ? !!folderStatus : !!statusXY;
 
     // Git submenu
     const gitMenu: MenuItem = {
@@ -734,6 +732,7 @@ const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefresh
           e.preventDefault();
           e.stopPropagation();
           
+          const { selectedFilePaths } = useWorkspaceStore.getState();
           if (!selectedFilePaths.includes(path)) {
             setSelectedFilePaths([path]);
             setLastSelectedFilePath(path);
@@ -815,7 +814,7 @@ const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefresh
             <FileNode
               key={child.name}
               name={child.name}
-              path={joinPath(path, child.name)}
+              path={child.path}
               isDir={child.isDir}
               depth={depth + 1}
               onRefreshParent={loadChildren}
@@ -824,13 +823,19 @@ const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefresh
         </div>
       )}
 
-      <DeleteConfirmModal
-        isOpen={isDeleteModalOpen}
-        onConfirm={handleConfirmDelete}
-        onCancel={() => setIsDeleteModalOpen(false)}
-        title={selectedFilePaths.includes(path) && selectedFilePaths.length > 1 ? `确定要删除这 ${selectedFilePaths.length} 个选中的项目吗？` : `确定要删除 ${name} 吗？`}
-        description={isDir || (selectedFilePaths.includes(path) && selectedFilePaths.length > 1) ? "选中项目将同时递归删除其包含的全部子目录与文件，此操作不可恢复。" : "此文件将被从本地硬盘中彻底删除，且无法恢复。"}
-      />
+      {(() => {
+        const { selectedFilePaths } = useWorkspaceStore.getState();
+        const isSelectedMultiple = selectedFilePaths.includes(path) && selectedFilePaths.length > 1;
+        return (
+          <DeleteConfirmModal
+            isOpen={isDeleteModalOpen}
+            onConfirm={handleConfirmDelete}
+            onCancel={() => setIsDeleteModalOpen(false)}
+            title={isSelectedMultiple ? `确定要删除这 ${selectedFilePaths.length} 个选中的项目吗？` : `确定要删除 ${name} 吗？`}
+            description={isDir || isSelectedMultiple ? "选中项目将同时递归删除其包含的全部子目录与文件，此操作不可恢复。" : "此文件将被从本地硬盘中彻底删除，且无法恢复。"}
+          />
+        );
+      })()}
 
       {ctxMenu && (
         <FileExplorerContextMenu
@@ -948,12 +953,17 @@ export const FileExplorer: React.FC = () => {
     if (currentProject) {
       refreshGitStatus();
       
+      let timer: ReturnType<typeof setTimeout>;
       const handleFocus = () => {
-        refreshGitStatus();
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+          refreshGitStatus();
+        }, 300);
       };
       window.addEventListener('focus', handleFocus);
       return () => {
         window.removeEventListener('focus', handleFocus);
+        clearTimeout(timer);
       };
     }
   }, [currentProject, refreshGitStatus]);

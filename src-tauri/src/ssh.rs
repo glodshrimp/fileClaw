@@ -787,10 +787,31 @@ pub async fn sftp_upload(
     let cancelled_set = Arc::clone(&state.cancelled_transfers);
 
     tokio::task::spawn_blocking(move || {
-        // Acquire a lock temporarily to clone necessary connections
-        let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
-        let ssh_session = sessions.get_mut(&id).ok_or_else(|| "No active SSH connection".to_string())?;
-        let sftp = get_sftp(ssh_session)?;
+        // Acquire a lock temporarily to clone necessary connection parameters
+        let (host, port, username, password, key_path) = {
+            let sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
+            let ssh_session = sessions.get(&id).ok_or_else(|| "No active SSH connection".to_string())?;
+            (
+                ssh_session.host.clone(),
+                ssh_session.port,
+                ssh_session.username.clone(),
+                ssh_session.password.clone(),
+                ssh_session.key_path.clone(),
+            )
+        }; // Lock is dropped here!
+        
+        // Connect a dedicated session just for this file transfer
+        let (transfer_session, _tcp) = connect_session(
+            &host,
+            port,
+            &username,
+            password.as_deref(),
+            key_path.as_deref(),
+            10
+        )?;
+        
+        let sftp = transfer_session.sftp()
+            .map_err(|e| format!("Failed to start SFTP session: {}", e))?;
         
         // Open target remote file
         let mut remote_file = sftp.create(Path::new(&remote_path))
@@ -890,9 +911,31 @@ pub async fn sftp_download(
     let cancelled_set = Arc::clone(&state.cancelled_transfers);
 
     tokio::task::spawn_blocking(move || {
-        let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
-        let ssh_session = sessions.get_mut(&id).ok_or_else(|| "No active SSH connection".to_string())?;
-        let sftp = get_sftp(ssh_session)?;
+        // Acquire a lock temporarily to clone necessary connection parameters
+        let (host, port, username, password, key_path) = {
+            let sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
+            let ssh_session = sessions.get(&id).ok_or_else(|| "No active SSH connection".to_string())?;
+            (
+                ssh_session.host.clone(),
+                ssh_session.port,
+                ssh_session.username.clone(),
+                ssh_session.password.clone(),
+                ssh_session.key_path.clone(),
+            )
+        }; // Lock is dropped here!
+        
+        // Connect a dedicated session just for this file transfer
+        let (transfer_session, _tcp) = connect_session(
+            &host,
+            port,
+            &username,
+            password.as_deref(),
+            key_path.as_deref(),
+            10
+        )?;
+        
+        let sftp = transfer_session.sftp()
+            .map_err(|e| format!("Failed to start SFTP session: {}", e))?;
         
         let remote_stat = sftp.stat(Path::new(&remote_path)).map_err(|e| e.to_string())?;
         let total_size = remote_stat.size.unwrap_or(0);
