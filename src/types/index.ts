@@ -249,6 +249,7 @@ declare global {
       gitFetch: (repoPath: string) => Promise<void>;
       gitRemotes: (repoPath: string) => Promise<Array<[string, string]>>;
       gitSetRemoteUrl: (repoPath: string, name: string, url: string) => Promise<void>;
+      gitAddRemote: (repoPath: string, name: string, url: string) => Promise<void>;
       gitHistory: (repoPath: string, filePath?: string) => Promise<any[]>;
       gitLogGraph: (repoPath: string) => Promise<any[]>;
       gitUnpushedCommits: (repoPath: string, remote: string, branch: string) => Promise<{ hash: string; author: string; date: string; message: string }[]>;

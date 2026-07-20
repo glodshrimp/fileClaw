@@ -700,6 +700,7 @@ const electronAPI: any = {
   gitFetch: (repoPath: string) => invoke('git_fetch', { repoPath }),
   gitRemotes: (repoPath: string) => invoke('git_remotes', { repoPath }),
   gitSetRemoteUrl: (repoPath: string, name: string, url: string) => invoke('git_set_remote_url', { repoPath, name, url }),
+  gitAddRemote: (repoPath: string, name: string, url: string) => invoke('git_add_remote', { repoPath, name, url }),
   gitHistory: (repoPath: string, filePath?: string) => invoke('git_history', { repoPath, filePath }),
   gitLogGraph: (repoPath: string) => invoke('git_log_graph', { repoPath }),
   gitUnpushedCommits: (repoPath: string, remote: string, branch: string) => invoke('git_unpushed_commits', { repoPath, remote, branch }),

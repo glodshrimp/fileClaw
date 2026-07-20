@@ -149,6 +149,7 @@ pub fn run() {
             git::git_fetch,
             git::git_remotes,
             git::git_set_remote_url,
+            git::git_add_remote,
             git::git_history,
             git::git_stash_push,
             git::git_stash_list,

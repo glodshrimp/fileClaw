@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useWorkspaceStore } from '../../../../contexts/useWorkspaceStore';
-import { X, Check, Globe, Edit2, AlertTriangle } from 'lucide-react';
+import { X, Check, Globe, Edit2, AlertTriangle, Plus } from 'lucide-react';
 
 interface RemotesDialogProps {
   path: string;
@@ -20,6 +20,8 @@ export const RemotesDialog: React.FC<RemotesDialogProps> = ({ path, onClose }) =
   const [editingRemote, setEditingRemote] = useState<string | null>(null);
   const [editUrl, setEditUrl] = useState('');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [newRemoteName, setNewRemoteName] = useState('');
+  const [newRemoteUrl, setNewRemoteUrl] = useState('');
 
   const fetchRemotes = async () => {
     if (!projectPath) return;
@@ -64,6 +66,23 @@ export const RemotesDialog: React.FC<RemotesDialogProps> = ({ path, onClose }) =
     }
   };
 
+  const handleAddRemote = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newRemoteName.trim() || !newRemoteUrl.trim() || loading) return;
+    setLoading(true);
+    setErrorMsg(null);
+
+    try {
+      await window.electronAPI.gitAddRemote(projectPath, newRemoteName.trim(), newRemoteUrl.trim());
+      setNewRemoteName('');
+      setNewRemoteUrl('');
+      await fetchRemotes();
+    } catch (err: any) {
+      setErrorMsg('添加远程仓库失败: ' + err.message);
+      setLoading(false);
+    }
+  };
+
   return (
     <div className="fixed inset-0 z-[10000] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
       <div className="bg-[#111622] border border-white/10 w-full max-w-lg rounded-xl shadow-2xl flex flex-col overflow-hidden max-h-[80vh]">
@@ -88,6 +107,50 @@ export const RemotesDialog: React.FC<RemotesDialogProps> = ({ path, onClose }) =
 
         {/* Remotes Table/List */}
         <div className="flex-1 overflow-y-auto p-4 space-y-4 scrollbar-thin">
+          {/* Add Remote Form */}
+          <form onSubmit={handleAddRemote} className="bg-slate-950/60 border border-white/10 rounded-xl p-4 flex flex-col space-y-3">
+            <div className="text-xs font-bold text-slate-200 flex items-center space-x-1.5 border-b border-white/5 pb-2">
+              <Plus className="w-3.5 h-3.5 text-primary" />
+              <span>添加远程仓库 (Add Remote)</span>
+            </div>
+            
+            <div className="grid grid-cols-3 gap-3">
+              <div className="col-span-1">
+                <input
+                  type="text"
+                  value={newRemoteName}
+                  onChange={(e) => setNewRemoteName(e.target.value)}
+                  className="w-full bg-slate-900 border border-white/10 focus:border-primary/50 text-xs text-white rounded-lg px-2.5 py-1.5 focus:outline-none font-mono transition-all"
+                  placeholder="名称 (如 origin)"
+                  required
+                />
+              </div>
+              <div className="col-span-2">
+                <input
+                  type="text"
+                  value={newRemoteUrl}
+                  onChange={(e) => setNewRemoteUrl(e.target.value)}
+                  className="w-full bg-slate-900 border border-white/10 focus:border-primary/50 text-xs text-white rounded-lg px-2.5 py-1.5 focus:outline-none font-mono transition-all"
+                  placeholder="远程仓库 URL (Git URL)"
+                  required
+                />
+              </div>
+            </div>
+
+            <div className="flex justify-end pt-1">
+              <button
+                type="submit"
+                disabled={loading || !newRemoteName.trim() || !newRemoteUrl.trim()}
+                className="px-3.5 py-1.5 bg-primary hover:opacity-90 disabled:opacity-50 text-[10px] font-mono text-white rounded-lg transition-colors flex items-center space-x-1 cursor-pointer"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>添加 Remote</span>
+              </button>
+            </div>
+          </form>
+
+          <div className="border-t border-white/5 my-2" />
+
           {loading && remotes.length === 0 ? (
             <div className="h-40 flex items-center justify-center text-slate-500 font-mono text-xs">
               正在读取远程地址...

@@ -272,6 +272,15 @@ pub fn git_set_remote_url(repo_path: String, name: String, url: String) -> Resul
 }
 
 #[tauri::command]
+pub fn git_add_remote(repo_path: String, name: String, url: String) -> Result<(), String> {
+    if name.is_empty() || url.is_empty() {
+        return Err("Remote name and URL cannot be empty".to_string());
+    }
+    run_git_cmd(&repo_path, &["remote", "add", &name, &url])?;
+    Ok(())
+}
+
+#[tauri::command]
 pub fn git_history(repo_path: String, file_path: Option<String>) -> Result<Vec<GitCommitInfo>, String> {
     let mut args = vec![
         "log", 

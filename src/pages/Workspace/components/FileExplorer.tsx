@@ -728,9 +728,12 @@ const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefresh
         }`}
         style={{ paddingLeft: `${depth * 12 + (isSelected ? 6 : 8)}px` }}
         onClick={handleRowClick}
-        onContextMenu={async (e) => {
+        onContextMenu={(e) => {
           e.preventDefault();
           e.stopPropagation();
+          
+          const x = e.clientX;
+          const y = e.clientY;
           
           const { selectedFilePaths } = useWorkspaceStore.getState();
           if (!selectedFilePaths.includes(path)) {
@@ -738,16 +741,17 @@ const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefresh
             setLastSelectedFilePath(path);
           }
 
-          let systemClipboardPath = '';
-          try {
-            systemClipboardPath = await window.electronAPI.localReadFileFromClipboard();
-          } catch (err) {
-            console.warn('Failed to read system clipboard file path:', err);
-          }
+          setCtxMenu({ x, y });
 
-          setCanPaste(!!(systemClipboardPath || copiedFilePath));
-          
-          setCtxMenu({ x: e.clientX, y: e.clientY });
+          (async () => {
+            let systemClipboardPath = '';
+            try {
+              systemClipboardPath = await window.electronAPI.localReadFileFromClipboard();
+            } catch (err) {
+              console.warn('Failed to read system clipboard file path:', err);
+            }
+            setCanPaste(!!(systemClipboardPath || copiedFilePath));
+          })();
         }}
       >
         <div className="flex items-center space-x-1.5 min-w-0 flex-1">
