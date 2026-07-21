@@ -54,10 +54,16 @@ fn get_git_command() -> String {
 
 fn run_git_cmd(repo_path: &str, args: &[&str]) -> Result<String, String> {
     let git_cmd = get_git_command();
-    let output = Command::new(&git_cmd)
-        .args(args)
-        .current_dir(repo_path)
-        .output()
+    let mut cmd = Command::new(&git_cmd);
+    cmd.args(args).current_dir(repo_path);
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+
+    let output = cmd.output()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 format!(

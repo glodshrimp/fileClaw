@@ -717,12 +717,16 @@ export const FileExplorer: React.FC = () => {
     if (currentProject) {
       refreshGitStatus();
       
+      let lastRefreshTime = Date.now();
       let timer: ReturnType<typeof setTimeout>;
       const handleFocus = () => {
+        const now = Date.now();
+        if (now - lastRefreshTime < 3000) return;
         clearTimeout(timer);
         timer = setTimeout(() => {
+          lastRefreshTime = Date.now();
           refreshGitStatus();
-        }, 300);
+        }, 500);
       };
       window.addEventListener('focus', handleFocus);
       return () => {

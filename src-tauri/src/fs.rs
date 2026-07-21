@@ -196,10 +196,12 @@ pub fn local_write_file_to_clipboard(path: String) -> Result<bool, String> {
 
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
         let script = format!("Set-Clipboard -Path \"{}\"", path);
-        let output = std::process::Command::new("powershell")
-            .args(&["-Command", &script])
-            .output()
+        let mut cmd = std::process::Command::new("powershell");
+        cmd.args(&["-Command", &script]);
+        cmd.creation_flags(0x08000000);
+        let output = cmd.output()
             .map_err(|e| format!("Failed to execute powershell: {}", e))?;
         
         if !output.status.success() {
@@ -247,16 +249,19 @@ pub fn local_read_file_from_clipboard() -> Result<String, String> {
 
     #[cfg(target_os = "windows")]
     {
-        let output = std::process::Command::new("powershell")
-            .args(&["-Command", "(Get-Clipboard -Format FileDropList).Path"])
-            .output()
+        use std::os::windows::process::CommandExt;
+        let mut cmd1 = std::process::Command::new("powershell");
+        cmd1.args(&["-Command", "(Get-Clipboard -Format FileDropList).Path"]);
+        cmd1.creation_flags(0x08000000);
+        let output = cmd1.output()
             .map_err(|e| format!("Failed to execute powershell: {}", e))?;
         
         let mut path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if path_str.is_empty() {
-            let txt_output = std::process::Command::new("powershell")
-                .args(&["-Command", "Get-Clipboard -Format Text"])
-                .output()
+            let mut cmd2 = std::process::Command::new("powershell");
+            cmd2.args(&["-Command", "Get-Clipboard -Format Text"]);
+            cmd2.creation_flags(0x08000000);
+            let txt_output = cmd2.output()
                 .map_err(|e| format!("Failed to execute powershell text fallback: {}", e))?;
             path_str = String::from_utf8_lossy(&txt_output.stdout).trim().to_string();
         }
@@ -422,6 +427,11 @@ pub fn execute_bash_command(command: String, cwd: Option<String>) -> Result<Stri
     let mut cmd = if cfg!(target_os = "windows") {
         let mut c = std::process::Command::new("powershell");
         c.args(&["-Command", &command]);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            c.creation_flags(0x08000000);
+        }
         c
     } else {
         let mut c = std::process::Command::new("sh");
