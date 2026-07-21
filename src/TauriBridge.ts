@@ -709,6 +709,9 @@ const electronAPI: any = {
   gitStashPush: (repoPath: string, message?: string) => invoke('git_stash_push', { repoPath, message }),
   gitStashList: (repoPath: string) => invoke('git_stash_list', { repoPath }),
   gitStashPop: (repoPath: string, index: number) => invoke('git_stash_pop', { repoPath, index }),
+  gitRefreshStatus: (workspacePath: string, gitRoots: string[] | null, activeTabPath: string | null) => 
+    invoke('git_refresh_status', { workspacePath, gitRoots, activeTabPath }),
+
 
   // Git Settings APIs
   getGitSettings: async () => {

@@ -258,6 +258,18 @@ declare global {
       gitStashPush: (repoPath: string, message?: string) => Promise<void>;
       gitStashList: (repoPath: string) => Promise<string[]>;
       gitStashPop: (repoPath: string, index: number) => Promise<void>;
+      gitRefreshStatus: (
+        workspacePath: string,
+        gitRoots: string[] | null,
+        activeTabPath: string | null
+      ) => Promise<{
+        gitBranch: string | null;
+        gitRoots: string[];
+        gitRepoBranches: Record<string, string>;
+        gitFileStatuses: Record<string, string>;
+        gitDirtyFolders: Record<string, { modified: boolean; added: boolean; untracked: boolean; notAdded: boolean }>;
+      }>;
+
 
       onSshOutput: (id: string, callback: (data: string) => void) => () => void;
       onSshError: (id: string, callback: (error: string) => void) => () => void;

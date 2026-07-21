@@ -1,9 +1,10 @@
-import React, { useState, useEffect, useRef, useMemo, useCallback, createContext, useContext } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback, createContext, useContext, startTransition } from 'react';
 import { useWorkspaceStore } from '../../../contexts/useWorkspaceStore';
-import { Folder, ChevronRight, ChevronDown, Plus, Search, X, RotateCw, Settings } from 'lucide-react';
+import { Folder, ChevronRight, ChevronDown, Plus, Search, X, RotateCw, Settings, Loader2, FolderClosed } from 'lucide-react';
 import DeleteConfirmModal from '../../../components/DeleteConfirmModal';
 import { copyToClipboard } from '../../../utils/copy';
 import { getFileIcon as getFileIconUtil, getFolderIcon } from '../../../utils/fileIcon';
+import { getProjectRootPath, normalizePath } from '../../../utils/path';
 import { useApp } from '../../../contexts/AppContext';
 import { CommitDialog } from './git/CommitDialog';
 import { BranchesDialog } from './git/BranchesDialog';
@@ -37,6 +38,9 @@ interface ActionContextType {
 }
 
 const FileExplorerActionContext = createContext<ActionContextType | null>(null);
+
+/** Number of child nodes mounted per animation frame during batch rendering. */
+const CHILDREN_BATCH_SIZE = 50;
 
 interface MenuItem {
   label?: string;
@@ -223,238 +227,198 @@ const getUniqueDestPath = async (srcPath: string, destDir: string): Promise<stri
 
   return `${destDir}${separator}${candidateName}`;
 };
-
-interface FileNodeProps {
+interface FlatTreeItem {
   name: string;
   path: string;
   isDir: boolean;
   depth: number;
+  isEmptyPlaceholder?: boolean;
+  isCreatingPlaceholder?: boolean;
+  creatingType?: 'file' | 'folder';
+  isMorePlaceholder?: boolean;
 }
 
-const FileNode = React.memo<FileNodeProps>(({ name, path, isDir, depth }) => {
-  const actions = useContext(FileExplorerActionContext)!;
+interface FileNodeRowProps {
+  item: FlatTreeItem;
+  isSelected: boolean;
+  isExpanded: boolean;
+  statusColorClass: string;
+  isLoading: boolean;
+  onRowClick: (e: React.MouseEvent, path: string, name: string, isDir: boolean) => void;
+  onContextMenu: (e: React.MouseEvent, path: string, name: string, isDir: boolean) => void;
+  onQuickAction: (e: React.MouseEvent, path: string, type: 'file' | 'folder') => void;
+  onCreateSubmit: (name: string, parentPath: string, type: 'file' | 'folder') => void;
+  onCancelCreating: () => void;
+  onLoadAllChildren: (path: string) => void;
+}
 
-  const isExpanded = useWorkspaceStore((s) => !!s.expandedFolders[path]);
-  const isSelected = useWorkspaceStore((s) =>
-    s.selectedFilePaths.length > 0
-      ? s.selectedFilePaths.includes(path)
-      : s.activeTabPath === path
-  );
-
-  const statusColorClass = useWorkspaceStore((s) => {
-    const isCommonIgnored = name === 'node_modules' 
-      || name === 'target' 
-      || name === 'dist' 
-      || name === 'build'
-      || name.startsWith('.');
-
-    if (isDir) {
-      const folderStatus = s.gitDirtyFolders[path];
-      if (folderStatus) {
-        if (folderStatus.notAdded) return 'text-[#f87171]';
-        if (folderStatus.modified) return 'text-[#60a5fa]';
-        if (folderStatus.added) return 'text-[#4ade80]';
-        if (folderStatus.untracked) return 'text-[#fb923c]';
-      }
-      if (isCommonIgnored) return 'text-slate-500';
-    } else {
-      const statusXY = s.gitFileStatuses[path];
-      if (statusXY) {
-        if (statusXY === '??') return 'text-[#fb923c]';
-        if (statusXY === '!!') return 'text-slate-500';
-        if (statusXY.includes('D')) return 'text-red-400 line-through';
-        
-        const X = statusXY[0];
-        const Y = statusXY[1];
-        if (Y === 'M') return 'text-[#f87171]';
-        if (X === 'M') return 'text-[#60a5fa]';
-        if (X === 'A' || X === 'R') return 'text-[#4ade80]';
-      }
-      if (isCommonIgnored) return 'text-slate-500';
-    }
-    return '';
-  });
-
-  const fileExplorerRefreshKey = useWorkspaceStore((s) => s.fileExplorerRefreshKey);
-
-  const selectAndToggleFolder = useWorkspaceStore((s) => s.selectAndToggleFolder);
-  const selectSingleFile = useWorkspaceStore((s) => s.selectSingleFile);
-  const setSelectedFilePaths = useWorkspaceStore((s) => s.setSelectedFilePaths);
-  const setLastSelectedFilePath = useWorkspaceStore((s) => s.setLastSelectedFilePath);
-  const openFile = useWorkspaceStore((s) => s.openFile);
-
-  const [children, setChildren] = useState<FileEntry[] | null>(null);
-  const [loading, setLoading] = useState(false);
+const FileNodeRow = React.memo<FileNodeRowProps>(({
+  item,
+  isSelected,
+  isExpanded,
+  statusColorClass,
+  isLoading,
+  onRowClick,
+  onContextMenu,
+  onQuickAction,
+  onCreateSubmit,
+  onCancelCreating,
+  onLoadAllChildren,
+}) => {
+  const { name, path, isDir, depth, isEmptyPlaceholder, isCreatingPlaceholder, creatingType, isMorePlaceholder } = item;
   const [newItemName, setNewItemName] = useState('');
 
-  const isCreatingHere = actions.creatingTarget?.path === path;
-  const creatingType = actions.creatingTarget?.type;
+  if (isEmptyPlaceholder) {
+    return (
+      <div 
+        className="text-[10px] text-slate-500 italic h-6 flex items-center select-none" 
+        style={{ paddingLeft: `${depth * 12 + 8}px` }}
+      >
+        空目录
+      </div>
+    );
+  }
 
-  const loadChildren = useCallback(async (force = false) => {
-    if (!isDir) return;
-    setLoading(true);
-    try {
-      const res = await actions.getDirChildren(path, force);
-      setChildren(res);
-    } catch (err) {
-      console.error('Failed to load dir:', err);
-    } finally {
-      setLoading(false);
-    }
-  }, [isDir, path, actions]);
+  if (isMorePlaceholder) {
+    const parentPath = path.substring(0, path.lastIndexOf('/::more::'));
+    return (
+      <div 
+        onClick={() => onLoadAllChildren(parentPath)}
+        className="text-[10px] text-primary hover:underline italic h-6 flex items-center cursor-pointer select-none" 
+        style={{ paddingLeft: `${depth * 12 + 8}px` }}
+      >
+        {name}
+      </div>
+    );
+  }
 
-  useEffect(() => {
-    if (isDir && isExpanded) {
-      loadChildren();
-    }
-  }, [isDir, path, isExpanded, fileExplorerRefreshKey, loadChildren]);
+  if (isCreatingPlaceholder && creatingType) {
+    const parentPath = path.substring(0, path.lastIndexOf('/::creating::'));
+    const handleFormSubmit = (e: React.FormEvent) => {
+      e.preventDefault();
+      if (newItemName.trim()) {
+        onCreateSubmit(newItemName.trim(), parentPath, creatingType);
+        setNewItemName('');
+      }
+    };
+
+    return (
+      <form 
+        onSubmit={handleFormSubmit} 
+        className="flex items-center space-x-1 h-6 pr-2 select-none" 
+        style={{ paddingLeft: `${depth * 12 + 8}px` }}
+      >
+        <input
+          type="text"
+          autoFocus
+          placeholder={creatingType === 'file' ? '文件名...' : '文件夹名...'}
+          value={newItemName}
+          onChange={(e) => setNewItemName(e.target.value)}
+          onBlur={onCancelCreating}
+          onKeyDown={(e) => {
+            if (e.key === 'Escape') {
+              onCancelCreating();
+            }
+          }}
+          className="bg-slate-950 border border-white/10 rounded px-1.5 py-0.5 text-[10px] text-white focus:outline-none focus:border-primary flex-1 font-mono"
+        />
+      </form>
+    );
+  }
 
   const handleRowClick = (e: React.MouseEvent) => {
-    e.stopPropagation();
-
-    const { selectedFilePaths, lastSelectedFilePath } = useWorkspaceStore.getState();
-
-    if (e.shiftKey && lastSelectedFilePath) {
-      const elements = Array.from(document.querySelectorAll('[data-file-path]'));
-      const visiblePaths = elements.map(el => el.getAttribute('data-file-path')).filter(Boolean) as string[];
-      const idxStart = visiblePaths.indexOf(lastSelectedFilePath);
-      const idxEnd = visiblePaths.indexOf(path);
-      
-      if (idxStart !== -1 && idxEnd !== -1) {
-        const min = Math.min(idxStart, idxEnd);
-        const max = Math.max(idxStart, idxEnd);
-        const rangePaths = visiblePaths.slice(min, max + 1);
-        setSelectedFilePaths(rangePaths);
-      }
-      return;
-    }
-
-    if (e.metaKey || e.ctrlKey) {
-      if (selectedFilePaths.includes(path)) {
-        setSelectedFilePaths(selectedFilePaths.filter(p => p !== path));
-      } else {
-        setSelectedFilePaths([...selectedFilePaths, path]);
-      }
-      setLastSelectedFilePath(path);
-      return;
-    }
-
-    if (isDir) {
-      selectAndToggleFolder(path);
-    } else {
-      selectSingleFile(path);
-      openFile(path, name);
-    }
-  };
-
-  const handleCreateSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!newItemName.trim() || !creatingType) return;
-
-    try {
-      const isCreateDir = creatingType === 'folder';
-      await window.electronAPI.localCreateNode(path, newItemName.trim(), isCreateDir);
-      actions.cancelCreating();
-      setNewItemName('');
-      actions.reloadDir(path);
-    } catch (err: any) {
-      alert('创建失败: ' + err.message);
-    }
+    onRowClick(e, path, name, isDir);
   };
 
   return (
-    <div className="select-none">
-      <div
-        data-file-path={path}
-        className={`group flex items-center justify-between py-1 px-2 hover:bg-background-secondary/85 text-text-primary rounded cursor-pointer transition-colors text-[11px] ${
-          isSelected ? 'bg-primary/20 border-l-2 border-primary pl-[6px]' : ''
-        }`}
-        style={{ paddingLeft: `${depth * 12 + (isSelected ? 6 : 8)}px` }}
-        onClick={handleRowClick}
-        onContextMenu={(e) => {
-          actions.openContextMenu(e, path, name, isDir);
-        }}
-      >
-        <div className="flex items-center space-x-1.5 min-w-0 flex-1">
-          {isDir ? (
-            <>
-              {isExpanded ? <ChevronDown className="w-3 h-3 text-text-tertiary" /> : <ChevronRight className="w-3 h-3 text-text-tertiary" />}
-              {getFolderIcon(name, isExpanded)}
-            </>
-          ) : (
-            getFileIconUtil(name)
-          )}
-          <span className={`truncate ${statusColorClass || (isSelected ? 'text-primary font-medium' : 'text-text-secondary group-hover:text-text-primary')}`}>
-            {name}
-          </span>
-        </div>
-
-        {/* Quick action buttons for directories */}
-        {isDir && (
-          <div className="hidden group-hover:flex items-center space-x-1 flex-shrink-0 pr-1">
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                if (!isExpanded) selectAndToggleFolder(path);
-                actions.startCreating(path, 'file');
-              }}
-              className="p-0.5 hover:bg-background-secondary rounded text-text-tertiary hover:text-text-primary"
-              title="新建文件"
-            >
-              <Plus className="w-3 h-3" />
-            </button>
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                if (!isExpanded) selectAndToggleFolder(path);
-                actions.startCreating(path, 'folder');
-              }}
-              className="p-0.5 hover:bg-background-secondary rounded text-text-tertiary hover:text-text-primary"
-              title="新建文件夹"
-            >
-              <Folder className="w-3 h-3" />
-            </button>
-          </div>
+    <div
+      data-file-path={path}
+      className={`group flex items-center justify-between h-6 px-2 hover:bg-background-secondary/85 text-text-primary rounded cursor-pointer transition-colors text-[11px] select-none ${
+        isSelected ? 'bg-primary/20 border-l-2 border-primary pl-[6px]' : ''
+      }`}
+      style={{ paddingLeft: `${depth * 12 + (isSelected ? 6 : 8)}px` }}
+      onClick={handleRowClick}
+      onContextMenu={(e) => onContextMenu(e, path, name, isDir)}
+    >
+      <div className="flex items-center space-x-1.5 min-w-0 flex-1">
+        {isDir ? (
+          <>
+            {isExpanded ? <ChevronDown className="w-3 h-3 text-text-tertiary" /> : <ChevronRight className="w-3 h-3 text-text-tertiary" />}
+            {isLoading ? (
+              <Loader2 className="w-3 h-3 animate-spin text-text-tertiary flex-shrink-0" />
+            ) : (
+              getFolderIcon(name, isExpanded)
+            )}
+          </>
+        ) : (
+          getFileIconUtil(name)
         )}
+        <span className={`truncate ${statusColorClass || (isSelected ? 'text-primary font-medium' : 'text-text-secondary group-hover:text-text-primary')}`}>
+          {name}
+        </span>
       </div>
 
-      {/* Inline Create Input */}
-      {isCreatingHere && (
-        <form onSubmit={handleCreateSubmit} className="flex items-center space-x-1 py-1 pr-2" style={{ paddingLeft: `${(depth + 1) * 12 + 8}px` }}>
-          <input
-            type="text"
-            autoFocus
-            placeholder={creatingType === 'file' ? '文件名...' : '文件夹名...'}
-            value={newItemName}
-            onChange={(e) => setNewItemName(e.target.value)}
-            onBlur={() => { actions.cancelCreating(); setNewItemName(''); }}
-            className="bg-slate-950 border border-white/10 rounded px-1.5 py-0.5 text-[10px] text-white focus:outline-none focus:border-primary flex-1 font-mono"
-          />
-        </form>
-      )}
-
-      {/* Children list */}
-      {isDir && isExpanded && children && (
-        <div className="overflow-hidden">
-          {children.length === 0 && !loading && (
-            <div className="text-[10px] text-slate-500 italic py-1" style={{ paddingLeft: `${(depth + 1) * 12 + 8}px` }}>
-              空目录
-            </div>
-          )}
-          {children.map((child) => (
-            <FileNode
-              key={child.name}
-              name={child.name}
-              path={child.path}
-              isDir={child.isDir}
-              depth={depth + 1}
-            />
-          ))}
+      {isDir && (
+        <div className="hidden group-hover:flex items-center space-x-1 flex-shrink-0 pr-1">
+          <button
+            onClick={(e) => onQuickAction(e, path, 'file')}
+            className="p-0.5 hover:bg-background-secondary rounded text-text-tertiary hover:text-text-primary"
+            title="新建文件"
+          >
+            <Plus className="w-3 h-3" />
+          </button>
+          <button
+            onClick={(e) => onQuickAction(e, path, 'folder')}
+            className="p-0.5 hover:bg-background-secondary rounded text-text-tertiary hover:text-text-primary"
+            title="新建文件夹"
+          >
+            <Folder className="w-3 h-3" />
+          </button>
         </div>
       )}
     </div>
   );
 });
+
+const getStatusColorClass = (
+  name: string,
+  path: string,
+  isDir: boolean,
+  gitFileStatuses: Record<string, string>,
+  gitDirtyFolders: Record<string, any>
+): string => {
+  const isCommonIgnored = name === 'node_modules' 
+    || name === 'target' 
+    || name === 'dist' 
+    || name === 'build'
+    || name.startsWith('.');
+
+  if (isDir) {
+    const folderStatus = gitDirtyFolders[path];
+    if (folderStatus) {
+      if (folderStatus.notAdded) return 'text-[#f87171]';
+      if (folderStatus.modified) return 'text-[#60a5fa]';
+      if (folderStatus.added) return 'text-[#4ade80]';
+      if (folderStatus.untracked) return 'text-[#fb923c]';
+    }
+    if (isCommonIgnored) return 'text-slate-500';
+  } else {
+    const statusXY = gitFileStatuses[path];
+    if (statusXY) {
+      if (statusXY === '??') return 'text-[#fb923c]';
+      if (statusXY === '!!') return 'text-slate-500';
+      if (statusXY.includes('D')) return 'text-red-400 line-through';
+      
+      const X = statusXY[0];
+      const Y = statusXY[1];
+      if (Y === 'M') return 'text-[#f87171]';
+      if (X === 'M') return 'text-[#60a5fa]';
+      if (X === 'A' || X === 'R') return 'text-[#4ade80]';
+    }
+    if (isCommonIgnored) return 'text-slate-500';
+  }
+  return '';
+};
 
 const IGNORED_DIRS = ['.git', 'node_modules', 'dist', 'build', 'target', '.vscode', '.idea', '__pycache__', 'env', 'venv'];
 
@@ -490,6 +454,8 @@ const recursiveSearch = async (
   return results;
 };
 
+const LARGE_DIR_LIMIT = 200;
+
 export const FileExplorer: React.FC = () => {
   const currentProject = useWorkspaceStore((s) => s.currentProject);
   const openFile = useWorkspaceStore((s) => s.openFile);
@@ -507,29 +473,245 @@ export const FileExplorer: React.FC = () => {
   const [activeGitModal, setActiveGitModal] = useState<{ type: GitModalType; path: string } | null>(null);
   const [creatingTarget, setCreatingTarget] = useState<{ path: string; type: 'file' | 'folder' } | null>(null);
 
+  // Zustand State subscriptions
+  const expandedFolders = useWorkspaceStore((s) => s.expandedFolders);
+  const selectedFilePaths = useWorkspaceStore((s) => s.selectedFilePaths);
+  const activeTabPath = useWorkspaceStore((s) => s.activeTabPath);
+  const gitFileStatuses = useWorkspaceStore((s) => s.gitFileStatuses);
+  const gitDirtyFolders = useWorkspaceStore((s) => s.gitDirtyFolders);
+  const fileExplorerRefreshKey = useWorkspaceStore((s) => s.fileExplorerRefreshKey);
+
+  const selectAndToggleFolder = useWorkspaceStore((s) => s.selectAndToggleFolder);
+  const selectSingleFile = useWorkspaceStore((s) => s.selectSingleFile);
+  const setSelectedFilePaths = useWorkspaceStore((s) => s.setSelectedFilePaths);
+  const setLastSelectedFilePath = useWorkspaceStore((s) => s.setLastSelectedFilePath);
+  const collapseAllFolders = useWorkspaceStore((s) => s.collapseAllFolders);
+
   // Directory Content Cache
   const dirCache = useRef<Map<string, FileEntry[]>>(new Map());
+  const [fullyExpandedDirs, setFullyExpandedDirs] = useState<Record<string, boolean>>({});
 
   const refreshGitStatus = useWorkspaceStore((s) => s.refreshGitStatus);
   const refreshFileExplorerStore = useWorkspaceStore((s) => s.refreshFileExplorer);
 
   const clearDirCache = useCallback(() => {
     dirCache.current.clear();
+    setFullyExpandedDirs({});
   }, []);
 
   const getDirChildren = useCallback(async (dirPath: string, force = false): Promise<FileEntry[]> => {
-    if (!force && dirCache.current.has(dirPath)) {
-      return dirCache.current.get(dirPath)!;
+    const normalized = normalizePath(dirPath);
+    if (!force && dirCache.current.has(normalized)) {
+      return dirCache.current.get(normalized)!;
     }
-    const list = await window.electronAPI.localListDir(dirPath);
-    dirCache.current.set(dirPath, list);
-    return list;
+    const list = await window.electronAPI.localListDir(normalized);
+    const entries: FileEntry[] = list.map((item: FileEntry) => ({
+      name: item.name,
+      isDir: item.isDir,
+      path: normalizePath(item.path),
+      size: item.size ?? 0,
+      mtime: item.mtime ?? 0,
+      ctime: item.ctime ?? 0,
+    }));
+    dirCache.current.set(normalized, entries);
+    return entries;
   }, []);
 
   const reloadDir = useCallback(async (dirPath: string) => {
     dirCache.current.delete(dirPath);
     refreshFileExplorerStore();
   }, [refreshFileExplorerStore]);
+
+  // Loading state of folders
+  const [loadingFolders, setLoadingFolders] = useState<Record<string, boolean>>({});
+
+  const loadFolderChildren = useCallback(async (dirPath: string) => {
+    const normalized = normalizePath(dirPath);
+    setLoadingFolders((prev) => ({ ...prev, [normalized]: true }));
+    try {
+      await getDirChildren(normalized, true);
+    } catch (err) {
+      console.error('Failed to load children in lazy loader:', err);
+    } finally {
+      setLoadingFolders((prev) => ({ ...prev, [normalized]: false }));
+      refreshFileExplorerStore();
+    }
+  }, [getDirChildren, refreshFileExplorerStore]);
+
+  const handleLoadAllChildren = useCallback((dirPath: string) => {
+    setFullyExpandedDirs((prev) => ({ ...prev, [dirPath]: true }));
+    refreshFileExplorerStore();
+  }, [refreshFileExplorerStore]);
+
+  // Build the flat list of visible items recursively
+  const visibleItems = useMemo(() => {
+    if (!currentProject) return [];
+    const root = getProjectRootPath(currentProject);
+    const items: FlatTreeItem[] = [];
+
+    const traverse = (path: string, name: string, isDir: boolean, depth: number) => {
+      const normalized = normalizePath(path);
+      items.push({ name, path: normalized, isDir, depth });
+
+      if (isDir && expandedFolders[normalized]) {
+        // Render creating input row first if active in this dir
+        if (creatingTarget && creatingTarget.path === normalized) {
+          items.push({
+            name: '',
+            path: `${normalized}/::creating::`,
+            isDir: creatingTarget.type === 'folder',
+            depth: depth + 1,
+            isCreatingPlaceholder: true,
+            creatingType: creatingTarget.type,
+          });
+        }
+
+        const children = dirCache.current.get(normalized);
+        if (children) {
+          if (children.length === 0) {
+            // Render Empty folder indicator row
+            if (!creatingTarget || creatingTarget.path !== normalized) {
+              items.push({
+                name: '空目录',
+                path: `${normalized}/::empty::`,
+                isDir: false,
+                depth: depth + 1,
+                isEmptyPlaceholder: true,
+              });
+            }
+          } else {
+            const shouldTruncate = children.length > LARGE_DIR_LIMIT && !fullyExpandedDirs[normalized];
+            const childrenToShow = shouldTruncate ? children.slice(0, LARGE_DIR_LIMIT) : children;
+
+            for (const child of childrenToShow) {
+              traverse(child.path, child.name, child.isDir, depth + 1);
+            }
+
+            if (shouldTruncate) {
+              items.push({
+                name: `显示前 ${LARGE_DIR_LIMIT} 项 (共 ${children.length} 项)，点击加载全部...`,
+                path: `${normalized}/::more::`,
+                isDir: false,
+                depth: depth + 1,
+                isEmptyPlaceholder: false,
+                isMorePlaceholder: true,
+              });
+            }
+          }
+        }
+      }
+    };
+
+    traverse(root, currentProject.name, true, 0);
+    return items;
+  }, [currentProject, expandedFolders, creatingTarget, fullyExpandedDirs, fileExplorerRefreshKey]);
+
+  // Reactive lazy loader for expanded directories
+  useEffect(() => {
+    visibleItems.forEach((item) => {
+      if (item.isDir && expandedFolders[item.path]) {
+        const hasCache = dirCache.current.has(item.path);
+        const isLoading = loadingFolders[item.path];
+        if (!hasCache && !isLoading) {
+          loadFolderChildren(item.path);
+        }
+      }
+    });
+  }, [visibleItems, expandedFolders, loadingFolders, loadFolderChildren]);
+
+  // Scroll measurement for custom Virtual Scroll list
+  const ITEM_HEIGHT = 24;
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [measuredHeight, setMeasuredHeight] = useState(600);
+
+  const handleScroll = (e: React.UIEvent<HTMLDivElement>) => {
+    setScrollTop(e.currentTarget.scrollTop);
+  };
+
+  useEffect(() => {
+    if (containerRef.current) {
+      setMeasuredHeight(containerRef.current.clientHeight);
+      const observer = new ResizeObserver((entries) => {
+        for (const entry of entries) {
+          setMeasuredHeight(entry.contentRect.height);
+        }
+      });
+      observer.observe(containerRef.current);
+      return () => observer.disconnect();
+    }
+  }, []);
+
+  const startIndex = Math.max(0, Math.floor(scrollTop / ITEM_HEIGHT) - 5);
+  const endIndex = Math.min(visibleItems.length, Math.ceil((scrollTop + measuredHeight) / ITEM_HEIGHT) + 5);
+  const renderedItems = visibleItems.slice(startIndex, endIndex);
+
+  // Row Interactions
+  const handleRowClick = useCallback((e: React.MouseEvent, path: string, name: string, isDir: boolean) => {
+    e.stopPropagation();
+
+    const state = useWorkspaceStore.getState();
+
+    if (e.shiftKey && state.lastSelectedFilePath) {
+      const visiblePaths = visibleItems.map(item => item.path);
+      const idxStart = visiblePaths.indexOf(state.lastSelectedFilePath);
+      const idxEnd = visiblePaths.indexOf(path);
+      
+      if (idxStart !== -1 && idxEnd !== -1) {
+        const min = Math.min(idxStart, idxEnd);
+        const max = Math.max(idxStart, idxEnd);
+        const rangePaths = visiblePaths.slice(min, max + 1);
+        state.setSelectedFilePaths(rangePaths);
+      }
+      return;
+    }
+
+    if (e.metaKey || e.ctrlKey) {
+      if (state.selectedFilePaths.includes(path)) {
+        state.setSelectedFilePaths(state.selectedFilePaths.filter(p => p !== path));
+      } else {
+        state.setSelectedFilePaths([...state.selectedFilePaths, path]);
+      }
+      state.setLastSelectedFilePath(path);
+      return;
+    }
+
+    if (isDir) {
+      state.selectAndToggleFolder(path);
+    } else {
+      state.selectSingleFile(path);
+      state.openFile(path, name);
+    }
+  }, [visibleItems]);
+
+  const handleQuickAction = useCallback((e: React.MouseEvent, path: string, type: 'file' | 'folder') => {
+    e.stopPropagation();
+    const state = useWorkspaceStore.getState();
+    if (!state.expandedFolders[path]) {
+      state.selectAndToggleFolder(path);
+    }
+    setCreatingTarget({ path, type });
+  }, []);
+
+  const handleCreateSubmit = useCallback(async (name: string, parentPath: string, type: 'file' | 'folder') => {
+    try {
+      const isCreateDir = type === 'folder';
+      await window.electronAPI.localCreateNode(parentPath, name, isCreateDir);
+      setCreatingTarget(null);
+      
+      dirCache.current.delete(parentPath);
+      refreshFileExplorerStore();
+      
+      const state = useWorkspaceStore.getState();
+      await state.refreshGitStatus();
+    } catch (err: any) {
+      alert('创建失败: ' + err.message);
+    }
+  }, [refreshFileExplorerStore]);
+
+  const cancelCreating = useCallback(() => {
+    setCreatingTarget(null);
+  }, []);
 
   useEffect(() => {
     if (currentProject) {
@@ -871,16 +1053,6 @@ export const FileExplorer: React.FC = () => {
     setActiveCtxMenu({ x: e.clientX, y: e.clientY, items });
   }, [reloadDir]);
 
-  const openGitModal = useCallback((type: GitModalType, path: string) => {
-    setActiveGitModal({ type, path });
-  }, []);
-
-  const openDeleteModal = useCallback((path: string, name: string, isDir: boolean) => {
-    const { selectedFilePaths } = useWorkspaceStore.getState();
-    const selectedCount = selectedFilePaths.includes(path) ? selectedFilePaths.length : 1;
-    setActiveDeleteTarget({ path, name, isDir, selectedCount });
-  }, []);
-
   const handleConfirmDelete = async () => {
     if (!activeDeleteTarget) return;
     try {
@@ -902,204 +1074,222 @@ export const FileExplorer: React.FC = () => {
     }
   };
 
-  const startCreating = useCallback((parentPath: string, type: 'file' | 'folder') => {
-    setCreatingTarget({ path: parentPath, type });
-  }, []);
-
-  const cancelCreating = useCallback(() => {
-    setCreatingTarget(null);
-  }, []);
-
-  const actionContextValue = useMemo<ActionContextType>(() => ({
-    openContextMenu,
-    openGitModal,
-    openDeleteModal,
-    getDirChildren,
-    startCreating,
-    creatingTarget,
-    cancelCreating,
-    reloadDir,
-  }), [openContextMenu, openGitModal, openDeleteModal, getDirChildren, startCreating, creatingTarget, cancelCreating, reloadDir]);
-
   if (!currentProject) return null;
 
-  const rootPath = currentProject.codePath || currentProject.path;
+  const rootPath = getProjectRootPath(currentProject);
 
   return (
-    <FileExplorerActionContext.Provider value={actionContextValue}>
-      <div className="flex flex-col h-full bg-background-primary border-r border-border-primary select-none w-full">
-        <div className="p-3 border-b border-border-primary flex items-center justify-between flex-shrink-0 bg-background-secondary/20">
-          <h3 className="text-xs font-bold text-text-primary uppercase tracking-wider font-mono">资源管理器</h3>
-          <div className="flex items-center space-x-1.5">
-            <button
-              onClick={async () => {
-                try {
-                  const path = await window.electronAPI.selectDirectory();
-                  if (path) {
-                    const updated = { ...currentProject, codePath: path };
-                    await window.electronAPI.updateProject(currentProject.id, updated);
-                    dispatch({ type: 'UPDATE_PROJECT', payload: updated });
-                    setCurrentProject(updated);
-                  }
-                } catch (err) {
-                  console.error('Failed to change code directory:', err);
+    <div className="flex flex-col h-full bg-background-primary border-r border-border-primary select-none w-full">
+      <div className="p-3 border-b border-border-primary flex items-center justify-between flex-shrink-0 bg-background-secondary/20">
+        <h3 className="text-xs font-bold text-text-primary uppercase tracking-wider font-mono">资源管理器</h3>
+        <div className="flex items-center space-x-1.5">
+          <button
+            onClick={async () => {
+              try {
+                const path = await window.electronAPI.selectDirectory();
+                if (path) {
+                  const updated = { ...currentProject, codePath: path };
+                  await window.electronAPI.updateProject(currentProject.id, updated);
+                  dispatch({ type: 'UPDATE_PROJECT', payload: updated });
+                  setCurrentProject(updated);
                 }
-              }}
-              className="p-1 rounded text-text-secondary hover:bg-background-secondary/80 hover:text-text-primary transition-colors"
-              title={`开发代码路径: ${rootPath}`}
-            >
-              <Settings className="w-3.5 h-3.5" />
-            </button>
-            
-            <button
-              onClick={() => {
-                setShowSearch(!showSearch);
-                if (showSearch) setSearchQuery('');
-              }}
-              className={`p-1 rounded transition-colors ${
-                showSearch ? 'bg-primary/20 text-primary' : 'text-text-secondary hover:bg-background-secondary/80 hover:text-text-primary'
-              }`}
-              title="搜索文件"
-            >
-              <Search className="w-3.5 h-3.5" />
-            </button>
+              } catch (err) {
+                console.error('Failed to change code directory:', err);
+              }
+            }}
+            className="p-1 rounded text-text-secondary hover:bg-background-secondary/80 hover:text-text-primary transition-colors"
+            title={`开发代码路径: ${rootPath}`}
+          >
+            <Settings className="w-3.5 h-3.5" />
+          </button>
+          
+          <button
+            onClick={() => {
+              setShowSearch(!showSearch);
+              if (showSearch) setSearchQuery('');
+            }}
+            className={`p-1 rounded transition-colors ${
+              showSearch ? 'bg-primary/20 text-primary' : 'text-text-secondary hover:bg-background-secondary/80 hover:text-text-primary'
+            }`}
+            title="搜索文件"
+          >
+            <Search className="w-3.5 h-3.5" />
+          </button>
 
-            <button
-              onClick={async (e) => {
-                const icon = e.currentTarget.querySelector('svg');
-                if (icon) {
-                  icon.classList.add('animate-spin');
-                  setTimeout(() => icon.classList.remove('animate-spin'), 600);
-                }
-                clearDirCache();
-                refreshFileExplorerStore();
-                await refreshGitStatus();
-              }}
-              className="p-1 rounded text-text-secondary hover:bg-background-secondary/80 hover:text-text-primary transition-colors duration-200"
-              title="刷新目录"
-            >
-              <RotateCw className="w-3.5 h-3.5" />
-            </button>
+          <button
+            onClick={() => {
+              collapseAllFolders();
+            }}
+            className="p-1 rounded text-text-secondary hover:bg-background-secondary/80 hover:text-text-primary transition-colors"
+            title="折叠全部文件夹"
+          >
+            <FolderClosed className="w-3.5 h-3.5" />
+          </button>
+
+          <button
+            onClick={async (e) => {
+              const icon = e.currentTarget.querySelector('svg');
+              if (icon) {
+                icon.classList.add('animate-spin');
+                setTimeout(() => icon.classList.remove('animate-spin'), 600);
+              }
+              clearDirCache();
+              refreshFileExplorerStore();
+              await refreshGitStatus();
+            }}
+            className="p-1 rounded text-text-secondary hover:bg-background-secondary/80 hover:text-text-primary transition-colors duration-200"
+            title="刷新目录"
+          >
+            <RotateCw className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      </div>
+
+      {showSearch && (
+        <div className="p-2 border-b border-border-primary bg-background-secondary/40 flex-shrink-0">
+          <div className="relative">
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="搜索项目文件..."
+              className="w-full bg-background-primary border border-border-primary focus:border-primary/50 text-xs text-text-primary rounded px-2.5 py-1.5 pl-7 focus:outline-none placeholder-text-tertiary font-mono transition-all"
+              autoFocus
+            />
+            <Search className="w-3.5 h-3.5 text-text-tertiary absolute left-2.5 top-2.5" />
+            {searchQuery && (
+              <button 
+                onClick={() => setSearchQuery('')}
+                className="absolute right-2.5 top-2.5 text-text-tertiary hover:text-text-primary"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            )}
           </div>
         </div>
+      )}
 
-        {showSearch && (
-          <div className="p-2 border-b border-border-primary bg-background-secondary/40 flex-shrink-0">
-            <div className="relative">
-              <input
-                type="text"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="搜索项目文件..."
-                className="w-full bg-background-primary border border-border-primary focus:border-primary/50 text-xs text-text-primary rounded px-2.5 py-1.5 pl-7 focus:outline-none placeholder-text-tertiary font-mono transition-all"
-                autoFocus
-              />
-              <Search className="w-3.5 h-3.5 text-text-tertiary absolute left-2.5 top-2.5" />
-              {searchQuery && (
-                <button 
-                  onClick={() => setSearchQuery('')}
-                  className="absolute right-2.5 top-2.5 text-text-tertiary hover:text-text-primary"
+      <div 
+        ref={containerRef} 
+        onScroll={handleScroll} 
+        className="flex-1 overflow-y-auto p-1.5 scrollbar-thin relative"
+      >
+        {showSearch && searchQuery.trim() ? (
+          searching ? (
+            <div className="p-4 text-center text-text-tertiary text-xs font-mono">
+              正在搜索中...
+            </div>
+          ) : searchResults.length === 0 ? (
+            <div className="p-4 text-center text-text-tertiary text-xs font-mono">
+              未找到匹配文件
+            </div>
+          ) : (
+            <div className="space-y-0.5">
+              {searchResults.map((item) => (
+                <div
+                  key={item.path}
+                  onClick={() => {
+                    if (!item.isDir) {
+                      openFile(item.path, item.name);
+                    }
+                  }}
+                  className="flex items-center space-x-2 px-2 py-1.5 rounded hover:bg-background-secondary cursor-pointer transition-colors text-xs text-text-secondary hover:text-text-primary"
                 >
-                  <X className="w-3 h-3" />
-                </button>
-              )}
+                  {item.isDir ? (
+                    <Folder className="w-3.5 h-3.5 text-primary flex-shrink-0" />
+                  ) : (
+                    getFileIconUtil(item.name)
+                  )}
+                  
+                  <div className="flex flex-col min-w-0 flex-1">
+                    <span className="font-mono truncate">{item.name}</span>
+                    <span className="text-[9px] text-text-tertiary truncate font-mono select-all">
+                      {item.path.substring(rootPath.length + 1) || item.path}
+                    </span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )
+        ) : (
+          <div style={{ height: `${visibleItems.length * ITEM_HEIGHT}px`, width: '100%', position: 'relative' }}>
+            <div style={{ transform: `translateY(${startIndex * ITEM_HEIGHT}px)`, position: 'absolute', left: 0, right: 0 }}>
+              {renderedItems.map((item) => {
+                const isSelected = selectedFilePaths.length > 0
+                  ? selectedFilePaths.includes(item.path)
+                  : activeTabPath === item.path;
+
+                const isExpanded = !!expandedFolders[item.path];
+                const statusColor = getStatusColorClass(item.name, item.path, item.isDir, gitFileStatuses, gitDirtyFolders);
+                const isLoading = !!loadingFolders[item.path];
+
+                return (
+                  <FileNodeRow
+                    key={item.path}
+                    item={item}
+                    isSelected={isSelected}
+                    isExpanded={isExpanded}
+                    statusColorClass={statusColor}
+                    isLoading={isLoading}
+                    onRowClick={handleRowClick}
+                    onContextMenu={openContextMenu}
+                    onQuickAction={handleQuickAction}
+                    onCreateSubmit={handleCreateSubmit}
+                    onCancelCreating={cancelCreating}
+                    onLoadAllChildren={handleLoadAllChildren}
+                  />
+                );
+              })}
             </div>
           </div>
         )}
-
-        <div className="flex-1 overflow-y-auto p-1.5 scrollbar-thin">
-          {showSearch && searchQuery.trim() ? (
-            searching ? (
-              <div className="p-4 text-center text-text-tertiary text-xs font-mono">
-                正在搜索中...
-              </div>
-            ) : searchResults.length === 0 ? (
-              <div className="p-4 text-center text-text-tertiary text-xs font-mono">
-                未找到匹配文件
-              </div>
-            ) : (
-              <div className="space-y-0.5">
-                {searchResults.map((item) => (
-                  <div
-                    key={item.path}
-                    onClick={() => {
-                      if (!item.isDir) {
-                        openFile(item.path, item.name);
-                      }
-                    }}
-                    className="flex items-center space-x-2 px-2 py-1.5 rounded hover:bg-background-secondary cursor-pointer transition-colors text-xs text-text-secondary hover:text-text-primary"
-                  >
-                    {item.isDir ? (
-                      <Folder className="w-3.5 h-3.5 text-primary flex-shrink-0" />
-                    ) : (
-                      getFileIconUtil(item.name)
-                    )}
-                    
-                    <div className="flex flex-col min-w-0 flex-1">
-                      <span className="font-mono truncate">{item.name}</span>
-                      <span className="text-[9px] text-text-tertiary truncate font-mono select-all">
-                        {item.path.substring(rootPath.length + 1) || item.path}
-                      </span>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )
-          ) : (
-            <FileNode
-              name={currentProject.name}
-              path={rootPath}
-              isDir={true}
-              depth={0}
-            />
-          )}
-        </div>
-
-        {/* Global Modals */}
-        {activeDeleteTarget && (
-          <DeleteConfirmModal
-            isOpen={true}
-            onConfirm={handleConfirmDelete}
-            onCancel={() => setActiveDeleteTarget(null)}
-            title={activeDeleteTarget.selectedCount > 1 ? `确定要删除这 ${activeDeleteTarget.selectedCount} 个选中的项目吗？` : `确定要删除 ${activeDeleteTarget.name} 吗？`}
-            description={activeDeleteTarget.isDir || activeDeleteTarget.selectedCount > 1 ? "选中项目将同时递归删除其包含的全部子目录与文件，此操作不可恢复。" : "此文件将被从本地硬盘中彻底删除，且无法恢复。"}
-          />
-        )}
-
-        {activeCtxMenu && (
-          <FileExplorerContextMenu
-            x={activeCtxMenu.x}
-            y={activeCtxMenu.y}
-            items={activeCtxMenu.items}
-            onClose={() => setActiveCtxMenu(null)}
-          />
-        )}
-
-        {activeGitModal?.type === 'commit' && (
-          <CommitDialog path={activeGitModal.path} onClose={() => { setActiveGitModal(null); refreshGitStatus(); }} />
-        )}
-        {activeGitModal?.type === 'branches' && (
-          <BranchesDialog path={activeGitModal.path} onClose={() => setActiveGitModal(null)} />
-        )}
-        {activeGitModal?.type === 'remotes' && (
-          <RemotesDialog path={activeGitModal.path} onClose={() => setActiveGitModal(null)} />
-        )}
-        {activeGitModal?.type === 'stash' && (
-          <StashDialog path={activeGitModal.path} onClose={() => { setActiveGitModal(null); refreshGitStatus(); }} />
-        )}
-        {activeGitModal?.type === 'history' && (
-          <HistoryDialog path={activeGitModal.path} onClose={() => setActiveGitModal(null)} />
-        )}
-        {activeGitModal?.type === 'rollback' && (
-          <RollbackDialog path={activeGitModal.path} onClose={() => setActiveGitModal(null)} />
-        )}
-        {activeGitModal?.type === 'push' && (
-          <PushDialog path={activeGitModal.path} onClose={() => setActiveGitModal(null)} />
-        )}
-        {activeGitModal?.type === 'pull' && (
-          <PullDialog path={activeGitModal.path} onClose={() => setActiveGitModal(null)} />
-        )}
       </div>
-    </FileExplorerActionContext.Provider>
+
+      {/* Global Modals */}
+      {activeDeleteTarget && (
+        <DeleteConfirmModal
+          isOpen={true}
+          onConfirm={handleConfirmDelete}
+          onCancel={() => setActiveDeleteTarget(null)}
+          title={activeDeleteTarget.selectedCount > 1 ? `确定要删除这 ${activeDeleteTarget.selectedCount} 个选中的项目吗？` : `确定要删除 ${activeDeleteTarget.name} 吗？`}
+          description={activeDeleteTarget.isDir || activeDeleteTarget.selectedCount > 1 ? "选中项目将同时递归删除其包含的全部子目录与文件，此操作不可恢复。" : "此文件将被从本地硬盘中彻底删除，且无法恢复。"}
+        />
+      )}
+
+      {activeCtxMenu && (
+        <FileExplorerContextMenu
+          x={activeCtxMenu.x}
+          y={activeCtxMenu.y}
+          items={activeCtxMenu.items}
+          onClose={() => setActiveCtxMenu(null)}
+        />
+      )}
+
+      {activeGitModal?.type === 'commit' && (
+        <CommitDialog path={activeGitModal.path} onClose={() => { setActiveGitModal(null); refreshGitStatus(); }} />
+      )}
+      {activeGitModal?.type === 'branches' && (
+        <BranchesDialog path={activeGitModal.path} onClose={() => setActiveGitModal(null)} />
+      )}
+      {activeGitModal?.type === 'remotes' && (
+        <RemotesDialog path={activeGitModal.path} onClose={() => setActiveGitModal(null)} />
+      )}
+      {activeGitModal?.type === 'stash' && (
+        <StashDialog path={activeGitModal.path} onClose={() => { setActiveGitModal(null); refreshGitStatus(); }} />
+      )}
+      {activeGitModal?.type === 'history' && (
+        <HistoryDialog path={activeGitModal.path} onClose={() => setActiveGitModal(null)} />
+      )}
+      {activeGitModal?.type === 'rollback' && (
+        <RollbackDialog path={activeGitModal.path} onClose={() => setActiveGitModal(null)} />
+      )}
+      {activeGitModal?.type === 'push' && (
+        <PushDialog path={activeGitModal.path} onClose={() => setActiveGitModal(null)} />
+      )}
+      {activeGitModal?.type === 'pull' && (
+        <PullDialog path={activeGitModal.path} onClose={() => setActiveGitModal(null)} />
+      )}
+    </div>
   );
 };
+

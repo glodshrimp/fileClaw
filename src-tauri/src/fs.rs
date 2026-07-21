@@ -33,6 +33,25 @@ pub struct ReadFileResult {
     mime_type: Option<String>,
 }
 
+fn cmp_name_case_insensitive(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let mut a_chars = a.chars().flat_map(|c| c.to_lowercase());
+    let mut b_chars = b.chars().flat_map(|c| c.to_lowercase());
+
+    loop {
+        match (a_chars.next(), b_chars.next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(ca), Some(cb)) => match ca.cmp(&cb) {
+                Ordering::Equal => continue,
+                ord => return ord,
+            },
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn local_list_dir(dir_path: String) -> Result<Vec<FileNode>, String> {
     tokio::task::spawn_blocking(move || {
@@ -52,38 +71,25 @@ pub async fn local_list_dir(dir_path: String) -> Result<Vec<FileNode>, String> {
                 Ok(ft) => ft,
                 Err(_) => continue,
             };
-            let is_dir = file_type.is_dir();
             let file_name = entry.file_name().to_string_lossy().into_owned();
             let file_path = path.join(&file_name).to_string_lossy().into_owned();
 
-            let (size, mtime) = if !is_dir {
-                if let Ok(meta) = entry.metadata() {
-                    let mt = meta.modified()
-                        .map(|t| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64)
-                        .unwrap_or(0);
-                    (meta.len(), mt)
-                } else {
-                    (0, 0)
-                }
-            } else {
-                (0, 0)
-            };
-
+            // Tree view only needs name/path/isDir; size/mtime fetched on demand via local_stat.
             list.push(FileNode {
                 name: file_name,
                 path: file_path,
-                is_dir,
-                size,
-                mtime,
+                is_dir: file_type.is_dir(),
+                size: 0,
+                mtime: 0,
             });
         }
 
-        // Sort: directories first, then alphabetical
+        // Sort: directories first, then case-insensitive alphabetical
         list.sort_by(|a, b| {
             if a.is_dir != b.is_dir {
                 b.is_dir.cmp(&a.is_dir)
             } else {
-                a.name.to_lowercase().cmp(&b.name.to_lowercase())
+                cmp_name_case_insensitive(&a.name, &b.name)
             }
         });
 

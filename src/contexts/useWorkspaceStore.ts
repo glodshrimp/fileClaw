@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { Project } from '../types';
+import { getProjectRootPath, normalizePath } from '../utils/path';
 
 export interface OpenFileTab {
   path: string;
@@ -53,6 +54,8 @@ interface WorkspaceState {
   // Actions
   setCurrentProject: (project: Project | null) => void;
   toggleFolder: (path: string) => void;
+  collapseAllFolders: () => void;
+
   openFile: (path: string, name: string) => Promise<void>;
   closeFile: (path: string) => void;
   updateTabContent: (path: string, content: string) => void;
@@ -114,14 +117,17 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   setSelectedFilePaths: (paths) => set({ selectedFilePaths: paths }),
   lastSelectedFilePath: null,
   setLastSelectedFilePath: (path) => set({ lastSelectedFilePath: path }),
-  selectAndToggleFolder: (path) => set((state) => ({
-    selectedFilePaths: [path],
-    lastSelectedFilePath: path,
-    expandedFolders: {
-      ...state.expandedFolders,
-      [path]: !state.expandedFolders[path],
-    },
-  })),
+  selectAndToggleFolder: (path) => {
+    const key = normalizePath(path);
+    set((state) => ({
+      selectedFilePaths: [key],
+      lastSelectedFilePath: key,
+      expandedFolders: {
+        ...state.expandedFolders,
+        [key]: !state.expandedFolders[key],
+      },
+    }));
+  },
   selectSingleFile: (path) => set({
     selectedFilePaths: [path],
     lastSelectedFilePath: path,
@@ -142,7 +148,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       currentProject: project,
       openTabs: [],
       activeTabPath: null,
-      expandedFolders: project ? { [project.path]: true } : {},
+      expandedFolders: project ? { [getProjectRootPath(project)]: true } : {},
       selectedFilePaths: [],
       lastSelectedFilePath: null,
       gitBranch: null,
@@ -152,18 +158,31 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       gitDirtyFolders: {},
     });
     if (project) {
-      setTimeout(() => {
-        get().refreshGitStatus();
-      }, 50);
+      const refresh = () => get().refreshGitStatus();
+      if (typeof requestIdleCallback !== 'undefined') {
+        requestIdleCallback(refresh, { timeout: 2000 });
+      } else {
+        setTimeout(refresh, 500);
+      }
     }
   },
 
-  toggleFolder: (path) => set((state) => ({
-    expandedFolders: {
-      ...state.expandedFolders,
-      [path]: !state.expandedFolders[path],
-    },
-  })),
+  toggleFolder: (path) => {
+    const key = normalizePath(path);
+    set((state) => ({
+      expandedFolders: {
+        ...state.expandedFolders,
+        [key]: !state.expandedFolders[key],
+      },
+    }));
+  },
+
+  collapseAllFolders: () => {
+    const { currentProject } = get();
+    set({
+      expandedFolders: currentProject ? { [getProjectRootPath(currentProject)]: true } : {},
+    });
+  },
 
   openFile: async (path, name) => {
     const { openTabs } = get();
@@ -432,7 +451,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     return new Promise((resolve) => {
       refreshGitTimeout = setTimeout(async () => {
         refreshGitTimeout = null;
-        const { currentProject, activeTabPath } = get();
+        const { currentProject, activeTabPath, gitRoots } = get();
         if (!currentProject) {
           resolve();
           return;
@@ -440,86 +459,21 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         const projectPath = currentProject.codePath || currentProject.path;
 
         try {
-          let { gitRoots } = get();
-          if (!gitRoots || gitRoots.length === 0) {
-            gitRoots = await window.electronAPI.gitDiscoverRoots(projectPath);
-          }
-          const roots = gitRoots;
-          if (roots.length === 0) {
-            set({
-              gitBranch: null,
-              gitRoots: [],
-              gitRepoBranches: {},
-              gitFileStatuses: {},
-              gitDirtyFolders: {}
-            });
-            resolve();
-            return;
-          }
-
-          const mergedStatuses: Record<string, string> = {};
-          const repoBranches: Record<string, string> = {};
-          const dirtyFolders: Record<string, { modified: boolean; added: boolean; untracked: boolean; notAdded: boolean }> = {};
-
-          const isWindows = projectPath.includes('\\') || (!projectPath.startsWith('/') && projectPath.includes(':'));
-          const sep = isWindows ? '\\' : '/';
-
-          for (const rootPath of roots) {
-            try {
-              const branch = await window.electronAPI.gitCurrentBranch(rootPath);
-              repoBranches[rootPath] = branch || 'HEAD';
-
-              const statuses = await window.electronAPI.gitStatus(rootPath);
-              for (const [relPath, status] of Object.entries(statuses)) {
-                // Build absolute path
-                const normalizedRel = relPath.replace(/\\/g, sep).replace(/\//g, sep);
-                const absFilePath = rootPath + (rootPath.endsWith(sep) ? '' : sep) + normalizedRel;
-                mergedStatuses[absFilePath] = status;
-
-                // Trace parent folders all the way up to workspace root path
-                let parent = absFilePath.substring(0, absFilePath.lastIndexOf(sep));
-                while (parent && parent.startsWith(projectPath) && parent.length >= projectPath.length) {
-                  if (!dirtyFolders[parent]) {
-                    dirtyFolders[parent] = { modified: false, added: false, untracked: false, notAdded: false };
-                  }
-                  const X = status[0] || ' ';
-                  const Y = status[1] || ' ';
-                  const isNotAdded = Y === 'M' || Y === 'D';
-                  const isModified = X === 'M';
-                  const isAdded = X === 'A' || X === 'R';
-                  const isUntracked = status === '??';
-
-                  if (isNotAdded) dirtyFolders[parent].notAdded = true;
-                  if (isModified) dirtyFolders[parent].modified = true;
-                  if (isAdded) dirtyFolders[parent].added = true;
-                  if (isUntracked) dirtyFolders[parent].untracked = true;
-
-                  parent = parent.substring(0, parent.lastIndexOf(sep));
-                }
-              }
-            } catch (subErr) {
-              console.error(`Failed to refresh git status for sub-repo ${rootPath}:`, subErr);
-            }
-          }
-
-          // Resolve active branch based on active tab path focus
-          let activeBranch = repoBranches[roots[0]] || null;
-          if (activeTabPath) {
-            const sortedRoots = [...roots].sort((a, b) => b.length - a.length);
-            const matched = sortedRoots.find(r => activeTabPath.startsWith(r));
-            if (matched) {
-              activeBranch = repoBranches[matched];
-            }
-          }
+          const result = await window.electronAPI.gitRefreshStatus(
+            projectPath,
+            gitRoots.length > 0 ? gitRoots : null,
+            activeTabPath
+          );
 
           set({
-            gitBranch: activeBranch || 'HEAD',
-            gitRoots: roots,
-            gitRepoBranches: repoBranches,
-            gitFileStatuses: mergedStatuses,
-            gitDirtyFolders: dirtyFolders
+            gitBranch: result.gitBranch || 'HEAD',
+            gitRoots: result.gitRoots,
+            gitRepoBranches: result.gitRepoBranches,
+            gitFileStatuses: result.gitFileStatuses,
+            gitDirtyFolders: result.gitDirtyFolders,
           });
         } catch (err) {
+          console.error("Failed to refresh git status:", err);
           set({
             gitBranch: null,
             gitRoots: [],

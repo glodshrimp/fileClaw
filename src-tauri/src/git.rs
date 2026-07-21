@@ -620,3 +620,152 @@ pub fn git_log_graph(repo_path: String) -> Result<Vec<GitGraphCommit>, String> {
     }
     Ok(list)
 }
+
+#[derive(Serialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderGitStatus {
+    pub modified: bool,
+    pub added: bool,
+    pub untracked: bool,
+    pub not_added: bool,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct GitStatusResult {
+    pub git_branch: Option<String>,
+    pub git_roots: Vec<String>,
+    pub git_repo_branches: HashMap<String, String>,
+    pub git_file_statuses: HashMap<String, String>,
+    pub git_dirty_folders: HashMap<String, FolderGitStatus>,
+}
+
+#[tauri::command]
+pub async fn git_refresh_status(
+    workspace_path: String,
+    git_roots: Option<Vec<String>>,
+    active_tab_path: Option<String>,
+) -> Result<GitStatusResult, String> {
+    tokio::task::spawn_blocking(move || {
+        let roots = match git_roots {
+            Some(r) if !r.is_empty() => r,
+            _ => {
+                let path = Path::new(&workspace_path);
+                if !path.exists() {
+                    Vec::new()
+                } else {
+                    let mut r = Vec::new();
+                    find_all_git_roots(path, 0, 4, &mut r);
+                    r.into_iter()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect()
+                }
+            }
+        };
+
+        if roots.is_empty() {
+            return Ok(GitStatusResult {
+                git_branch: None,
+                git_roots: Vec::new(),
+                git_repo_branches: HashMap::new(),
+                git_file_statuses: HashMap::new(),
+                git_dirty_folders: HashMap::new(),
+            });
+        }
+
+        let mut merged_statuses = HashMap::new();
+        let mut repo_branches = HashMap::new();
+        let mut dirty_folders: HashMap<String, FolderGitStatus> = HashMap::new();
+
+        let is_windows = cfg!(target_os = "windows");
+        let sep = if is_windows { "\\" } else { "/" };
+
+        for root_path in &roots {
+            // Get current branch
+            if let Ok(branch) = git_current_branch(root_path.clone()) {
+                repo_branches.insert(root_path.clone(), branch);
+            } else {
+                repo_branches.insert(root_path.clone(), "HEAD".to_string());
+            }
+
+            // Get status
+            if let Ok(statuses) = git_status_impl(root_path) {
+                for (rel_path, status) in statuses {
+                    // Normalise rel path separators
+                    let normalized_rel = if is_windows {
+                        rel_path.replace('/', "\\")
+                    } else {
+                        rel_path.replace('\\', "/")
+                    };
+
+                    let abs_file_path = if root_path.ends_with(sep) {
+                        format!("{}{}", root_path, normalized_rel)
+                    } else {
+                        format!("{}{}{}", root_path, sep, normalized_rel)
+                    };
+
+                    merged_statuses.insert(abs_file_path.clone(), status.clone());
+
+                    // Trace parent folders all the way up to workspace path
+                    let mut parent = Path::new(&abs_file_path).parent();
+                    let ws_path = Path::new(&workspace_path);
+                    while let Some(p) = parent {
+                        if p.starts_with(ws_path) {
+                            let parent_str = p.to_string_lossy().into_owned();
+                            
+                            let entry = dirty_folders.entry(parent_str).or_default();
+                            
+                            let chars: Vec<char> = status.chars().collect();
+                            let x = chars.first().copied().unwrap_or(' ');
+                            let y = chars.get(1).copied().unwrap_or(' ');
+                            let is_not_added = y == 'M' || y == 'D';
+                            let is_modified = x == 'M';
+                            let is_added = x == 'A' || x == 'R';
+                            let is_untracked = status == "??" || status == "?";
+
+                            if is_not_added {
+                                entry.not_added = true;
+                            }
+                            if is_modified {
+                                entry.modified = true;
+                            }
+                            if is_added {
+                                entry.added = true;
+                            }
+                            if is_untracked {
+                                entry.untracked = true;
+                            }
+                            
+                            parent = p.parent();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Resolve active branch based on active tab path focus
+        let mut active_branch = repo_branches.get(&roots[0]).cloned();
+        if let Some(ref active_tab) = active_tab_path {
+            let mut sorted_roots = roots.clone();
+            sorted_roots.sort_by(|a, b| b.len().cmp(&a.len()));
+            if let Some(matched) = sorted_roots.iter().find(|r| active_tab.starts_with(*r)) {
+                if let Some(b) = repo_branches.get(matched) {
+                    active_branch = Some(b.clone());
+                }
+            }
+        }
+
+        Ok(GitStatusResult {
+            git_branch: active_branch,
+            git_roots: roots,
+            git_repo_branches: repo_branches,
+            git_file_statuses: merged_statuses,
+            git_dirty_folders: dirty_folders,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+

@@ -160,6 +160,7 @@ pub fn run() {
             git::git_log_graph,
             git::set_git_path,
             git::test_git_path,
+            git::git_refresh_status,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

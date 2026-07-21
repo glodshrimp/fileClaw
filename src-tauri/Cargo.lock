@@ -971,7 +971,7 @@ dependencies = [
 
 [[package]]
 name = "fileclaw-app"
-version = "0.2.4"
+version = "0.2.6"
 dependencies = [
  "base64 0.21.7",
  "portable-pty",
