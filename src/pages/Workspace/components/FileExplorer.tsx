@@ -1,11 +1,10 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback, createContext, useContext } from 'react';
 import { useWorkspaceStore } from '../../../contexts/useWorkspaceStore';
-import { Folder, FolderOpen, FileText, ChevronRight, ChevronDown, Plus, FileJson, FileCode, FileImage, Search, X, RotateCw } from 'lucide-react';
+import { Folder, ChevronRight, ChevronDown, Plus, Search, X, RotateCw, Settings } from 'lucide-react';
 import DeleteConfirmModal from '../../../components/DeleteConfirmModal';
 import { copyToClipboard } from '../../../utils/copy';
 import { getFileIcon as getFileIconUtil, getFolderIcon } from '../../../utils/fileIcon';
 import { useApp } from '../../../contexts/AppContext';
-import { Settings } from 'lucide-react';
 import { CommitDialog } from './git/CommitDialog';
 import { BranchesDialog } from './git/BranchesDialog';
 import { RemotesDialog } from './git/RemotesDialog';
@@ -24,22 +23,20 @@ interface FileEntry {
   path: string;
 }
 
-interface FileNodeProps {
-  name: string;
-  path: string;
-  isDir: boolean;
-  depth: number;
-  onRefreshParent?: () => void;
+type GitModalType = 'commit' | 'branches' | 'remotes' | 'stash' | 'history' | 'rollback' | 'push' | 'pull';
+
+interface ActionContextType {
+  openContextMenu: (e: React.MouseEvent, path: string, name: string, isDir: boolean) => void;
+  openGitModal: (type: GitModalType, path: string) => void;
+  openDeleteModal: (path: string, name: string, isDir: boolean) => void;
+  getDirChildren: (dirPath: string, force?: boolean) => Promise<FileEntry[]>;
+  startCreating: (parentPath: string, type: 'file' | 'folder') => void;
+  creatingTarget: { path: string; type: 'file' | 'folder' } | null;
+  cancelCreating: () => void;
+  reloadDir: (dirPath: string) => void;
 }
 
-const joinPath = (parent: string, child: string): string => {
-  const isWindows = parent.includes('\\') || (!parent.startsWith('/') && parent.includes(':'));
-  const sep = isWindows ? '\\' : '/';
-  if (parent.endsWith(sep)) {
-    return parent + child;
-  }
-  return parent + sep + child;
-};
+const FileExplorerActionContext = createContext<ActionContextType | null>(null);
 
 interface MenuItem {
   label?: string;
@@ -58,12 +55,12 @@ interface ContextMenuProps {
 }
 
 const FileExplorerContextMenu: React.FC<ContextMenuProps> = ({ x, y, items, onClose }) => {
-  const ref = React.useRef<HTMLDivElement>(null);
-  const [activeSubmenuIndex, setActiveSubmenuIndex] = React.useState<number | null>(null);
-  const [coords, setCoords] = React.useState({ left: x, top: y });
-  const [isPositioned, setIsPositioned] = React.useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const [activeSubmenuIndex, setActiveSubmenuIndex] = useState<number | null>(null);
+  const [coords, setCoords] = useState({ left: x, top: y });
+  const [isPositioned, setIsPositioned] = useState(false);
 
-  React.useEffect(() => {
+  useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
       if (ref.current && !ref.current.contains(e.target as Node)) {
         onClose();
@@ -204,7 +201,6 @@ const getUniqueDestPath = async (srcPath: string, destDir: string): Promise<stri
   const separator = srcPath.includes('\\') ? '\\' : '/';
   const fileName = srcPath.substring(Math.max(srcPath.lastIndexOf('/'), srcPath.lastIndexOf('\\')) + 1);
   
-  // Read target directory files
   let existingFiles: string[] = [];
   try {
     const list = await window.electronAPI.localListDir(destDir);
@@ -215,7 +211,7 @@ const getUniqueDestPath = async (srcPath: string, destDir: string): Promise<stri
 
   const dotIndex = fileName.lastIndexOf('.');
   const baseName = dotIndex === -1 ? fileName : fileName.substring(0, dotIndex);
-  const ext = dotIndex === -1 ? '' : fileName.substring(dotIndex); // e.g. ".txt"
+  const ext = dotIndex === -1 ? '' : fileName.substring(dotIndex);
 
   let candidateName = fileName;
   let counter = 0;
@@ -228,54 +224,24 @@ const getUniqueDestPath = async (srcPath: string, destDir: string): Promise<stri
   return `${destDir}${separator}${candidateName}`;
 };
 
-const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefreshParent }) => {
-  // Fine-grained selectors to prevent re-rendering the whole tree on selection/expansion changes
+interface FileNodeProps {
+  name: string;
+  path: string;
+  isDir: boolean;
+  depth: number;
+}
+
+const FileNode = React.memo<FileNodeProps>(({ name, path, isDir, depth }) => {
+  const actions = useContext(FileExplorerActionContext)!;
+
   const isExpanded = useWorkspaceStore((s) => !!s.expandedFolders[path]);
-  const isSelected = useWorkspaceStore((s) => s.selectedFilePaths.includes(path) || (s.selectedFilePaths.length === 0 && s.activeTabPath === path));
-  const folderStatus = useWorkspaceStore((s) => s.gitDirtyFolders[path]);
-  const statusXY = useWorkspaceStore((s) => s.gitFileStatuses[path]);
-  const fileExplorerRefreshKey = useWorkspaceStore((s) => s.fileExplorerRefreshKey);
-  const copiedFilePath = useWorkspaceStore((s) => s.copiedFilePath);
-  const gitRoots = useWorkspaceStore((s) => s.gitRoots);
-  const activeTabPath = useWorkspaceStore((s) => s.activeTabPath);
+  const isSelected = useWorkspaceStore((s) =>
+    s.selectedFilePaths.length > 0
+      ? s.selectedFilePaths.includes(path)
+      : s.activeTabPath === path
+  );
 
-  // Actions are stable and will not cause re-renders
-  const toggleFolder = useWorkspaceStore((s) => s.toggleFolder);
-  const openFile = useWorkspaceStore((s) => s.openFile);
-  const openTerminal = useWorkspaceStore((s) => s.openTerminal);
-  const currentProject = useWorkspaceStore((s) => s.currentProject);
-  const setCopiedFilePath = useWorkspaceStore((s) => s.setCopiedFilePath);
-  const setSelectedFilePaths = useWorkspaceStore((s) => s.setSelectedFilePaths);
-  const setLastSelectedFilePath = useWorkspaceStore((s) => s.setLastSelectedFilePath);
-  const [children, setChildren] = useState<FileEntry[] | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [isCreating, setIsCreating] = useState<'file' | 'folder' | null>(null);
-  const [newItemName, setNewItemName] = useState('');
-  const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
-  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
-  const [activeGitModal, setActiveGitModal] = useState<'commit' | 'branches' | 'remotes' | 'stash' | 'history' | 'rollback' | 'push' | 'pull' | null>(null);
-  const [canPaste, setCanPaste] = useState(false);
-
-  const rootPath = currentProject?.codePath || currentProject?.path || '';
-  
-  const nodeGitRoot = React.useMemo(() => {
-    if (!gitRoots || gitRoots.length === 0) return null;
-    const sorted = [...gitRoots].sort((a, b) => b.length - a.length);
-    return sorted.find(r => path.startsWith(r)) || null;
-  }, [path, gitRoots]);
-
-  const isGitRepo = nodeGitRoot !== null;
-  const getRelativePath = (absolutePath: string, root: string) => {
-    if (!root || absolutePath === root) return '';
-    let rel = absolutePath.substring(root.length);
-    if (rel.startsWith('/') || rel.startsWith('\\')) {
-      rel = rel.substring(1);
-    }
-    return rel.replace(/\\/g, '/');
-  };
-  const relPath = getRelativePath(path, rootPath);
-
-  const getGitStatusColorClass = () => {
+  const statusColorClass = useWorkspaceStore((s) => {
     const isCommonIgnored = name === 'node_modules' 
       || name === 'target' 
       || name === 'dist' 
@@ -283,56 +249,71 @@ const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefresh
       || name.startsWith('.');
 
     if (isDir) {
+      const folderStatus = s.gitDirtyFolders[path];
       if (folderStatus) {
-        if (folderStatus.notAdded) return 'text-[#f87171]'; // Red for not add
-        if (folderStatus.modified) return 'text-[#60a5fa]'; // Blue for modified
-        if (folderStatus.added) return 'text-[#4ade80]'; // Green for added
-        if (folderStatus.untracked) return 'text-[#fb923c]'; // Orange/Yellow for untracked
+        if (folderStatus.notAdded) return 'text-[#f87171]';
+        if (folderStatus.modified) return 'text-[#60a5fa]';
+        if (folderStatus.added) return 'text-[#4ade80]';
+        if (folderStatus.untracked) return 'text-[#fb923c]';
       }
       if (isCommonIgnored) return 'text-slate-500';
     } else {
+      const statusXY = s.gitFileStatuses[path];
       if (statusXY) {
-        if (statusXY === '??') return 'text-[#fb923c]'; // Orange/Yellow for untracked
-        if (statusXY === '!!') return 'text-slate-500'; // Gray for ignored
-        if (statusXY.includes('D')) return 'text-red-400 line-through'; // Deleted
+        if (statusXY === '??') return 'text-[#fb923c]';
+        if (statusXY === '!!') return 'text-slate-500';
+        if (statusXY.includes('D')) return 'text-red-400 line-through';
         
         const X = statusXY[0];
         const Y = statusXY[1];
-        if (Y === 'M') return 'text-[#f87171]'; // Red for not add (unstaged change)
-        if (X === 'M') return 'text-[#60a5fa]'; // Blue for modified (staged modification)
-        if (X === 'A' || X === 'R') return 'text-[#4ade80]'; // Green for added (staged addition)
+        if (Y === 'M') return 'text-[#f87171]';
+        if (X === 'M') return 'text-[#60a5fa]';
+        if (X === 'A' || X === 'R') return 'text-[#4ade80]';
       }
       if (isCommonIgnored) return 'text-slate-500';
     }
     return '';
-  };
-  const statusColorClass = getGitStatusColorClass();
+  });
 
-  const loadChildren = async () => {
+  const fileExplorerRefreshKey = useWorkspaceStore((s) => s.fileExplorerRefreshKey);
+
+  const selectAndToggleFolder = useWorkspaceStore((s) => s.selectAndToggleFolder);
+  const selectSingleFile = useWorkspaceStore((s) => s.selectSingleFile);
+  const setSelectedFilePaths = useWorkspaceStore((s) => s.setSelectedFilePaths);
+  const setLastSelectedFilePath = useWorkspaceStore((s) => s.setLastSelectedFilePath);
+  const openFile = useWorkspaceStore((s) => s.openFile);
+
+  const [children, setChildren] = useState<FileEntry[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [newItemName, setNewItemName] = useState('');
+
+  const isCreatingHere = actions.creatingTarget?.path === path;
+  const creatingType = actions.creatingTarget?.type;
+
+  const loadChildren = useCallback(async (force = false) => {
     if (!isDir) return;
     setLoading(true);
     try {
-      const res = await window.electronAPI.localListDir(path);
+      const res = await actions.getDirChildren(path, force);
       setChildren(res);
     } catch (err) {
       console.error('Failed to load dir:', err);
     } finally {
       setLoading(false);
     }
-  };
+  }, [isDir, path, actions]);
 
   useEffect(() => {
     if (isDir && isExpanded) {
       loadChildren();
     }
-  }, [path, isExpanded, fileExplorerRefreshKey]);
+  }, [isDir, path, isExpanded, fileExplorerRefreshKey, loadChildren]);
 
   const handleRowClick = (e: React.MouseEvent) => {
     e.stopPropagation();
 
     const { selectedFilePaths, lastSelectedFilePath } = useWorkspaceStore.getState();
 
-    // 1. Shift-click selection range
     if (e.shiftKey && lastSelectedFilePath) {
       const elements = Array.from(document.querySelectorAll('[data-file-path]'));
       const visiblePaths = elements.map(el => el.getAttribute('data-file-path')).filter(Boolean) as string[];
@@ -348,7 +329,6 @@ const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefresh
       return;
     }
 
-    // 2. Ctrl/Cmd-click selection toggle
     if (e.metaKey || e.ctrlKey) {
       if (selectedFilePaths.includes(path)) {
         setSelectedFilePaths(selectedFilePaths.filter(p => p !== path));
@@ -359,364 +339,27 @@ const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefresh
       return;
     }
 
-    // 3. Normal click
-    setSelectedFilePaths([path]);
-    setLastSelectedFilePath(path);
-
     if (isDir) {
-      toggleFolder(path);
+      selectAndToggleFolder(path);
     } else {
+      selectSingleFile(path);
       openFile(path, name);
     }
   };
 
-  const handleCreate = async (e: React.FormEvent) => {
+  const handleCreateSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newItemName.trim() || !isCreating) return;
+    if (!newItemName.trim() || !creatingType) return;
 
     try {
-      const isCreateDir = isCreating === 'folder';
+      const isCreateDir = creatingType === 'folder';
       await window.electronAPI.localCreateNode(path, newItemName.trim(), isCreateDir);
-      setIsCreating(null);
+      actions.cancelCreating();
       setNewItemName('');
-      loadChildren();
+      actions.reloadDir(path);
     } catch (err: any) {
       alert('创建失败: ' + err.message);
     }
-  };
-
-  const handleDeleteClick = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    setIsDeleteModalOpen(true);
-  };
-
-  const handleConfirmDelete = async () => {
-    try {
-      const { selectedFilePaths } = useWorkspaceStore.getState();
-      const targetPaths = selectedFilePaths.includes(path) ? selectedFilePaths : [path];
-      for (const p of targetPaths) {
-        await window.electronAPI.localDeleteNode(p);
-      }
-      
-      // Clear selections
-      setSelectedFilePaths([]);
-      setLastSelectedFilePath(null);
-      
-      if (onRefreshParent) onRefreshParent();
-      const { refreshGitStatus } = useWorkspaceStore.getState();
-      await refreshGitStatus();
-    } catch (err: any) {
-      alert('删除失败: ' + err.message);
-    } finally {
-      setIsDeleteModalOpen(false);
-    }
-  };
-
-  const getFileIcon = (fileName: string) => {
-    return getFileIconUtil(fileName);
-  };
-
-  const buildMenuItems = () => {
-    const items: MenuItem[] = [];
-
-    // 1. If folder, place 'Open in Terminal' at the very top
-    if (isDir) {
-      items.push({
-        label: 'Open in Terminal',
-        onClick: () => {
-          openTerminal(path, name);
-        }
-      });
-    }
-
-    // 2. Add base items: Open (files only) and Reveal in Finder (both)
-    if (!isDir) {
-      items.push({
-        label: 'Open',
-        onClick: () => {
-          openFile(path, name);
-        }
-      });
-    }
-
-    items.push(
-      {
-        label: 'Reveal in Finder',
-        onClick: async () => {
-          const getParentPath = (filePath: string) => {
-            const isWindows = filePath.includes('\\') || (!filePath.startsWith('/') && filePath.includes(':'));
-            const sep = isWindows ? '\\' : '/';
-            const parts = filePath.split(sep);
-            parts.pop();
-            return parts.join(sep);
-          };
-          const dirToOpen = isDir ? path : getParentPath(path);
-          try {
-            await window.electronAPI.openDirectory(dirToOpen);
-          } catch (err: any) {
-            console.error('Failed to open directory:', err);
-          }
-        }
-      },
-      { divider: true }
-    );
-
-    if (isDir) {
-      items.push(
-        {
-          label: 'New File',
-          onClick: () => {
-            if (!isExpanded) toggleFolder(path);
-            setIsCreating('file');
-          }
-        },
-        {
-          label: 'New Folder',
-          onClick: () => {
-            if (!isExpanded) toggleFolder(path);
-            setIsCreating('folder');
-          }
-        },
-        { divider: true }
-      );
-    }
-
-    items.push(
-      {
-        label: 'Copy Path',
-        onClick: (e: React.MouseEvent) => {
-          const { selectedFilePaths } = useWorkspaceStore.getState();
-          const targetPaths = selectedFilePaths.includes(path) ? selectedFilePaths : [path];
-          copyToClipboard(targetPaths.join('\n'), e);
-        }
-      },
-      {
-        label: 'Copy Relative Path',
-        onClick: (e: React.MouseEvent) => {
-          const rootPath = currentProject?.codePath || currentProject?.path || '';
-          const { selectedFilePaths } = useWorkspaceStore.getState();
-          const targetPaths = selectedFilePaths.includes(path) ? selectedFilePaths : [path];
-          const relPaths = targetPaths.map(p => {
-            let rel = p.substring(rootPath.length);
-            if (rel.startsWith('/') || rel.startsWith('\\')) {
-              rel = rel.substring(1);
-            }
-            return rel || '.';
-          });
-          copyToClipboard(relPaths.join('\n'), e);
-        }
-      },
-      { divider: true },
-      {
-        label: 'Copy File',
-        onClick: async () => {
-          try {
-            await window.electronAPI.localWriteFileToClipboard(path);
-          } catch (err: any) {
-            console.error('Failed to copy file to system clipboard:', err);
-          }
-          setCopiedFilePath(path);
-        }
-      },
-      {
-        label: 'Paste',
-        disabled: !canPaste,
-        onClick: async () => {
-          let systemClipboardPath = '';
-          try {
-            systemClipboardPath = await window.electronAPI.localReadFileFromClipboard();
-          } catch (e) {
-            console.warn('Failed to read system clipboard file path:', e);
-          }
-
-          const sourcePath = systemClipboardPath ? systemClipboardPath.trim() : copiedFilePath;
-
-          if (!sourcePath) {
-            alert('剪贴板中无有效的文件复制记录');
-            return;
-          }
-
-          const destDir = isDir ? path : path.substring(0, Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\')));
-
-          try {
-            const finalDestPath = await getUniqueDestPath(sourcePath, destDir);
-            const success = await window.electronAPI.localCopyFile(sourcePath, finalDestPath);
-            if (success) {
-              const { refreshFileExplorer, refreshGitStatus } = useWorkspaceStore.getState();
-              refreshFileExplorer();
-              await refreshGitStatus();
-            } else {
-              alert('粘贴文件失败：复制操作未成功完成');
-            }
-          } catch (err: any) {
-            console.error('Failed to copy and paste file:', err);
-            alert('粘贴文件失败: ' + err.message);
-          }
-        }
-      },
-      { divider: true }
-    );
-
-    if (!isDir) {
-      items.push(
-        {
-          label: 'Attach to Agent',
-          onClick: async (e: React.MouseEvent) => {
-            try {
-              const readResult = await window.electronAPI.readFileBase64(path);
-              const attached = {
-                name,
-                path,
-                type: readResult.type,
-                data: readResult.data,
-                mimeType: readResult.mimeType,
-                preview: readResult.type === 'image' ? `data:${readResult.mimeType};base64,${readResult.data}` : undefined
-              };
-              const event = new CustomEvent('attach-file-to-agent', { detail: attached });
-              window.dispatchEvent(event);
-              copyToClipboard('已成功关联到 Agent', e);
-            } catch (err: any) {
-              alert('关联失败: ' + err.message);
-            }
-          }
-        },
-        { divider: true }
-      );
-    }
-
-    const canAdd = (() => {
-      if (isDir) {
-        return folderStatus ? (folderStatus.notAdded || folderStatus.untracked) : false;
-      } else {
-        if (!statusXY) return false;
-        if (statusXY === '??') return true;
-        const Y = statusXY[1] || ' ';
-        return Y === 'M' || Y === 'D';
-      }
-    })();
-
-    const hasChanges = isDir ? !!folderStatus : !!statusXY;
-
-    // Git submenu
-    const gitMenu: MenuItem = {
-      label: 'Git',
-      children: isGitRepo ? [
-        {
-          label: 'Commit File...',
-          onClick: () => {
-            setActiveGitModal('commit');
-          }
-        },
-        {
-          label: 'Add to Git',
-          disabled: !canAdd,
-          onClick: async () => {
-            try {
-              const { runGitAdd } = useWorkspaceStore.getState();
-              await runGitAdd(path);
-            } catch (err: any) {
-              alert('Stage file failed: ' + err.message);
-            }
-          }
-        },
-        {
-          label: 'Rollback...',
-          disabled: !hasChanges,
-          onClick: () => {
-            setActiveGitModal('rollback');
-          }
-        },
-        { divider: true },
-        {
-          label: 'Push...',
-          onClick: () => {
-            setActiveGitModal('push');
-          }
-        },
-        {
-          label: 'Pull...',
-          onClick: () => {
-            setActiveGitModal('pull');
-          }
-        },
-        {
-          label: 'Fetch',
-          onClick: async () => {
-            try {
-              let targetRoot = currentProject?.codePath || currentProject?.path || '';
-              if (gitRoots && gitRoots.length > 0) {
-                const sorted = [...gitRoots].sort((a, b) => b.length - a.length);
-                const matched = sorted.find(r => path.startsWith(r));
-                if (matched) targetRoot = matched;
-              }
-              await window.electronAPI.gitFetch(targetRoot);
-              const { refreshGitStatus } = useWorkspaceStore.getState();
-              await refreshGitStatus();
-              alert('Fetch 成功！');
-            } catch (err: any) {
-              alert('Fetch 失败: ' + err.message);
-            }
-          }
-        },
-        { divider: true },
-        {
-          label: 'Branches...',
-          onClick: () => {
-            setActiveGitModal('branches');
-          }
-        },
-        {
-          label: 'Manage Remotes...',
-          onClick: () => {
-            setActiveGitModal('remotes');
-          }
-        },
-        { divider: true },
-        {
-          label: 'Stash Changes...',
-          onClick: () => {
-            setActiveGitModal('stash');
-          }
-        },
-        {
-          label: 'Show History',
-          onClick: () => {
-            setActiveGitModal('history');
-          }
-        },
-        {
-          label: 'Show Git Graph',
-          onClick: () => {
-            const { openGitGraph } = useWorkspaceStore.getState();
-            openGitGraph();
-          }
-        }
-      ] : [
-        {
-          label: 'Initialize Git Repository',
-          onClick: async () => {
-            try {
-              const { runGitInit } = useWorkspaceStore.getState();
-              await runGitInit();
-              alert('Git 仓库初始化成功！');
-            } catch (err: any) {
-              alert('初始化 Git 失败: ' + err.message);
-            }
-          }
-        }
-      ]
-    };
-    items.push(gitMenu, { divider: true });
-
-    items.push({
-      label: 'Delete',
-      danger: true,
-      onClick: () => {
-        setIsDeleteModalOpen(true);
-      }
-    });
-
-    return items;
   };
 
   return (
@@ -729,29 +372,7 @@ const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefresh
         style={{ paddingLeft: `${depth * 12 + (isSelected ? 6 : 8)}px` }}
         onClick={handleRowClick}
         onContextMenu={(e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          
-          const x = e.clientX;
-          const y = e.clientY;
-          
-          const { selectedFilePaths } = useWorkspaceStore.getState();
-          if (!selectedFilePaths.includes(path)) {
-            setSelectedFilePaths([path]);
-            setLastSelectedFilePath(path);
-          }
-
-          setCtxMenu({ x, y });
-
-          (async () => {
-            let systemClipboardPath = '';
-            try {
-              systemClipboardPath = await window.electronAPI.localReadFileFromClipboard();
-            } catch (err) {
-              console.warn('Failed to read system clipboard file path:', err);
-            }
-            setCanPaste(!!(systemClipboardPath || copiedFilePath));
-          })();
+          actions.openContextMenu(e, path, name, isDir);
         }}
       >
         <div className="flex items-center space-x-1.5 min-w-0 flex-1">
@@ -761,46 +382,52 @@ const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefresh
               {getFolderIcon(name, isExpanded)}
             </>
           ) : (
-            getFileIcon(name)
+            getFileIconUtil(name)
           )}
           <span className={`truncate ${statusColorClass || (isSelected ? 'text-primary font-medium' : 'text-text-secondary group-hover:text-text-primary')}`}>
             {name}
           </span>
         </div>
 
-        {/* Action buttons */}
-        <div className="hidden group-hover:flex items-center space-x-1 flex-shrink-0 pr-1">
-          {isDir && (
-            <>
-              <button
-                onClick={(e) => { e.stopPropagation(); setIsCreating('file'); }}
-                className="p-0.5 hover:bg-background-secondary rounded text-text-tertiary hover:text-text-primary"
-                title="新建文件"
-              >
-                <Plus className="w-3 h-3" />
-              </button>
-              <button
-                onClick={(e) => { e.stopPropagation(); setIsCreating('folder'); }}
-                className="p-0.5 hover:bg-background-secondary rounded text-text-tertiary hover:text-text-primary"
-                title="新建文件夹"
-              >
-                <Folder className="w-3 h-3" />
-              </button>
-            </>
-          )}
-        </div>
+        {/* Quick action buttons for directories */}
+        {isDir && (
+          <div className="hidden group-hover:flex items-center space-x-1 flex-shrink-0 pr-1">
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                if (!isExpanded) selectAndToggleFolder(path);
+                actions.startCreating(path, 'file');
+              }}
+              className="p-0.5 hover:bg-background-secondary rounded text-text-tertiary hover:text-text-primary"
+              title="新建文件"
+            >
+              <Plus className="w-3 h-3" />
+            </button>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                if (!isExpanded) selectAndToggleFolder(path);
+                actions.startCreating(path, 'folder');
+              }}
+              className="p-0.5 hover:bg-background-secondary rounded text-text-tertiary hover:text-text-primary"
+              title="新建文件夹"
+            >
+              <Folder className="w-3 h-3" />
+            </button>
+          </div>
+        )}
       </div>
 
-      {/* Input container */}
-      {isCreating && (
-        <form onSubmit={handleCreate} className="flex items-center space-x-1 py-1 pr-2" style={{ paddingLeft: `${(depth + 1) * 12 + 8}px` }}>
+      {/* Inline Create Input */}
+      {isCreatingHere && (
+        <form onSubmit={handleCreateSubmit} className="flex items-center space-x-1 py-1 pr-2" style={{ paddingLeft: `${(depth + 1) * 12 + 8}px` }}>
           <input
             type="text"
             autoFocus
-            placeholder={isCreating === 'file' ? '文件名...' : '文件夹名...'}
+            placeholder={creatingType === 'file' ? '文件名...' : '文件夹名...'}
             value={newItemName}
             onChange={(e) => setNewItemName(e.target.value)}
-            onBlur={() => { setIsCreating(null); setNewItemName(''); }}
+            onBlur={() => { actions.cancelCreating(); setNewItemName(''); }}
             className="bg-slate-950 border border-white/10 rounded px-1.5 py-0.5 text-[10px] text-white focus:outline-none focus:border-primary flex-1 font-mono"
           />
         </form>
@@ -821,92 +448,13 @@ const FileNode: React.FC<FileNodeProps> = ({ name, path, isDir, depth, onRefresh
               path={child.path}
               isDir={child.isDir}
               depth={depth + 1}
-              onRefreshParent={loadChildren}
             />
           ))}
         </div>
       )}
-
-      {(() => {
-        const { selectedFilePaths } = useWorkspaceStore.getState();
-        const isSelectedMultiple = selectedFilePaths.includes(path) && selectedFilePaths.length > 1;
-        return (
-          <DeleteConfirmModal
-            isOpen={isDeleteModalOpen}
-            onConfirm={handleConfirmDelete}
-            onCancel={() => setIsDeleteModalOpen(false)}
-            title={isSelectedMultiple ? `确定要删除这 ${selectedFilePaths.length} 个选中的项目吗？` : `确定要删除 ${name} 吗？`}
-            description={isDir || isSelectedMultiple ? "选中项目将同时递归删除其包含的全部子目录与文件，此操作不可恢复。" : "此文件将被从本地硬盘中彻底删除，且无法恢复。"}
-          />
-        );
-      })()}
-
-      {ctxMenu && (
-        <FileExplorerContextMenu
-          x={ctxMenu.x}
-          y={ctxMenu.y}
-          items={buildMenuItems()}
-          onClose={() => setCtxMenu(null)}
-        />
-      )}
-
-      {activeGitModal === 'commit' && (
-        <CommitDialog
-          path={path}
-          onClose={() => {
-            setActiveGitModal(null);
-            useWorkspaceStore.getState().refreshGitStatus();
-          }}
-        />
-      )}
-      {activeGitModal === 'branches' && (
-        <BranchesDialog
-          path={path}
-          onClose={() => setActiveGitModal(null)}
-        />
-      )}
-      {activeGitModal === 'remotes' && (
-        <RemotesDialog
-          path={path}
-          onClose={() => setActiveGitModal(null)}
-        />
-      )}
-      {activeGitModal === 'stash' && (
-        <StashDialog
-          path={path}
-          onClose={() => {
-            setActiveGitModal(null);
-            useWorkspaceStore.getState().refreshGitStatus();
-          }}
-        />
-      )}
-      {activeGitModal === 'history' && (
-        <HistoryDialog
-          path={path}
-          onClose={() => setActiveGitModal(null)}
-        />
-      )}
-      {activeGitModal === 'rollback' && (
-        <RollbackDialog
-          path={path}
-          onClose={() => setActiveGitModal(null)}
-        />
-      )}
-      {activeGitModal === 'push' && (
-        <PushDialog
-          path={path}
-          onClose={() => setActiveGitModal(null)}
-        />
-      )}
-      {activeGitModal === 'pull' && (
-        <PullDialog
-          path={path}
-          onClose={() => setActiveGitModal(null)}
-        />
-      )}
     </div>
   );
-};
+});
 
 const IGNORED_DIRS = ['.git', 'node_modules', 'dist', 'build', 'target', '.vscode', '.idea', '__pycache__', 'env', 'venv'];
 
@@ -947,11 +495,41 @@ export const FileExplorer: React.FC = () => {
   const openFile = useWorkspaceStore((s) => s.openFile);
   const setCurrentProject = useWorkspaceStore((s) => s.setCurrentProject);
   const { dispatch } = useApp();
+
   const [showSearch, setShowSearch] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<Array<{ name: string; path: string; isDir: boolean }>>([]);
   const [searching, setSearching] = useState(false);
+
+  // Singleton Modals & Context Menu State
+  const [activeCtxMenu, setActiveCtxMenu] = useState<{ x: number; y: number; items: MenuItem[] } | null>(null);
+  const [activeDeleteTarget, setActiveDeleteTarget] = useState<{ path: string; name: string; isDir: boolean; selectedCount: number } | null>(null);
+  const [activeGitModal, setActiveGitModal] = useState<{ type: GitModalType; path: string } | null>(null);
+  const [creatingTarget, setCreatingTarget] = useState<{ path: string; type: 'file' | 'folder' } | null>(null);
+
+  // Directory Content Cache
+  const dirCache = useRef<Map<string, FileEntry[]>>(new Map());
+
   const refreshGitStatus = useWorkspaceStore((s) => s.refreshGitStatus);
+  const refreshFileExplorerStore = useWorkspaceStore((s) => s.refreshFileExplorer);
+
+  const clearDirCache = useCallback(() => {
+    dirCache.current.clear();
+  }, []);
+
+  const getDirChildren = useCallback(async (dirPath: string, force = false): Promise<FileEntry[]> => {
+    if (!force && dirCache.current.has(dirPath)) {
+      return dirCache.current.get(dirPath)!;
+    }
+    const list = await window.electronAPI.localListDir(dirPath);
+    dirCache.current.set(dirPath, list);
+    return list;
+  }, []);
+
+  const reloadDir = useCallback(async (dirPath: string) => {
+    dirCache.current.delete(dirPath);
+    refreshFileExplorerStore();
+  }, [refreshFileExplorerStore]);
 
   useEffect(() => {
     if (currentProject) {
@@ -989,138 +567,539 @@ export const FileExplorer: React.FC = () => {
     return () => clearTimeout(delayDebounce);
   }, [searchQuery, currentProject]);
 
+  const openContextMenu = useCallback(async (e: React.MouseEvent, path: string, name: string, isDir: boolean) => {
+    e.preventDefault();
+    e.stopPropagation();
+
+    const state = useWorkspaceStore.getState();
+    if (!state.selectedFilePaths.includes(path)) {
+      state.setSelectedFilePaths([path]);
+      state.setLastSelectedFilePath(path);
+    }
+
+    let systemClipboardPath = '';
+    try {
+      systemClipboardPath = await window.electronAPI.localReadFileFromClipboard();
+    } catch (err) {
+      console.warn('Failed to read system clipboard file path:', err);
+    }
+    const canPaste = !!(systemClipboardPath || state.copiedFilePath);
+
+    const rootPath = state.currentProject?.codePath || state.currentProject?.path || '';
+    const gitRoots = state.gitRoots || [];
+
+    const nodeGitRoot = (() => {
+      if (!gitRoots || gitRoots.length === 0) return null;
+      const sorted = [...gitRoots].sort((a, b) => b.length - a.length);
+      return sorted.find(r => path.startsWith(r)) || null;
+    })();
+    const isGitRepo = nodeGitRoot !== null;
+
+    const folderStatus = state.gitDirtyFolders[path];
+    const statusXY = state.gitFileStatuses[path];
+
+    const canAdd = (() => {
+      if (isDir) {
+        return folderStatus ? (folderStatus.notAdded || folderStatus.untracked) : false;
+      } else {
+        if (!statusXY) return false;
+        if (statusXY === '??') return true;
+        const Y = statusXY[1] || ' ';
+        return Y === 'M' || Y === 'D';
+      }
+    })();
+
+    const hasChanges = isDir ? !!folderStatus : !!statusXY;
+
+    const items: MenuItem[] = [];
+
+    if (isDir) {
+      items.push({
+        label: 'Open in Terminal',
+        onClick: () => state.openTerminal(path, name)
+      });
+    }
+
+    if (!isDir) {
+      items.push({
+        label: 'Open',
+        onClick: () => state.openFile(path, name)
+      });
+    }
+
+    items.push(
+      {
+        label: 'Reveal in Finder',
+        onClick: async () => {
+          const getParentPath = (filePath: string) => {
+            const isWin = filePath.includes('\\') || (!filePath.startsWith('/') && filePath.includes(':'));
+            const sep = isWin ? '\\' : '/';
+            const parts = filePath.split(sep);
+            parts.pop();
+            return parts.join(sep);
+          };
+          const dirToOpen = isDir ? path : getParentPath(path);
+          try {
+            await window.electronAPI.openDirectory(dirToOpen);
+          } catch (err: any) {
+            console.error('Failed to open directory:', err);
+          }
+        }
+      },
+      { divider: true }
+    );
+
+    if (isDir) {
+      items.push(
+        {
+          label: 'New File',
+          onClick: () => {
+            if (!state.expandedFolders[path]) {
+              state.selectAndToggleFolder(path);
+            }
+            setCreatingTarget({ path, type: 'file' });
+          }
+        },
+        {
+          label: 'New Folder',
+          onClick: () => {
+            if (!state.expandedFolders[path]) {
+              state.selectAndToggleFolder(path);
+            }
+            setCreatingTarget({ path, type: 'folder' });
+          }
+        },
+        { divider: true }
+      );
+    }
+
+    items.push(
+      {
+        label: 'Copy Path',
+        onClick: (evt: React.MouseEvent) => {
+          const { selectedFilePaths } = useWorkspaceStore.getState();
+          const targetPaths = selectedFilePaths.includes(path) ? selectedFilePaths : [path];
+          copyToClipboard(targetPaths.join('\n'), evt);
+        }
+      },
+      {
+        label: 'Copy Relative Path',
+        onClick: (evt: React.MouseEvent) => {
+          const { selectedFilePaths } = useWorkspaceStore.getState();
+          const targetPaths = selectedFilePaths.includes(path) ? selectedFilePaths : [path];
+          const relPaths = targetPaths.map(p => {
+            let rel = p.substring(rootPath.length);
+            if (rel.startsWith('/') || rel.startsWith('\\')) {
+              rel = rel.substring(1);
+            }
+            return rel || '.';
+          });
+          copyToClipboard(relPaths.join('\n'), evt);
+        }
+      },
+      { divider: true },
+      {
+        label: 'Copy File',
+        onClick: async () => {
+          try {
+            await window.electronAPI.localWriteFileToClipboard(path);
+          } catch (err: any) {
+            console.error('Failed to copy file to system clipboard:', err);
+          }
+          state.setCopiedFilePath(path);
+        }
+      },
+      {
+        label: 'Paste',
+        disabled: !canPaste,
+        onClick: async () => {
+          let sysClipPath = '';
+          try {
+            sysClipPath = await window.electronAPI.localReadFileFromClipboard();
+          } catch (e) {
+            console.warn('Failed to read system clipboard file path:', e);
+          }
+
+          const sourcePath = sysClipPath ? sysClipPath.trim() : state.copiedFilePath;
+
+          if (!sourcePath) {
+            alert('剪贴板中无有效的文件复制记录');
+            return;
+          }
+
+          const destDir = isDir ? path : path.substring(0, Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\')));
+
+          try {
+            const finalDestPath = await getUniqueDestPath(sourcePath, destDir);
+            const success = await window.electronAPI.localCopyFile(sourcePath, finalDestPath);
+            if (success) {
+              reloadDir(destDir);
+              await state.refreshGitStatus();
+            } else {
+              alert('粘贴文件失败：复制操作未成功完成');
+            }
+          } catch (err: any) {
+            console.error('Failed to copy and paste file:', err);
+            alert('粘贴文件失败: ' + err.message);
+          }
+        }
+      },
+      { divider: true }
+    );
+
+    if (!isDir) {
+      items.push(
+        {
+          label: 'Attach to Agent',
+          onClick: async (evt: React.MouseEvent) => {
+            try {
+              const readResult = await window.electronAPI.readFileBase64(path);
+              const attached = {
+                name,
+                path,
+                type: readResult.type,
+                data: readResult.data,
+                mimeType: readResult.mimeType,
+                preview: readResult.type === 'image' ? `data:${readResult.mimeType};base64,${readResult.data}` : undefined
+              };
+              const event = new CustomEvent('attach-file-to-agent', { detail: attached });
+              window.dispatchEvent(event);
+              copyToClipboard('已成功关联到 Agent', evt);
+            } catch (err: any) {
+              alert('关联失败: ' + err.message);
+            }
+          }
+        },
+        { divider: true }
+      );
+    }
+
+    const gitMenu: MenuItem = {
+      label: 'Git',
+      children: isGitRepo ? [
+        {
+          label: 'Commit File...',
+          onClick: () => setActiveGitModal({ type: 'commit', path })
+        },
+        {
+          label: 'Add to Git',
+          disabled: !canAdd,
+          onClick: async () => {
+            try {
+              await state.runGitAdd(path);
+            } catch (err: any) {
+              alert('Stage file failed: ' + err.message);
+            }
+          }
+        },
+        {
+          label: 'Rollback...',
+          disabled: !hasChanges,
+          onClick: () => setActiveGitModal({ type: 'rollback', path })
+        },
+        { divider: true },
+        {
+          label: 'Push...',
+          onClick: () => setActiveGitModal({ type: 'push', path })
+        },
+        {
+          label: 'Pull...',
+          onClick: () => setActiveGitModal({ type: 'pull', path })
+        },
+        {
+          label: 'Fetch',
+          onClick: async () => {
+            try {
+              let targetRoot = rootPath;
+              if (nodeGitRoot) targetRoot = nodeGitRoot;
+              await window.electronAPI.gitFetch(targetRoot);
+              await state.refreshGitStatus();
+              alert('Fetch 成功！');
+            } catch (err: any) {
+              alert('Fetch 失败: ' + err.message);
+            }
+          }
+        },
+        { divider: true },
+        {
+          label: 'Branches...',
+          onClick: () => setActiveGitModal({ type: 'branches', path })
+        },
+        {
+          label: 'Manage Remotes...',
+          onClick: () => setActiveGitModal({ type: 'remotes', path })
+        },
+        { divider: true },
+        {
+          label: 'Stash Changes...',
+          onClick: () => setActiveGitModal({ type: 'stash', path })
+        },
+        {
+          label: 'Show History',
+          onClick: () => setActiveGitModal({ type: 'history', path })
+        },
+        {
+          label: 'Show Git Graph',
+          onClick: () => state.openGitGraph()
+        }
+      ] : [
+        {
+          label: 'Initialize Git Repository',
+          onClick: async () => {
+            try {
+              await state.runGitInit();
+              alert('Git 仓库初始化成功！');
+            } catch (err: any) {
+              alert('初始化 Git 失败: ' + err.message);
+            }
+          }
+        }
+      ]
+    };
+    items.push(gitMenu, { divider: true });
+
+    items.push({
+      label: 'Delete',
+      danger: true,
+      onClick: () => {
+        const { selectedFilePaths } = useWorkspaceStore.getState();
+        const selectedCount = selectedFilePaths.includes(path) ? selectedFilePaths.length : 1;
+        setActiveDeleteTarget({ path, name, isDir, selectedCount });
+      }
+    });
+
+    setActiveCtxMenu({ x: e.clientX, y: e.clientY, items });
+  }, [reloadDir]);
+
+  const openGitModal = useCallback((type: GitModalType, path: string) => {
+    setActiveGitModal({ type, path });
+  }, []);
+
+  const openDeleteModal = useCallback((path: string, name: string, isDir: boolean) => {
+    const { selectedFilePaths } = useWorkspaceStore.getState();
+    const selectedCount = selectedFilePaths.includes(path) ? selectedFilePaths.length : 1;
+    setActiveDeleteTarget({ path, name, isDir, selectedCount });
+  }, []);
+
+  const handleConfirmDelete = async () => {
+    if (!activeDeleteTarget) return;
+    try {
+      const { selectedFilePaths, setSelectedFilePaths, setLastSelectedFilePath, refreshGitStatus } = useWorkspaceStore.getState();
+      const targetPaths = selectedFilePaths.includes(activeDeleteTarget.path) ? selectedFilePaths : [activeDeleteTarget.path];
+      for (const p of targetPaths) {
+        await window.electronAPI.localDeleteNode(p);
+      }
+      setSelectedFilePaths([]);
+      setLastSelectedFilePath(null);
+
+      clearDirCache();
+      refreshFileExplorerStore();
+      await refreshGitStatus();
+    } catch (err: any) {
+      alert('删除失败: ' + err.message);
+    } finally {
+      setActiveDeleteTarget(null);
+    }
+  };
+
+  const startCreating = useCallback((parentPath: string, type: 'file' | 'folder') => {
+    setCreatingTarget({ path: parentPath, type });
+  }, []);
+
+  const cancelCreating = useCallback(() => {
+    setCreatingTarget(null);
+  }, []);
+
+  const actionContextValue = useMemo<ActionContextType>(() => ({
+    openContextMenu,
+    openGitModal,
+    openDeleteModal,
+    getDirChildren,
+    startCreating,
+    creatingTarget,
+    cancelCreating,
+    reloadDir,
+  }), [openContextMenu, openGitModal, openDeleteModal, getDirChildren, startCreating, creatingTarget, cancelCreating, reloadDir]);
+
   if (!currentProject) return null;
 
   const rootPath = currentProject.codePath || currentProject.path;
 
   return (
-    <div className="flex flex-col h-full bg-background-primary border-r border-border-primary select-none w-full">
-      <div className="p-3 border-b border-border-primary flex items-center justify-between flex-shrink-0 bg-background-secondary/20">
-        <h3 className="text-xs font-bold text-text-primary uppercase tracking-wider font-mono">资源管理器</h3>
-        <div className="flex items-center space-x-1.5">
-          <button
-            onClick={async () => {
-              try {
-                const path = await window.electronAPI.selectDirectory();
-                if (path) {
-                  const updated = { ...currentProject, codePath: path };
-                  await window.electronAPI.updateProject(currentProject.id, updated);
-                  dispatch({ type: 'UPDATE_PROJECT', payload: updated });
-                  setCurrentProject(updated);
+    <FileExplorerActionContext.Provider value={actionContextValue}>
+      <div className="flex flex-col h-full bg-background-primary border-r border-border-primary select-none w-full">
+        <div className="p-3 border-b border-border-primary flex items-center justify-between flex-shrink-0 bg-background-secondary/20">
+          <h3 className="text-xs font-bold text-text-primary uppercase tracking-wider font-mono">资源管理器</h3>
+          <div className="flex items-center space-x-1.5">
+            <button
+              onClick={async () => {
+                try {
+                  const path = await window.electronAPI.selectDirectory();
+                  if (path) {
+                    const updated = { ...currentProject, codePath: path };
+                    await window.electronAPI.updateProject(currentProject.id, updated);
+                    dispatch({ type: 'UPDATE_PROJECT', payload: updated });
+                    setCurrentProject(updated);
+                  }
+                } catch (err) {
+                  console.error('Failed to change code directory:', err);
                 }
-              } catch (err) {
-                console.error('Failed to change code directory:', err);
-              }
-            }}
-            className="p-1 rounded text-text-secondary hover:bg-background-secondary/80 hover:text-text-primary transition-colors"
-            title={`开发代码路径: ${rootPath}`}
-          >
-            <Settings className="w-3.5 h-3.5" />
-          </button>
-          
-          <button
-            onClick={() => {
-              setShowSearch(!showSearch);
-              if (showSearch) setSearchQuery('');
-            }}
-            className={`p-1 rounded transition-colors ${
-              showSearch ? 'bg-primary/20 text-primary' : 'text-text-secondary hover:bg-background-secondary/80 hover:text-text-primary'
-            }`}
-            title="搜索文件"
-          >
-            <Search className="w-3.5 h-3.5" />
-          </button>
+              }}
+              className="p-1 rounded text-text-secondary hover:bg-background-secondary/80 hover:text-text-primary transition-colors"
+              title={`开发代码路径: ${rootPath}`}
+            >
+              <Settings className="w-3.5 h-3.5" />
+            </button>
+            
+            <button
+              onClick={() => {
+                setShowSearch(!showSearch);
+                if (showSearch) setSearchQuery('');
+              }}
+              className={`p-1 rounded transition-colors ${
+                showSearch ? 'bg-primary/20 text-primary' : 'text-text-secondary hover:bg-background-secondary/80 hover:text-text-primary'
+              }`}
+              title="搜索文件"
+            >
+              <Search className="w-3.5 h-3.5" />
+            </button>
 
-          <button
-            onClick={async (e) => {
-              const icon = e.currentTarget.querySelector('svg');
-              if (icon) {
-                icon.classList.add('animate-spin');
-                setTimeout(() => icon.classList.remove('animate-spin'), 600);
-              }
-              const { refreshFileExplorer, refreshGitStatus } = useWorkspaceStore.getState();
-              refreshFileExplorer();
-              await refreshGitStatus();
-            }}
-            className="p-1 rounded text-text-secondary hover:bg-background-secondary/80 hover:text-text-primary transition-colors duration-200"
-            title="刷新目录"
-          >
-            <RotateCw className="w-3.5 h-3.5" />
-          </button>
-        </div>
-      </div>
-
-      {showSearch && (
-        <div className="p-2 border-b border-border-primary bg-background-secondary/40 flex-shrink-0">
-          <div className="relative">
-            <input
-              type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="搜索项目文件..."
-              className="w-full bg-background-primary border border-border-primary focus:border-primary/50 text-xs text-text-primary rounded px-2.5 py-1.5 pl-7 focus:outline-none placeholder-text-tertiary font-mono transition-all"
-              autoFocus
-            />
-            <Search className="w-3.5 h-3.5 text-text-tertiary absolute left-2.5 top-2.5" />
-            {searchQuery && (
-              <button 
-                onClick={() => setSearchQuery('')}
-                className="absolute right-2.5 top-2.5 text-text-tertiary hover:text-text-primary"
-              >
-                <X className="w-3 h-3" />
-              </button>
-            )}
+            <button
+              onClick={async (e) => {
+                const icon = e.currentTarget.querySelector('svg');
+                if (icon) {
+                  icon.classList.add('animate-spin');
+                  setTimeout(() => icon.classList.remove('animate-spin'), 600);
+                }
+                clearDirCache();
+                refreshFileExplorerStore();
+                await refreshGitStatus();
+              }}
+              className="p-1 rounded text-text-secondary hover:bg-background-secondary/80 hover:text-text-primary transition-colors duration-200"
+              title="刷新目录"
+            >
+              <RotateCw className="w-3.5 h-3.5" />
+            </button>
           </div>
         </div>
-      )}
 
-      <div className="flex-1 overflow-y-auto p-1.5 scrollbar-thin">
-        {showSearch && searchQuery.trim() ? (
-          searching ? (
-            <div className="p-4 text-center text-text-tertiary text-xs font-mono">
-              正在搜索中...
-            </div>
-          ) : searchResults.length === 0 ? (
-            <div className="p-4 text-center text-text-tertiary text-xs font-mono">
-              未找到匹配文件
-            </div>
-          ) : (
-            <div className="space-y-0.5">
-              {searchResults.map((item) => (
-                <div
-                  key={item.path}
-                  onClick={() => {
-                    if (!item.isDir) {
-                      openFile(item.path, item.name);
-                    }
-                  }}
-                  className="flex items-center space-x-2 px-2 py-1.5 rounded hover:bg-background-secondary cursor-pointer transition-colors text-xs text-text-secondary hover:text-text-primary"
+        {showSearch && (
+          <div className="p-2 border-b border-border-primary bg-background-secondary/40 flex-shrink-0">
+            <div className="relative">
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="搜索项目文件..."
+                className="w-full bg-background-primary border border-border-primary focus:border-primary/50 text-xs text-text-primary rounded px-2.5 py-1.5 pl-7 focus:outline-none placeholder-text-tertiary font-mono transition-all"
+                autoFocus
+              />
+              <Search className="w-3.5 h-3.5 text-text-tertiary absolute left-2.5 top-2.5" />
+              {searchQuery && (
+                <button 
+                  onClick={() => setSearchQuery('')}
+                  className="absolute right-2.5 top-2.5 text-text-tertiary hover:text-text-primary"
                 >
-                  {item.isDir ? (
-                    <Folder className="w-3.5 h-3.5 text-primary flex-shrink-0" />
-                  ) : (
-                    getFileIconUtil(item.name)
-                  )}
-                  
-                  <div className="flex flex-col min-w-0 flex-1">
-                    <span className="font-mono truncate">{item.name}</span>
-                    <span className="text-[9px] text-text-tertiary truncate font-mono select-all">
-                      {item.path.substring(rootPath.length + 1) || item.path}
-                    </span>
-                  </div>
-                </div>
-              ))}
+                  <X className="w-3 h-3" />
+                </button>
+              )}
             </div>
-          )
-        ) : (
-          <FileNode
-            name={currentProject.name}
-            path={rootPath}
-            isDir={true}
-            depth={0}
+          </div>
+        )}
+
+        <div className="flex-1 overflow-y-auto p-1.5 scrollbar-thin">
+          {showSearch && searchQuery.trim() ? (
+            searching ? (
+              <div className="p-4 text-center text-text-tertiary text-xs font-mono">
+                正在搜索中...
+              </div>
+            ) : searchResults.length === 0 ? (
+              <div className="p-4 text-center text-text-tertiary text-xs font-mono">
+                未找到匹配文件
+              </div>
+            ) : (
+              <div className="space-y-0.5">
+                {searchResults.map((item) => (
+                  <div
+                    key={item.path}
+                    onClick={() => {
+                      if (!item.isDir) {
+                        openFile(item.path, item.name);
+                      }
+                    }}
+                    className="flex items-center space-x-2 px-2 py-1.5 rounded hover:bg-background-secondary cursor-pointer transition-colors text-xs text-text-secondary hover:text-text-primary"
+                  >
+                    {item.isDir ? (
+                      <Folder className="w-3.5 h-3.5 text-primary flex-shrink-0" />
+                    ) : (
+                      getFileIconUtil(item.name)
+                    )}
+                    
+                    <div className="flex flex-col min-w-0 flex-1">
+                      <span className="font-mono truncate">{item.name}</span>
+                      <span className="text-[9px] text-text-tertiary truncate font-mono select-all">
+                        {item.path.substring(rootPath.length + 1) || item.path}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )
+          ) : (
+            <FileNode
+              name={currentProject.name}
+              path={rootPath}
+              isDir={true}
+              depth={0}
+            />
+          )}
+        </div>
+
+        {/* Global Modals */}
+        {activeDeleteTarget && (
+          <DeleteConfirmModal
+            isOpen={true}
+            onConfirm={handleConfirmDelete}
+            onCancel={() => setActiveDeleteTarget(null)}
+            title={activeDeleteTarget.selectedCount > 1 ? `确定要删除这 ${activeDeleteTarget.selectedCount} 个选中的项目吗？` : `确定要删除 ${activeDeleteTarget.name} 吗？`}
+            description={activeDeleteTarget.isDir || activeDeleteTarget.selectedCount > 1 ? "选中项目将同时递归删除其包含的全部子目录与文件，此操作不可恢复。" : "此文件将被从本地硬盘中彻底删除，且无法恢复。"}
           />
         )}
+
+        {activeCtxMenu && (
+          <FileExplorerContextMenu
+            x={activeCtxMenu.x}
+            y={activeCtxMenu.y}
+            items={activeCtxMenu.items}
+            onClose={() => setActiveCtxMenu(null)}
+          />
+        )}
+
+        {activeGitModal?.type === 'commit' && (
+          <CommitDialog path={activeGitModal.path} onClose={() => { setActiveGitModal(null); refreshGitStatus(); }} />
+        )}
+        {activeGitModal?.type === 'branches' && (
+          <BranchesDialog path={activeGitModal.path} onClose={() => setActiveGitModal(null)} />
+        )}
+        {activeGitModal?.type === 'remotes' && (
+          <RemotesDialog path={activeGitModal.path} onClose={() => setActiveGitModal(null)} />
+        )}
+        {activeGitModal?.type === 'stash' && (
+          <StashDialog path={activeGitModal.path} onClose={() => { setActiveGitModal(null); refreshGitStatus(); }} />
+        )}
+        {activeGitModal?.type === 'history' && (
+          <HistoryDialog path={activeGitModal.path} onClose={() => setActiveGitModal(null)} />
+        )}
+        {activeGitModal?.type === 'rollback' && (
+          <RollbackDialog path={activeGitModal.path} onClose={() => setActiveGitModal(null)} />
+        )}
+        {activeGitModal?.type === 'push' && (
+          <PushDialog path={activeGitModal.path} onClose={() => setActiveGitModal(null)} />
+        )}
+        {activeGitModal?.type === 'pull' && (
+          <PullDialog path={activeGitModal.path} onClose={() => setActiveGitModal(null)} />
+        )}
       </div>
-    </div>
+    </FileExplorerActionContext.Provider>
   );
 };

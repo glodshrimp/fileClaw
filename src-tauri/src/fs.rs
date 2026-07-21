@@ -34,50 +34,63 @@ pub struct ReadFileResult {
 }
 
 #[tauri::command]
-pub fn local_list_dir(dir_path: String) -> Result<Vec<FileNode>, String> {
-    let path = Path::new(&dir_path);
-    if !path.exists() {
-        return Err("Directory does not exist".to_string());
-    }
-    if !path.is_dir() {
-        return Err("Path is not a directory".to_string());
-    }
+pub async fn local_list_dir(dir_path: String) -> Result<Vec<FileNode>, String> {
+    tokio::task::spawn_blocking(move || {
+        let path = Path::new(&dir_path);
+        if !path.exists() {
+            return Err("Directory does not exist".to_string());
+        }
+        if !path.is_dir() {
+            return Err("Path is not a directory".to_string());
+        }
 
-    let entries = fs::read_dir(path).map_err(|e| e.to_string())?;
-    let mut list = Vec::new();
+        let entries = fs::read_dir(path).map_err(|e| e.to_string())?;
+        let mut list = Vec::with_capacity(64);
 
-    for entry in entries {
-        if let Ok(entry) = entry {
-            let metadata = entry.metadata().map_err(|e| e.to_string())?;
+        for entry in entries.flatten() {
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            let is_dir = file_type.is_dir();
             let file_name = entry.file_name().to_string_lossy().into_owned();
-            
-            // Skip hidden files (.DS_Store, etc.) if desired, or keep them.
-            // Let's match typical FileScan behavior (show everything except maybe dot files depending on user settings, but let's include them for completeness)
-            
-            let mtime = metadata.modified()
-                .map(|t| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64)
-                .unwrap_or(0);
+            let file_path = path.join(&file_name).to_string_lossy().into_owned();
+
+            let (size, mtime) = if !is_dir {
+                if let Ok(meta) = entry.metadata() {
+                    let mt = meta.modified()
+                        .map(|t| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64)
+                        .unwrap_or(0);
+                    (meta.len(), mt)
+                } else {
+                    (0, 0)
+                }
+            } else {
+                (0, 0)
+            };
 
             list.push(FileNode {
                 name: file_name,
-                path: entry.path().to_string_lossy().into_owned(),
-                is_dir: metadata.is_dir(),
-                size: metadata.len(),
+                path: file_path,
+                is_dir,
+                size,
                 mtime,
             });
         }
-    }
 
-    // Sort: directories first, then alphabetical
-    list.sort_by(|a, b| {
-        if a.is_dir != b.is_dir {
-            b.is_dir.cmp(&a.is_dir)
-        } else {
-            a.name.to_lowercase().cmp(&b.name.to_lowercase())
-        }
-    });
+        // Sort: directories first, then alphabetical
+        list.sort_by(|a, b| {
+            if a.is_dir != b.is_dir {
+                b.is_dir.cmp(&a.is_dir)
+            } else {
+                a.name.to_lowercase().cmp(&b.name.to_lowercase())
+            }
+        });
 
-    Ok(list)
+        Ok(list)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]

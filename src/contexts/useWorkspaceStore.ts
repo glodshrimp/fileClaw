@@ -21,6 +21,8 @@ export interface OpenFileTab {
   previewSourcePath?: string;
 }
 
+let refreshGitTimeout: ReturnType<typeof setTimeout> | null = null;
+
 const getBranchForPath = (path: string | null, roots: string[], repoBranches: Record<string, string>): string | null => {
   if (roots.length === 0) return null;
   if (!path) return repoBranches[roots[0]] || 'HEAD';
@@ -89,6 +91,8 @@ interface WorkspaceState {
   setSelectedFilePaths: (paths: string[]) => void;
   lastSelectedFilePath: string | null;
   setLastSelectedFilePath: (path: string | null) => void;
+  selectAndToggleFolder: (path: string) => void;
+  selectSingleFile: (path: string) => void;
 }
 
 export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
@@ -110,6 +114,18 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   setSelectedFilePaths: (paths) => set({ selectedFilePaths: paths }),
   lastSelectedFilePath: null,
   setLastSelectedFilePath: (path) => set({ lastSelectedFilePath: path }),
+  selectAndToggleFolder: (path) => set((state) => ({
+    selectedFilePaths: [path],
+    lastSelectedFilePath: path,
+    expandedFolders: {
+      ...state.expandedFolders,
+      [path]: !state.expandedFolders[path],
+    },
+  })),
+  selectSingleFile: (path) => set({
+    selectedFilePaths: [path],
+    lastSelectedFilePath: path,
+  }),
 
   // Git State Init
   gitBranch: null,
@@ -410,98 +426,111 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   },
 
   refreshGitStatus: async () => {
-    const { currentProject, activeTabPath } = get();
-    if (!currentProject) return;
-    const projectPath = currentProject.codePath || currentProject.path;
+    if (refreshGitTimeout) {
+      clearTimeout(refreshGitTimeout);
+    }
+    return new Promise((resolve) => {
+      refreshGitTimeout = setTimeout(async () => {
+        refreshGitTimeout = null;
+        const { currentProject, activeTabPath } = get();
+        if (!currentProject) {
+          resolve();
+          return;
+        }
+        const projectPath = currentProject.codePath || currentProject.path;
 
-    try {
-      let { gitRoots } = get();
-      if (!gitRoots || gitRoots.length === 0) {
-        gitRoots = await window.electronAPI.gitDiscoverRoots(projectPath);
-      }
-      const roots = gitRoots;
-      if (roots.length === 0) {
-        set({
-          gitBranch: null,
-          gitRoots: [],
-          gitRepoBranches: {},
-          gitFileStatuses: {},
-          gitDirtyFolders: {}
-        });
-        return;
-      }
-
-      const mergedStatuses: Record<string, string> = {};
-      const repoBranches: Record<string, string> = {};
-      const dirtyFolders: Record<string, { modified: boolean; added: boolean; untracked: boolean; notAdded: boolean }> = {};
-
-      const isWindows = projectPath.includes('\\') || (!projectPath.startsWith('/') && projectPath.includes(':'));
-      const sep = isWindows ? '\\' : '/';
-
-      for (const rootPath of roots) {
         try {
-          const branch = await window.electronAPI.gitCurrentBranch(rootPath);
-          repoBranches[rootPath] = branch || 'HEAD';
+          let { gitRoots } = get();
+          if (!gitRoots || gitRoots.length === 0) {
+            gitRoots = await window.electronAPI.gitDiscoverRoots(projectPath);
+          }
+          const roots = gitRoots;
+          if (roots.length === 0) {
+            set({
+              gitBranch: null,
+              gitRoots: [],
+              gitRepoBranches: {},
+              gitFileStatuses: {},
+              gitDirtyFolders: {}
+            });
+            resolve();
+            return;
+          }
 
-          const statuses = await window.electronAPI.gitStatus(rootPath);
-          for (const [relPath, status] of Object.entries(statuses)) {
-            // Build absolute path
-            const normalizedRel = relPath.replace(/\\/g, sep).replace(/\//g, sep);
-            const absFilePath = rootPath + (rootPath.endsWith(sep) ? '' : sep) + normalizedRel;
-            mergedStatuses[absFilePath] = status;
+          const mergedStatuses: Record<string, string> = {};
+          const repoBranches: Record<string, string> = {};
+          const dirtyFolders: Record<string, { modified: boolean; added: boolean; untracked: boolean; notAdded: boolean }> = {};
 
-            // Trace parent folders all the way up to workspace root path
-            let parent = absFilePath.substring(0, absFilePath.lastIndexOf(sep));
-            while (parent && parent.startsWith(projectPath) && parent.length >= projectPath.length) {
-              if (!dirtyFolders[parent]) {
-                dirtyFolders[parent] = { modified: false, added: false, untracked: false, notAdded: false };
+          const isWindows = projectPath.includes('\\') || (!projectPath.startsWith('/') && projectPath.includes(':'));
+          const sep = isWindows ? '\\' : '/';
+
+          for (const rootPath of roots) {
+            try {
+              const branch = await window.electronAPI.gitCurrentBranch(rootPath);
+              repoBranches[rootPath] = branch || 'HEAD';
+
+              const statuses = await window.electronAPI.gitStatus(rootPath);
+              for (const [relPath, status] of Object.entries(statuses)) {
+                // Build absolute path
+                const normalizedRel = relPath.replace(/\\/g, sep).replace(/\//g, sep);
+                const absFilePath = rootPath + (rootPath.endsWith(sep) ? '' : sep) + normalizedRel;
+                mergedStatuses[absFilePath] = status;
+
+                // Trace parent folders all the way up to workspace root path
+                let parent = absFilePath.substring(0, absFilePath.lastIndexOf(sep));
+                while (parent && parent.startsWith(projectPath) && parent.length >= projectPath.length) {
+                  if (!dirtyFolders[parent]) {
+                    dirtyFolders[parent] = { modified: false, added: false, untracked: false, notAdded: false };
+                  }
+                  const X = status[0] || ' ';
+                  const Y = status[1] || ' ';
+                  const isNotAdded = Y === 'M' || Y === 'D';
+                  const isModified = X === 'M';
+                  const isAdded = X === 'A' || X === 'R';
+                  const isUntracked = status === '??';
+
+                  if (isNotAdded) dirtyFolders[parent].notAdded = true;
+                  if (isModified) dirtyFolders[parent].modified = true;
+                  if (isAdded) dirtyFolders[parent].added = true;
+                  if (isUntracked) dirtyFolders[parent].untracked = true;
+
+                  parent = parent.substring(0, parent.lastIndexOf(sep));
+                }
               }
-              const X = status[0] || ' ';
-              const Y = status[1] || ' ';
-              const isNotAdded = Y === 'M' || Y === 'D';
-              const isModified = X === 'M';
-              const isAdded = X === 'A' || X === 'R';
-              const isUntracked = status === '??';
-
-              if (isNotAdded) dirtyFolders[parent].notAdded = true;
-              if (isModified) dirtyFolders[parent].modified = true;
-              if (isAdded) dirtyFolders[parent].added = true;
-              if (isUntracked) dirtyFolders[parent].untracked = true;
-
-              parent = parent.substring(0, parent.lastIndexOf(sep));
+            } catch (subErr) {
+              console.error(`Failed to refresh git status for sub-repo ${rootPath}:`, subErr);
             }
           }
-        } catch (subErr) {
-          console.error(`Failed to refresh git status for sub-repo ${rootPath}:`, subErr);
-        }
-      }
 
-      // Resolve active branch based on active tab path focus
-      let activeBranch = repoBranches[roots[0]] || null;
-      if (activeTabPath) {
-        const sortedRoots = [...roots].sort((a, b) => b.length - a.length);
-        const matched = sortedRoots.find(r => activeTabPath.startsWith(r));
-        if (matched) {
-          activeBranch = repoBranches[matched];
-        }
-      }
+          // Resolve active branch based on active tab path focus
+          let activeBranch = repoBranches[roots[0]] || null;
+          if (activeTabPath) {
+            const sortedRoots = [...roots].sort((a, b) => b.length - a.length);
+            const matched = sortedRoots.find(r => activeTabPath.startsWith(r));
+            if (matched) {
+              activeBranch = repoBranches[matched];
+            }
+          }
 
-      set({
-        gitBranch: activeBranch || 'HEAD',
-        gitRoots: roots,
-        gitRepoBranches: repoBranches,
-        gitFileStatuses: mergedStatuses,
-        gitDirtyFolders: dirtyFolders
-      });
-    } catch (err) {
-      set({
-        gitBranch: null,
-        gitRoots: [],
-        gitRepoBranches: {},
-        gitFileStatuses: {},
-        gitDirtyFolders: {}
-      });
-    }
+          set({
+            gitBranch: activeBranch || 'HEAD',
+            gitRoots: roots,
+            gitRepoBranches: repoBranches,
+            gitFileStatuses: mergedStatuses,
+            gitDirtyFolders: dirtyFolders
+          });
+        } catch (err) {
+          set({
+            gitBranch: null,
+            gitRoots: [],
+            gitRepoBranches: {},
+            gitFileStatuses: {},
+            gitDirtyFolders: {}
+          });
+        }
+        resolve();
+      }, 150);
+    });
   },
 
   runGitCheckout: async (branch: string) => {

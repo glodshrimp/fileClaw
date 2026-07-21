@@ -81,9 +81,8 @@ fn run_git_cmd(repo_path: &str, args: &[&str]) -> Result<String, String> {
     }
 }
 
-#[tauri::command]
-pub fn git_status(repo_path: String) -> Result<HashMap<String, String>, String> {
-    let raw = run_git_cmd(&repo_path, &["status", "--porcelain", "-z"])?;
+fn git_status_impl(repo_path: &str) -> Result<HashMap<String, String>, String> {
+    let raw = run_git_cmd(repo_path, &["status", "--porcelain", "-z"])?;
     let mut map = HashMap::new();
     if raw.is_empty() {
         return Ok(map);
@@ -110,6 +109,13 @@ pub fn git_status(repo_path: String) -> Result<HashMap<String, String>, String> 
         i += 1;
     }
     Ok(map)
+}
+
+#[tauri::command]
+pub async fn git_status(repo_path: String) -> Result<HashMap<String, String>, String> {
+    tokio::task::spawn_blocking(move || git_status_impl(&repo_path))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -172,7 +178,7 @@ pub fn git_add(repo_path: String, file_path: String) -> Result<(), String> {
 
 #[tauri::command]
 pub fn git_restore(repo_path: String, file_path: String) -> Result<(), String> {
-    let status_map = git_status(repo_path.clone())?;
+    let status_map = git_status_impl(&repo_path)?;
     let is_untracked = status_map.get(&file_path).map(|s| s == "??" || s == "?").unwrap_or(false);
     
     if is_untracked {
