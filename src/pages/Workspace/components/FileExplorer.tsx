@@ -201,13 +201,19 @@ const FileExplorerContextMenu: React.FC<ContextMenuProps> = ({ x, y, items, onCl
   );
 };
 
+const isValidFileName = (name: string): boolean => {
+  if (!name || !name.trim()) return false;
+  return !/[\\/:*?"<>|]/.test(name.trim());
+};
+
 const getUniqueDestPath = async (srcPath: string, destDir: string): Promise<string> => {
-  const separator = srcPath.includes('\\') ? '\\' : '/';
-  const fileName = srcPath.substring(Math.max(srcPath.lastIndexOf('/'), srcPath.lastIndexOf('\\')) + 1);
+  const normSrc = normalizePath(srcPath);
+  const normDest = normalizePath(destDir);
+  const fileName = normSrc.substring(normSrc.lastIndexOf('/') + 1);
   
   let existingFiles: string[] = [];
   try {
-    const list = await window.electronAPI.localListDir(destDir);
+    const list = await window.electronAPI.localListDir(normDest);
     existingFiles = list.map((f: any) => f.name.toLowerCase());
   } catch (err) {
     console.error('Failed to list destination directory:', err);
@@ -225,8 +231,9 @@ const getUniqueDestPath = async (srcPath: string, destDir: string): Promise<stri
     candidateName = counter === 1 ? `${baseName}_copy${ext}` : `${baseName}_copy_${counter}${ext}`;
   }
 
-  return `${destDir}${separator}${candidateName}`;
+  return `${normDest}/${candidateName}`;
 };
+
 interface FlatTreeItem {
   name: string;
   path: string;
@@ -235,6 +242,7 @@ interface FlatTreeItem {
   isEmptyPlaceholder?: boolean;
   isCreatingPlaceholder?: boolean;
   creatingType?: 'file' | 'folder';
+  isRenamingPlaceholder?: boolean;
   isMorePlaceholder?: boolean;
 }
 
@@ -249,6 +257,8 @@ interface FileNodeRowProps {
   onQuickAction: (e: React.MouseEvent, path: string, type: 'file' | 'folder') => void;
   onCreateSubmit: (name: string, parentPath: string, type: 'file' | 'folder') => void;
   onCancelCreating: () => void;
+  onRenameSubmit: (oldPath: string, newName: string) => void;
+  onCancelRenaming: () => void;
   onLoadAllChildren: (path: string) => void;
 }
 
@@ -263,10 +273,15 @@ const FileNodeRow = React.memo<FileNodeRowProps>(({
   onQuickAction,
   onCreateSubmit,
   onCancelCreating,
+  onRenameSubmit,
+  onCancelRenaming,
   onLoadAllChildren,
 }) => {
-  const { name, path, isDir, depth, isEmptyPlaceholder, isCreatingPlaceholder, creatingType, isMorePlaceholder } = item;
+  const { name, path, isDir, depth, isEmptyPlaceholder, isCreatingPlaceholder, creatingType, isRenamingPlaceholder, isMorePlaceholder } = item;
   const [newItemName, setNewItemName] = useState('');
+  const [renameInput, setRenameInput] = useState(name);
+  const isCreatingSubmittedRef = useRef(false);
+  const isRenamingSubmittedRef = useRef(false);
 
   if (isEmptyPlaceholder) {
     return (
@@ -292,19 +307,65 @@ const FileNodeRow = React.memo<FileNodeRowProps>(({
     );
   }
 
-  if (isCreatingPlaceholder && creatingType) {
-    const parentPath = path.substring(0, path.lastIndexOf('/::creating::'));
-    const handleFormSubmit = (e: React.FormEvent) => {
-      e.preventDefault();
-      if (newItemName.trim()) {
-        onCreateSubmit(newItemName.trim(), parentPath, creatingType);
-        setNewItemName('');
+  if (isRenamingPlaceholder) {
+    const submitRename = () => {
+      if (isRenamingSubmittedRef.current) return;
+      isRenamingSubmittedRef.current = true;
+      const trimmed = renameInput.trim();
+      if (trimmed && trimmed !== name && isValidFileName(trimmed)) {
+        onRenameSubmit(path, trimmed);
+      } else {
+        onCancelRenaming();
       }
     };
 
     return (
       <form 
-        onSubmit={handleFormSubmit} 
+        onSubmit={(e) => {
+          e.preventDefault();
+          submitRename();
+        }} 
+        className="flex items-center space-x-1 h-6 pr-2 select-none" 
+        style={{ paddingLeft: `${depth * 12 + 8}px` }}
+      >
+        <input
+          type="text"
+          autoFocus
+          value={renameInput}
+          onChange={(e) => setRenameInput(e.target.value)}
+          onBlur={submitRename}
+          onKeyDown={(e) => {
+            if (e.key === 'Escape') {
+              isRenamingSubmittedRef.current = true;
+              onCancelRenaming();
+            }
+          }}
+          className="bg-slate-950 border border-primary rounded px-1.5 py-0.5 text-[10px] text-white focus:outline-none flex-1 font-mono"
+        />
+      </form>
+    );
+  }
+
+  if (isCreatingPlaceholder && creatingType) {
+    const parentPath = path.substring(0, path.lastIndexOf('/::creating::'));
+    const submitCreate = () => {
+      if (isCreatingSubmittedRef.current) return;
+      isCreatingSubmittedRef.current = true;
+      const trimmed = newItemName.trim();
+      if (trimmed && isValidFileName(trimmed)) {
+        onCreateSubmit(trimmed, parentPath, creatingType);
+        setNewItemName('');
+      } else {
+        onCancelCreating();
+      }
+    };
+
+    return (
+      <form 
+        onSubmit={(e) => {
+          e.preventDefault();
+          submitCreate();
+        }} 
         className="flex items-center space-x-1 h-6 pr-2 select-none" 
         style={{ paddingLeft: `${depth * 12 + 8}px` }}
       >
@@ -314,9 +375,10 @@ const FileNodeRow = React.memo<FileNodeRowProps>(({
           placeholder={creatingType === 'file' ? '文件名...' : '文件夹名...'}
           value={newItemName}
           onChange={(e) => setNewItemName(e.target.value)}
-          onBlur={onCancelCreating}
+          onBlur={submitCreate}
           onKeyDown={(e) => {
             if (e.key === 'Escape') {
+              isCreatingSubmittedRef.current = true;
               onCancelCreating();
             }
           }}
@@ -420,40 +482,6 @@ const getStatusColorClass = (
   return '';
 };
 
-const IGNORED_DIRS = ['.git', 'node_modules', 'dist', 'build', 'target', '.vscode', '.idea', '__pycache__', 'env', 'venv'];
-
-const recursiveSearch = async (
-  dirPath: string, 
-  query: string, 
-  results: Array<{ name: string; path: string; isDir: boolean }> = [],
-  depth = 0
-): Promise<Array<{ name: string; path: string; isDir: boolean }>> => {
-  if (results.length >= 100 || depth > 8) return results;
-
-  try {
-    const list = await window.electronAPI.localListDir(dirPath);
-    for (const item of list) {
-      if (results.length >= 100) break;
-
-      const matches = item.name.toLowerCase().includes(query.toLowerCase());
-      if (matches) {
-        results.push({ name: item.name, path: item.path, isDir: item.isDir });
-      }
-
-      if (item.isDir) {
-        const folderName = item.name.toLowerCase();
-        const shouldIgnore = IGNORED_DIRS.some(ignored => folderName === ignored);
-        if (!shouldIgnore) {
-          await recursiveSearch(item.path, query, results, depth + 1);
-        }
-      }
-    }
-  } catch (err) {
-    console.error('Search error in dir:', dirPath, err);
-  }
-  return results;
-};
-
 const LARGE_DIR_LIMIT = 200;
 
 export const FileExplorer: React.FC = () => {
@@ -472,6 +500,7 @@ export const FileExplorer: React.FC = () => {
   const [activeDeleteTarget, setActiveDeleteTarget] = useState<{ path: string; name: string; isDir: boolean; selectedCount: number } | null>(null);
   const [activeGitModal, setActiveGitModal] = useState<{ type: GitModalType; path: string } | null>(null);
   const [creatingTarget, setCreatingTarget] = useState<{ path: string; type: 'file' | 'folder' } | null>(null);
+  const [renamingTarget, setRenamingTarget] = useState<{ path: string; name: string; isDir: boolean } | null>(null);
 
   // Zustand State subscriptions
   const expandedFolders = useWorkspaceStore((s) => s.expandedFolders);
@@ -551,7 +580,18 @@ export const FileExplorer: React.FC = () => {
 
     const traverse = (path: string, name: string, isDir: boolean, depth: number) => {
       const normalized = normalizePath(path);
-      items.push({ name, path: normalized, isDir, depth });
+
+      if (renamingTarget && renamingTarget.path === normalized) {
+        items.push({
+          name,
+          path: normalized,
+          isDir,
+          depth,
+          isRenamingPlaceholder: true,
+        });
+      } else {
+        items.push({ name, path: normalized, isDir, depth });
+      }
 
       if (isDir && expandedFolders[normalized]) {
         // Render creating input row first if active in this dir
@@ -604,7 +644,7 @@ export const FileExplorer: React.FC = () => {
 
     traverse(root, currentProject.name, true, 0);
     return items;
-  }, [currentProject, expandedFolders, creatingTarget, fullyExpandedDirs, fileExplorerRefreshKey]);
+  }, [currentProject, expandedFolders, creatingTarget, renamingTarget, fullyExpandedDirs, fileExplorerRefreshKey]);
 
   // Reactive lazy loader for expanded directories
   useEffect(() => {
@@ -653,7 +693,9 @@ export const FileExplorer: React.FC = () => {
     const state = useWorkspaceStore.getState();
 
     if (e.shiftKey && state.lastSelectedFilePath) {
-      const visiblePaths = visibleItems.map(item => item.path);
+      const visiblePaths = visibleItems
+        .filter(item => !item.isEmptyPlaceholder && !item.isCreatingPlaceholder && !item.isMorePlaceholder && !item.isRenamingPlaceholder)
+        .map(item => item.path);
       const idxStart = visiblePaths.indexOf(state.lastSelectedFilePath);
       const idxEnd = visiblePaths.indexOf(path);
       
@@ -713,6 +755,107 @@ export const FileExplorer: React.FC = () => {
     setCreatingTarget(null);
   }, []);
 
+  const handleRenameSubmit = useCallback(async (oldPath: string, newName: string) => {
+    try {
+      const normOld = normalizePath(oldPath);
+      const parentPath = normOld.substring(0, normOld.lastIndexOf('/'));
+      const newPath = `${parentPath}/${newName}`;
+
+      const state = useWorkspaceStore.getState();
+      await state.renameNode(normOld, newPath);
+      setRenamingTarget(null);
+
+      dirCache.current.delete(parentPath);
+      refreshFileExplorerStore();
+    } catch (err: any) {
+      alert('重命名失败: ' + err.message);
+    }
+  }, [refreshFileExplorerStore]);
+
+  const cancelRenaming = useCallback(() => {
+    setRenamingTarget(null);
+  }, []);
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if ((e.target as HTMLElement).tagName === 'INPUT') return;
+
+    const realItems = visibleItems.filter(item => !item.isEmptyPlaceholder && !item.isCreatingPlaceholder && !item.isMorePlaceholder && !item.isRenamingPlaceholder);
+    if (realItems.length === 0) return;
+
+    const state = useWorkspaceStore.getState();
+    const currentSelected = state.selectedFilePaths[state.selectedFilePaths.length - 1] || state.lastSelectedFilePath;
+    const currentIndex = realItems.findIndex(i => i.path === currentSelected);
+
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      const nextIdx = currentIndex < realItems.length - 1 ? currentIndex + 1 : 0;
+      const nextItem = realItems[nextIdx];
+      state.setSelectedFilePaths([nextItem.path]);
+      state.setLastSelectedFilePath(nextItem.path);
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      const prevIdx = currentIndex > 0 ? currentIndex - 1 : realItems.length - 1;
+      const prevItem = realItems[prevIdx];
+      state.setSelectedFilePaths([prevItem.path]);
+      state.setLastSelectedFilePath(prevItem.path);
+    } else if (e.key === 'ArrowRight') {
+      e.preventDefault();
+      if (currentIndex !== -1) {
+        const item = realItems[currentIndex];
+        if (item.isDir) {
+          if (!expandedFolders[item.path]) {
+            state.selectAndToggleFolder(item.path);
+          } else if (currentIndex < realItems.length - 1) {
+            const nextItem = realItems[currentIndex + 1];
+            if (nextItem.path.startsWith(item.path + '/')) {
+              state.setSelectedFilePaths([nextItem.path]);
+              state.setLastSelectedFilePath(nextItem.path);
+            }
+          }
+        }
+      }
+    } else if (e.key === 'ArrowLeft') {
+      e.preventDefault();
+      if (currentIndex !== -1) {
+        const item = realItems[currentIndex];
+        if (item.isDir && expandedFolders[item.path]) {
+          state.selectAndToggleFolder(item.path);
+        } else {
+          const parentPath = item.path.substring(0, item.path.lastIndexOf('/'));
+          const parentItem = realItems.find(i => i.path === parentPath);
+          if (parentItem) {
+            state.setSelectedFilePaths([parentItem.path]);
+            state.setLastSelectedFilePath(parentItem.path);
+          }
+        }
+      }
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      if (currentIndex !== -1) {
+        const item = realItems[currentIndex];
+        if (item.isDir) {
+          state.selectAndToggleFolder(item.path);
+        } else {
+          state.selectSingleFile(item.path);
+          state.openFile(item.path, item.name);
+        }
+      }
+    } else if (e.key === 'F2') {
+      e.preventDefault();
+      if (currentIndex !== -1) {
+        const item = realItems[currentIndex];
+        setRenamingTarget({ path: item.path, name: item.name, isDir: item.isDir });
+      }
+    } else if (e.key === 'Delete' || (e.key === 'Backspace' && (e.metaKey || e.ctrlKey))) {
+      e.preventDefault();
+      if (currentIndex !== -1) {
+        const item = realItems[currentIndex];
+        const selectedCount = state.selectedFilePaths.includes(item.path) ? state.selectedFilePaths.length : 1;
+        setActiveDeleteTarget({ path: item.path, name: item.name, isDir: item.isDir, selectedCount });
+      }
+    }
+  };
+
   useEffect(() => {
     if (currentProject) {
       refreshGitStatus();
@@ -744,11 +887,17 @@ export const FileExplorer: React.FC = () => {
 
     const delayDebounce = setTimeout(async () => {
       setSearching(true);
-      const root = currentProject.codePath || currentProject.path;
-      const results = await recursiveSearch(root, searchQuery.trim());
-      setSearchResults(results);
-      setSearching(false);
-    }, 250);
+      try {
+        const root = currentProject.codePath || currentProject.path;
+        const results = await window.electronAPI.localSearchFiles(root, searchQuery.trim(), 100);
+        setSearchResults(results || []);
+      } catch (err) {
+        console.error('Failed to search files in Rust backend:', err);
+        setSearchResults([]);
+      } finally {
+        setSearching(false);
+      }
+    }, 200);
 
     return () => clearTimeout(delayDebounce);
   }, [searchQuery, currentProject]);
@@ -860,6 +1009,12 @@ export const FileExplorer: React.FC = () => {
     }
 
     items.push(
+      {
+        label: 'Rename',
+        onClick: () => {
+          setRenamingTarget({ path, name, isDir });
+        }
+      },
       {
         label: 'Copy Path',
         onClick: (evt: React.MouseEvent) => {
@@ -1060,10 +1215,18 @@ export const FileExplorer: React.FC = () => {
   const handleConfirmDelete = async () => {
     if (!activeDeleteTarget) return;
     try {
-      const { selectedFilePaths, setSelectedFilePaths, setLastSelectedFilePath, refreshGitStatus } = useWorkspaceStore.getState();
-      const targetPaths = selectedFilePaths.includes(activeDeleteTarget.path) ? selectedFilePaths : [activeDeleteTarget.path];
+      const { selectedFilePaths, setSelectedFilePaths, setLastSelectedFilePath, refreshGitStatus, closeTabsUnderPath } = useWorkspaceStore.getState();
+      const rawTargetPaths = selectedFilePaths.includes(activeDeleteTarget.path) ? selectedFilePaths : [activeDeleteTarget.path];
+      
+      const targetPaths = [...rawTargetPaths].sort((a, b) => b.length - a.length);
+
       for (const p of targetPaths) {
-        await window.electronAPI.localDeleteNode(p);
+        try {
+          await window.electronAPI.localDeleteNode(p);
+        } catch (err) {
+          console.warn('Failed to delete node:', p, err);
+        }
+        closeTabsUnderPath(p);
       }
       setSelectedFilePaths([]);
       setLastSelectedFilePath(null);
@@ -1176,7 +1339,9 @@ export const FileExplorer: React.FC = () => {
       <div 
         ref={containerRef} 
         onScroll={handleScroll} 
-        className="flex-1 overflow-y-auto p-1.5 scrollbar-thin relative"
+        tabIndex={0}
+        onKeyDown={handleKeyDown}
+        className="flex-1 overflow-y-auto p-1.5 scrollbar-thin relative focus:outline-none"
       >
         {showSearch && searchQuery.trim() ? (
           searching ? (
@@ -1193,7 +1358,17 @@ export const FileExplorer: React.FC = () => {
                 <div
                   key={item.path}
                   onClick={() => {
-                    if (!item.isDir) {
+                    if (item.isDir) {
+                      const state = useWorkspaceStore.getState();
+                      if (!state.expandedFolders[item.path]) {
+                        state.selectAndToggleFolder(item.path);
+                      } else {
+                        state.setSelectedFilePaths([item.path]);
+                        state.setLastSelectedFilePath(item.path);
+                      }
+                      setShowSearch(false);
+                      setSearchQuery('');
+                    } else {
                       openFile(item.path, item.name);
                     }
                   }}
@@ -1240,6 +1415,8 @@ export const FileExplorer: React.FC = () => {
                     onQuickAction={handleQuickAction}
                     onCreateSubmit={handleCreateSubmit}
                     onCancelCreating={cancelCreating}
+                    onRenameSubmit={handleRenameSubmit}
+                    onCancelRenaming={cancelRenaming}
                     onLoadAllChildren={handleLoadAllChildren}
                   />
                 );

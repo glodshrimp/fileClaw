@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import {
   Folder, File as FileIcon, ArrowLeft, RefreshCw, Home,
   Trash2, HardDrive, ChevronRight, FolderPlus, Copy, Clipboard,
@@ -448,6 +449,14 @@ const FilePane: React.FC<PaneProps> = ({
 
   useEffect(() => { setSelectedItem(null); }, [path]);
 
+  const parentRef = useRef<HTMLDivElement>(null);
+  const rowVirtualizer = useVirtualizer({
+    count: items.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => 36,
+    overscan: 10,
+  });
+
   const atRoot = path === sep || path === '';
   const parts = path.split(sep).filter(Boolean);
   const crumbs = [{ label: '/', path: sep }, ...parts.map((p, i) => ({
@@ -607,10 +616,10 @@ const FilePane: React.FC<PaneProps> = ({
         </div>
       )}
 
-      {/* File table */}
-      <div className="flex-1 overflow-y-auto scrollbar-thin">
-        <table className="w-full text-sm">
-          <thead className="sticky top-0 z-10 bg-background-secondary/95 backdrop-blur-sm">
+      {/* File table — Virtualized using @tanstack/react-virtual */}
+      <div ref={parentRef} className="flex-1 overflow-y-auto scrollbar-thin relative">
+        <table className="w-full text-sm table-fixed">
+          <thead className="sticky top-0 z-10 bg-background-secondary/95 backdrop-blur-sm shadow-sm">
             <tr className="text-text-tertiary text-[10px] uppercase border-b border-border">
               <th className="w-8 py-2 px-2"></th>
               <th className="text-left font-medium py-2 px-1">文件名</th>
@@ -620,57 +629,78 @@ const FilePane: React.FC<PaneProps> = ({
             </tr>
           </thead>
           <tbody>
-            {items.map((item, idx) => (
-              <tr
-                key={idx}
-                draggable
-                onDragStart={(e) => {
-                  e.stopPropagation();
-                  const fp = side === 'local' ? localJoin(path, item.name) : join(path, item.name);
-                  onDragStart({ item, fullPath: fp, side });
-                  e.dataTransfer.effectAllowed = 'copyMove';
-                  e.dataTransfer.setData('application/json', JSON.stringify({ name: item.name, side }));
-                  e.dataTransfer.setData('text/plain', item.name); // Required by WebKit for valid drag
-                }}
-                onDoubleClick={() => {
-                  if (item.isDir) {
-                    const np = side === 'local' ? localJoin(path, item.name) : join(path, item.name);
-                    onNavigate(np);
-                  }
-                }}
-                onContextMenu={(e) => { 
-                  e.preventDefault(); e.stopPropagation(); 
-                  setSelectedItem(item.name);
-                  onContextMenu(e, item); 
-                }}
-                onClick={() => setSelectedItem(item.name)}
-                className={`group cursor-pointer select-none border-b border-border/50 last:border-0 transition-colors ${
-                  selectedItem === item.name 
-                    ? 'bg-blue-500/10 shadow-[inset_3px_0_0_0_rgba(59,130,246,0.8)]' 
-                    : 'hover:bg-primary/5'
-                }`}
-              >
-                <td className="py-2 px-2 text-center">
-                  {item.isDir
-                    ? <Folder className="w-4 h-4 text-amber-500 inline" />
-                    : <FileIcon className="w-4 h-4 text-text-tertiary inline" />}
-                </td>
-                <td className="py-2 px-1 text-text-primary whitespace-nowrap overflow-hidden text-ellipsis max-w-[160px]" title={item.name}>
-                  {item.name}
-                </td>
-                <td className="py-2 px-3 text-right text-text-secondary font-mono text-[11px]">
-                  {formatSize(item.size, item.isDir)}
-                </td>
-                <td className="py-2 px-3 text-right text-text-tertiary text-[11px] hidden lg:table-cell">
-                  {formatDate(item.ctime)}
-                </td>
-                <td className="py-2 px-3 text-right text-text-tertiary text-[11px] hidden xl:table-cell">
-                  {formatDate(item.mtime)}
-                </td>
-              </tr>
-            ))}
-            {items.length === 0 && !loading && (
-              <tr><td colSpan={4} className="py-10 text-center text-gray-300 text-sm">空目录</td></tr>
+            {items.length === 0 && !loading ? (
+              <tr><td colSpan={5} className="py-10 text-center text-gray-300 text-sm">空目录</td></tr>
+            ) : (
+              <>
+                {rowVirtualizer.getVirtualItems().length > 0 && (
+                  <tr style={{ height: `${rowVirtualizer.getVirtualItems()[0].start}px` }}>
+                    <td colSpan={5} />
+                  </tr>
+                )}
+                {rowVirtualizer.getVirtualItems().map((virtualRow) => {
+                  const item = items[virtualRow.index];
+                  if (!item) return null;
+                  return (
+                    <tr
+                      key={virtualRow.key}
+                      data-index={virtualRow.index}
+                      ref={rowVirtualizer.measureElement}
+                      draggable
+                      onDragStart={(e) => {
+                        e.stopPropagation();
+                        const fp = side === 'local' ? localJoin(path, item.name) : join(path, item.name);
+                        onDragStart({ item, fullPath: fp, side });
+                        e.dataTransfer.effectAllowed = 'copyMove';
+                        e.dataTransfer.setData('application/json', JSON.stringify({ name: item.name, side }));
+                        e.dataTransfer.setData('text/plain', item.name);
+                      }}
+                      onDoubleClick={() => {
+                        if (item.isDir) {
+                          const np = side === 'local' ? localJoin(path, item.name) : join(path, item.name);
+                          onNavigate(np);
+                        }
+                      }}
+                      onContextMenu={(e) => { 
+                        e.preventDefault(); e.stopPropagation(); 
+                        setSelectedItem(item.name);
+                        onContextMenu(e, item); 
+                      }}
+                      onClick={() => setSelectedItem(item.name)}
+                      className={`group cursor-pointer select-none border-b border-border/50 last:border-0 transition-colors h-[36px] ${
+                        selectedItem === item.name 
+                          ? 'bg-blue-500/10 shadow-[inset_3px_0_0_0_rgba(59,130,246,0.8)]' 
+                          : 'hover:bg-primary/5'
+                      }`}
+                    >
+                      <td className="w-8 py-2 px-2 text-center">
+                        {item.isDir
+                          ? <Folder className="w-4 h-4 text-amber-500 inline" />
+                          : <FileIcon className="w-4 h-4 text-text-tertiary inline" />}
+                      </td>
+                      <td className="py-2 px-1 text-text-primary whitespace-nowrap overflow-hidden text-ellipsis" title={item.name}>
+                        {item.name}
+                      </td>
+                      <td className="py-2 px-3 text-right text-text-secondary font-mono text-[11px] w-20">
+                        {formatSize(item.size, item.isDir)}
+                      </td>
+                      <td className="py-2 px-3 text-right text-text-tertiary text-[11px] w-32 hidden lg:table-cell">
+                        {formatDate(item.ctime)}
+                      </td>
+                      <td className="py-2 px-3 text-right text-text-tertiary text-[11px] w-32 hidden xl:table-cell">
+                        {formatDate(item.mtime)}
+                      </td>
+                    </tr>
+                  );
+                })}
+                {rowVirtualizer.getVirtualItems().length > 0 && (
+                  <tr style={{
+                    height: `${rowVirtualizer.getTotalSize() - (rowVirtualizer.getVirtualItems()[rowVirtualizer.getVirtualItems().length - 1]?.end || 0) - 36}px`
+                  }}>
+                    <td colSpan={5} />
+                  </tr>
+                )}
+              </>
             )}
           </tbody>
         </table>
@@ -971,23 +1001,48 @@ const SftpBrowser: React.FC<SftpBrowserProps> = ({ sshId }) => {
       getCurrentWindow().onDragDropEvent((event) => {
         const payload = event.payload;
         
-        // Helper to determine which pane is being hovered
+        // Helper to determine which pane is being hovered with 3-tier fallback for all DPI settings
         const getTargetSide = (pos: { x: number, y: number }): 'local' | 'remote' | null => {
-          // The event.payload.position from Tauri is already in logical coordinates
-          // on macOS (and potentially other platforms depending on Tauri version),
-          // so dividing by devicePixelRatio causes incorrect element resolution.
-          // On Windows, the position is in physical pixels, so we MUST divide by devicePixelRatio
-          // to get the correct logical coordinates for document.elementFromPoint.
-          const isWindows = navigator.userAgent.toLowerCase().includes('win');
-          const dpr = isWindows ? (window.devicePixelRatio || 1) : 1;
-          const el = document.elementFromPoint(pos.x / dpr, pos.y / dpr);
-          if (!el) return null;
+          // Tier 1: Raw logical position
+          let el = document.elementFromPoint(pos.x, pos.y);
+          if (el) {
+            const paneLocal = el.closest('[data-pane-side="local"]');
+            if (paneLocal) return 'local';
+            const paneRemote = el.closest('[data-pane-side="remote"]');
+            if (paneRemote) return 'remote';
+          }
           
-          const paneLocal = el.closest('[data-pane-side="local"]');
-          if (paneLocal) return 'local';
-          const paneRemote = el.closest('[data-pane-side="remote"]');
-          if (paneRemote) return 'remote';
-          
+          // Tier 2: Scaled by devicePixelRatio
+          const dpr = window.devicePixelRatio || 1;
+          if (dpr !== 1) {
+            el = document.elementFromPoint(pos.x / dpr, pos.y / dpr);
+            if (el) {
+              const paneLocal = el.closest('[data-pane-side="local"]');
+              if (paneLocal) return 'local';
+              const paneRemote = el.closest('[data-pane-side="remote"]');
+              if (paneRemote) return 'remote';
+            }
+          }
+
+          // Tier 3: Bounding box collision detection fallback
+          const localPaneEl = document.querySelector('[data-pane-side="local"]');
+          if (localPaneEl) {
+            const rect = localPaneEl.getBoundingClientRect();
+            if ((pos.x >= rect.left && pos.x <= rect.right && pos.y >= rect.top && pos.y <= rect.bottom) ||
+                (pos.x / dpr >= rect.left && pos.x / dpr <= rect.right && pos.y / dpr >= rect.top && pos.y / dpr <= rect.bottom)) {
+              return 'local';
+            }
+          }
+
+          const remotePaneEl = document.querySelector('[data-pane-side="remote"]');
+          if (remotePaneEl) {
+            const rect = remotePaneEl.getBoundingClientRect();
+            if ((pos.x >= rect.left && pos.x <= rect.right && pos.y >= rect.top && pos.y <= rect.bottom) ||
+                (pos.x / dpr >= rect.left && pos.x / dpr <= rect.right && pos.y / dpr >= rect.top && pos.y / dpr <= rect.bottom)) {
+              return 'remote';
+            }
+          }
+
           return null;
         };
 
@@ -1030,15 +1085,20 @@ const SftpBrowser: React.FC<SftpBrowserProps> = ({ sshId }) => {
           const targetPath = side === 'local' ? curLocal : curRemote;
           window.electronAPI.printFrontendLog?.(`[DragDrop] targetPath: ${targetPath}`);
           
+          const extractFileName = (p: string) => {
+            const parts = p.split(/[/\\]/).filter(Boolean);
+            return parts.length > 0 ? parts[parts.length - 1] : p;
+          };
+
           if (side === 'remote') {
             paths.forEach((lPath) => {
-              const fileName = lPath.substring(Math.max(lPath.lastIndexOf('/'), lPath.lastIndexOf('\\')) + 1);
+              const fileName = extractFileName(lPath);
               window.electronAPI.printFrontendLog?.(`[DragDrop] Starting safe upload: ${lPath} -> ${targetPath}/${fileName}`);
               curUp(lPath, targetPath, fileName);
             });
           } else if (side === 'local') {
             paths.forEach(async (srcPath) => {
-              const fileName = srcPath.substring(Math.max(srcPath.lastIndexOf('/'), srcPath.lastIndexOf('\\')) + 1);
+              const fileName = extractFileName(srcPath);
               const destPath = localJoin(targetPath, fileName);
               try {
                 await window.electronAPI.localCopyFile(srcPath, destPath);
@@ -1117,7 +1177,10 @@ const SftpBrowser: React.FC<SftpBrowserProps> = ({ sshId }) => {
             loadRemote(currentPath);
           } catch (e: any) { alert('创建失败: ' + (e.message || e)); }
         } else {
-          alert('本地新建文件夹暂不支持，请使用 Finder 操作');
+          try {
+            await window.electronAPI.localCreateNode(currentPath, name, true);
+            loadLocal(currentPath);
+          } catch (e: any) { alert('创建本地文件夹失败: ' + (e.message || e)); }
         }
       }
     });

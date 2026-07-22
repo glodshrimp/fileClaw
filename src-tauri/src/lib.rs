@@ -86,12 +86,14 @@ pub fn run() {
             
             // FS Commands
             fs::local_list_dir,
+            fs::local_search_files,
             fs::local_home_dir,
             fs::local_stat,
             fs::local_write_file,
             fs::local_delete_node,
             fs::local_create_node,
             fs::local_copy_file,
+            fs::local_rename_node,
             fs::local_write_file_to_clipboard,
             fs::local_read_file_from_clipboard,
             fs::read_file_base64,

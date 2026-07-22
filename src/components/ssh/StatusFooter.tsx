@@ -33,12 +33,12 @@ interface StatusFooterProps {
 const MONITOR_COMMAND = [
   'echo "===HOSTNAME===" && hostname 2>/dev/null',
   'echo "===KERNEL===" && uname -r 2>/dev/null',
-  'echo "===CPU===" && grep "cpu " /proc/stat 2>/dev/null',
-  'echo "===MEM===" && free -m 2>/dev/null | awk \'NR==2{print $2,$3,$7}\'',
-  'echo "===LOAD===" && cat /proc/loadavg 2>/dev/null',
-  'echo "===TCP===" && ss -s 2>/dev/null | awk \'/TCP:/{gsub(/,/,""); print $2}\'',
-  'echo "===UPTIME===" && cat /proc/uptime 2>/dev/null | awk \'{print int($1)}\'',
-  'echo "===DISK===" && df -h / 2>/dev/null | awk \'NR==2{print $2,$3,$5}\'',
+  'echo "===CPU===" && (grep "cpu " /proc/stat 2>/dev/null || echo "cpu 0 0 0 0 0 0 0 0")',
+  'echo "===MEM===" && (free -m 2>/dev/null | awk \'NR==2{print $2,$3,$7}\' || echo "1024 512 512")',
+  'echo "===LOAD===" && (cat /proc/loadavg 2>/dev/null || uptime | awk \'{print $(NF-2)}\' | tr -d \',\' || echo "0.00")',
+  'echo "===TCP===" && (ss -s 2>/dev/null | awk \'/TCP:/{gsub(/,/,""); print $2}\' || netstat -an 2>/dev/null | grep -c ESTABLISHED || echo "0")',
+  'echo "===UPTIME===" && (cat /proc/uptime 2>/dev/null | awk \'{print int($1)}\' || echo "0")',
+  'echo "===DISK===" && (df -h / 2>/dev/null | awk \'NR==2{print $2,$3,$5}\' || echo "0 0 0%")',
   'echo "===END==="',
 ].join(' && ');
 

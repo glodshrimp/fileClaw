@@ -369,6 +369,7 @@ pub async fn ssh_open_shell(
 
         thread::spawn(move || {
             let mut buffer = [0u8; 4096];
+            let mut utf8_remainder = Vec::<u8>::new();
             
             // Keep session and tcp stream in this thread so they are kept alive
             let _session = shell_session_clone;
@@ -461,8 +462,28 @@ pub async fn ssh_open_shell(
                         break;
                     }
                     Ok(n) => {
-                        let output = String::from_utf8_lossy(&buffer[..n]).into_owned();
-                        let _ = app_handle_clone.emit(&format!("ssh-output-{}", shell_id_clone), output);
+                        utf8_remainder.extend_from_slice(&buffer[..n]);
+                        match std::str::from_utf8(&utf8_remainder) {
+                            Ok(valid_str) => {
+                                let output = valid_str.to_string();
+                                utf8_remainder.clear();
+                                let _ = app_handle_clone.emit(&format!("ssh-output-{}", shell_id_clone), output);
+                            }
+                            Err(e) => {
+                                let valid_len = e.valid_up_to();
+                                if valid_len > 0 {
+                                    let valid_str = String::from_utf8_lossy(&utf8_remainder[..valid_len]).into_owned();
+                                    let _ = app_handle_clone.emit(&format!("ssh-output-{}", shell_id_clone), valid_str);
+                                }
+                                if let Some(error_len) = e.error_len() {
+                                    // Skip invalid bytes
+                                    utf8_remainder.drain(..valid_len + error_len);
+                                } else {
+                                    // Keep incomplete UTF-8 bytes for the next read
+                                    utf8_remainder.drain(..valid_len);
+                                }
+                            }
+                        }
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock 
                                || e.kind() == std::io::ErrorKind::TimedOut 
@@ -673,6 +694,28 @@ pub async fn sftp_mkdir(state: tauri::State<'_, SshState>, id: String, path: Str
     .map_err(|_| "Task panicked".to_string())?
 }
 
+fn sftp_remove_dir_all_recursive(sftp: &ssh2::Sftp, path: &Path) -> Result<(), String> {
+    let entries = match sftp.readdir(path) {
+        Ok(e) => e,
+        Err(_) => return sftp.rmdir(path).map_err(|e| e.to_string()),
+    };
+    for (entry_path, stat) in entries {
+        let name = entry_path.file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if name == "." || name == ".." {
+            continue;
+        }
+        if stat.is_dir() {
+            sftp_remove_dir_all_recursive(sftp, &entry_path)?;
+        } else {
+            sftp.unlink(&entry_path).map_err(|e| format!("Failed to delete remote file {:?}: {}", entry_path, e))?;
+        }
+    }
+    sftp.rmdir(path).map_err(|e| format!("Failed to delete remote dir {:?}: {}", path, e))?;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn sftp_rmdir(state: tauri::State<'_, SshState>, id: String, path: String) -> Result<bool, String> {
     let sessions_arc = state.sessions.clone();
@@ -680,7 +723,11 @@ pub async fn sftp_rmdir(state: tauri::State<'_, SshState>, id: String, path: Str
         let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
         let ssh_session = sessions.get_mut(&id).ok_or_else(|| "No active SSH connection".to_string())?;
         let sftp = get_sftp(ssh_session)?;
-        sftp.rmdir(Path::new(&path)).map_err(|e| e.to_string())?;
+        let p = Path::new(&path);
+        if let Err(_) = sftp.rmdir(p) {
+            // Try recursive deletion if directory is non-empty
+            sftp_remove_dir_all_recursive(sftp, p)?;
+        }
         Ok(true)
     })
     .await
@@ -773,7 +820,249 @@ pub async fn sftp_chmod(
     .map_err(|_| "Task panicked".to_string())?
 }
 
-// SFTP Upload with chunking and cancellation support
+#[derive(serde::Deserialize, Clone, Debug)]
+pub struct TransferOptions {
+    pub resume: Option<bool>,
+    #[serde(rename = "remoteSize")]
+    pub remote_size: Option<u64>,
+}
+
+#[derive(Serialize, Clone)]
+struct ProgressPayload {
+    jid: String,
+    file: String,
+    transferred: u64,
+    total: u64,
+}
+
+fn calc_local_dir_size(p: &Path) -> u64 {
+    if p.is_file() {
+        p.metadata().map(|m| m.len()).unwrap_or(0)
+    } else if p.is_dir() {
+        let mut total = 0;
+        if let Ok(entries) = std::fs::read_dir(p) {
+            for entry in entries.flatten() {
+                total += calc_local_dir_size(&entry.path());
+            }
+        }
+        total
+    } else {
+        0
+    }
+}
+
+fn calc_remote_dir_size(sftp: &ssh2::Sftp, p: &Path) -> u64 {
+    let mut total = 0;
+    if let Ok(entries) = sftp.readdir(p) {
+        for (entry_path, stat) in entries {
+            let name = entry_path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            if name == "." || name == ".." { continue; }
+            if stat.is_dir() {
+                total += calc_remote_dir_size(sftp, &entry_path);
+            } else {
+                total += stat.size.unwrap_or(0);
+            }
+        }
+    }
+    total
+}
+
+fn upload_dir_recursive(
+    sftp: &ssh2::Sftp,
+    local_dir: &Path,
+    remote_dir: &Path,
+    app_handle: &AppHandle,
+    jid: &str,
+    cancelled_set: &Arc<Mutex<HashSet<String>>>,
+    transferred: &mut u64,
+    total_size: u64,
+    last_emit: &mut std::time::Instant,
+) -> Result<(), String> {
+    if cancelled_set.lock().unwrap().contains(jid) {
+        return Err("Transfer cancelled by user".to_string());
+    }
+
+    let _ = sftp.mkdir(remote_dir, 0o755);
+
+    let entries = std::fs::read_dir(local_dir)
+        .map_err(|e| format!("Failed to read local dir {:?}: {}", local_dir, e))?;
+
+    for entry in entries {
+        if cancelled_set.lock().unwrap().contains(jid) {
+            return Err("Transfer cancelled by user".to_string());
+        }
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let remote_target = remote_dir.join(&name);
+
+        if path.is_dir() {
+            upload_dir_recursive(sftp, &path, &remote_target, app_handle, jid, cancelled_set, transferred, total_size, last_emit)?;
+        } else {
+            upload_single_file_chunked(sftp, &path, &remote_target, app_handle, jid, cancelled_set, transferred, total_size, last_emit)?;
+        }
+    }
+    Ok(())
+}
+
+fn upload_single_file_chunked(
+    sftp: &ssh2::Sftp,
+    local_file_path: &Path,
+    remote_file_path: &Path,
+    app_handle: &AppHandle,
+    jid: &str,
+    cancelled_set: &Arc<Mutex<HashSet<String>>>,
+    transferred: &mut u64,
+    total_size: u64,
+    last_emit: &mut std::time::Instant,
+) -> Result<(), String> {
+    let mut local_file = File::open(local_file_path)
+        .map_err(|e| format!("Failed to open local file {:?}: {}", local_file_path, e))?;
+    let mut remote_file = sftp.create(remote_file_path)
+        .map_err(|e| format!("Failed to create remote file {:?}: {}", remote_file_path, e))?;
+
+    let mut buffer = vec![0u8; 1048576].into_boxed_slice();
+    loop {
+        if cancelled_set.lock().unwrap().contains(jid) {
+            return Err("Transfer cancelled by user".to_string());
+        }
+        let n = local_file.read(&mut buffer)
+            .map_err(|e| format!("Local read failed: {}", e))?;
+        if n == 0 { break; }
+        remote_file.write_all(&buffer[..n])
+            .map_err(|e| format!("Remote write failed: {}", e))?;
+        *transferred += n as u64;
+
+        let now = std::time::Instant::now();
+        if now.duration_since(*last_emit) >= std::time::Duration::from_millis(150) {
+            let _ = app_handle.emit("sftp-progress", ProgressPayload {
+                jid: jid.to_string(),
+                file: local_file_path.to_string_lossy().into_owned(),
+                transferred: *transferred,
+                total: total_size,
+            });
+            *last_emit = now;
+        }
+    }
+    Ok(())
+}
+
+fn download_dir_recursive(
+    sftp: &ssh2::Sftp,
+    remote_dir: &Path,
+    local_dir: &Path,
+    app_handle: &AppHandle,
+    jid: &str,
+    cancelled_set: &Arc<Mutex<HashSet<String>>>,
+    transferred: &mut u64,
+    total_size: u64,
+    last_emit: &mut std::time::Instant,
+) -> Result<(), String> {
+    if cancelled_set.lock().unwrap().contains(jid) {
+        return Err("Transfer cancelled by user".to_string());
+    }
+
+    let _ = std::fs::create_dir_all(local_dir);
+
+    let entries = sftp.readdir(remote_dir)
+        .map_err(|e| format!("Failed to read remote dir {:?}: {}", remote_dir, e))?;
+
+    for (entry_path, stat) in entries {
+        if cancelled_set.lock().unwrap().contains(jid) {
+            return Err("Transfer cancelled by user".to_string());
+        }
+        let name = entry_path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        if name == "." || name == ".." { continue; }
+
+        let local_target = local_dir.join(&name);
+        if stat.is_dir() {
+            download_dir_recursive(sftp, &entry_path, &local_target, app_handle, jid, cancelled_set, transferred, total_size, last_emit)?;
+        } else {
+            download_single_file_chunked(sftp, &entry_path, &local_target, app_handle, jid, cancelled_set, transferred, total_size, last_emit)?;
+        }
+    }
+    Ok(())
+}
+
+fn download_single_file_chunked(
+    sftp: &ssh2::Sftp,
+    remote_file_path: &Path,
+    local_file_path: &Path,
+    app_handle: &AppHandle,
+    jid: &str,
+    cancelled_set: &Arc<Mutex<HashSet<String>>>,
+    transferred: &mut u64,
+    total_size: u64,
+    last_emit: &mut std::time::Instant,
+) -> Result<(), String> {
+    let mut remote_file = sftp.open(remote_file_path)
+        .map_err(|e| format!("Failed to open remote file {:?}: {}", remote_file_path, e))?;
+    let mut local_file = File::create(local_file_path)
+        .map_err(|e| format!("Failed to create local file {:?}: {}", local_file_path, e))?;
+
+    let mut buffer = vec![0u8; 1048576].into_boxed_slice();
+    loop {
+        if cancelled_set.lock().unwrap().contains(jid) {
+            return Err("Transfer cancelled by user".to_string());
+        }
+        let n = remote_file.read(&mut buffer)
+            .map_err(|e| format!("Remote read failed: {}", e))?;
+        if n == 0 { break; }
+        local_file.write_all(&buffer[..n])
+            .map_err(|e| format!("Local write failed: {}", e))?;
+        *transferred += n as u64;
+
+        let now = std::time::Instant::now();
+        if now.duration_since(*last_emit) >= std::time::Duration::from_millis(150) {
+            let _ = app_handle.emit("sftp-progress", ProgressPayload {
+                jid: jid.to_string(),
+                file: remote_file_path.to_string_lossy().into_owned(),
+                transferred: *transferred,
+                total: total_size,
+            });
+            *last_emit = now;
+        }
+    }
+    Ok(())
+}
+
+fn get_or_create_transfer_session(
+    id: &str,
+    sessions_arc: &Arc<Mutex<HashMap<String, SshSession>>>,
+) -> Result<ssh2::Session, String> {
+    let (host, port, username, password, key_path, existing_session) = {
+        let sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
+        let ssh_session = sessions.get(id).ok_or_else(|| "No active SSH connection".to_string())?;
+        if ssh_session.session.authenticated() {
+            (String::new(), 0, String::new(), None, None, Some(ssh_session.session.clone()))
+        } else {
+            (
+                ssh_session.host.clone(),
+                ssh_session.port,
+                ssh_session.username.clone(),
+                ssh_session.password.clone(),
+                ssh_session.key_path.clone(),
+                None,
+            )
+        }
+    };
+
+    if let Some(sess) = existing_session {
+        Ok(sess)
+    } else {
+        let (session, _tcp) = connect_session(
+            &host,
+            port,
+            &username,
+            password.as_deref(),
+            key_path.as_deref(),
+            10
+        )?;
+        Ok(session)
+    }
+}
+
+// SFTP Upload with chunking, recursive dir and cancellation support
 #[tauri::command]
 pub async fn sftp_upload(
     app_handle: AppHandle,
@@ -782,122 +1071,129 @@ pub async fn sftp_upload(
     local_path: String,
     remote_path: String,
     jid: String,
+    options: Option<TransferOptions>,
 ) -> Result<bool, String> {
     let sessions_arc = state.sessions.clone();
     let cancelled_set = Arc::clone(&state.cancelled_transfers);
 
     tokio::task::spawn_blocking(move || {
-        // Acquire a lock temporarily to clone necessary connection parameters
-        let (host, port, username, password, key_path) = {
-            let sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
-            let ssh_session = sessions.get(&id).ok_or_else(|| "No active SSH connection".to_string())?;
-            (
-                ssh_session.host.clone(),
-                ssh_session.port,
-                ssh_session.username.clone(),
-                ssh_session.password.clone(),
-                ssh_session.key_path.clone(),
-            )
-        }; // Lock is dropped here!
-        
-        // Connect a dedicated session just for this file transfer
-        let (transfer_session, _tcp) = connect_session(
-            &host,
-            port,
-            &username,
-            password.as_deref(),
-            key_path.as_deref(),
-            10
-        )?;
+        let transfer_session = get_or_create_transfer_session(&id, &sessions_arc)?;
         
         let sftp = transfer_session.sftp()
             .map_err(|e| format!("Failed to start SFTP session: {}", e))?;
-        
-        // Open target remote file
-        let mut remote_file = sftp.create(Path::new(&remote_path))
-            .map_err(|e| format!("Failed to create remote file: {}", e))?;
-            
-        // Open local file
-        let mut local_file = File::open(&local_path)
-            .map_err(|e| format!("Failed to open local file: {}", e))?;
-            
-        let total_size = local_file.metadata().map(|m| m.len()).unwrap_or(0);
-        
-        // Clear cancelled state if it was there
+
         {
             let mut cancel_lock = cancelled_set.lock().unwrap();
             cancel_lock.remove(&jid);
         }
-        
-        // Perform copy loop in blocking fashion (Tauri commands can block if spawned on pool)
-        let mut buffer = vec![0u8; 1048576].into_boxed_slice(); // Optimized 1MB heap-allocated buffer
-        let mut transferred = 0;
-        
-        #[derive(Serialize, Clone)]
-        struct ProgressPayload {
-            jid: String,
-            file: String,
-            transferred: u64,
-            total: u64,
-        }
 
-        let mut last_emit = std::time::Instant::now();
-        // Emit initial progress
-        let _ = app_handle.emit("sftp-progress", ProgressPayload {
-            jid: jid.clone(),
-            file: local_path.clone(),
-            transferred,
-            total: total_size,
-        });
+        let l_path = Path::new(&local_path);
+        let r_path = Path::new(&remote_path);
 
-        loop {
-            // Check cancellation
-            {
-                let cancel_lock = cancelled_set.lock().unwrap();
-                if cancel_lock.contains(&jid) {
-                    return Err("Transfer cancelled by user".to_string());
+        if l_path.is_dir() {
+            let total_size = calc_local_dir_size(l_path);
+            let mut transferred = 0u64;
+            let mut last_emit = std::time::Instant::now();
+
+            upload_dir_recursive(
+                &sftp,
+                l_path,
+                r_path,
+                &app_handle,
+                &jid,
+                &cancelled_set,
+                &mut transferred,
+                total_size,
+                &mut last_emit,
+            )?;
+
+            let _ = app_handle.emit("sftp-progress", ProgressPayload {
+                jid: jid.clone(),
+                file: local_path.clone(),
+                transferred: total_size,
+                total: total_size,
+            });
+            Ok(true)
+        } else {
+            let mut local_file = File::open(l_path)
+                .map_err(|e| format!("Failed to open local file: {}", e))?;
+            let total_size = local_file.metadata().map(|m| m.len()).unwrap_or(0);
+
+            let is_resume = options.as_ref().and_then(|o| o.resume).unwrap_or(false);
+            let resume_offset = options.as_ref().and_then(|o| o.remote_size).unwrap_or(0);
+
+            let mut remote_file = if is_resume && resume_offset > 0 {
+                use std::io::Seek;
+                use std::io::SeekFrom;
+                let mut rf = sftp.open_mode(r_path, ssh2::OpenFlags::WRITE | ssh2::OpenFlags::READ, 0o644, ssh2::OpenType::File)
+                    .map_err(|e| format!("Failed to open remote file for resume: {}", e))?;
+                rf.seek(SeekFrom::Start(resume_offset))
+                    .map_err(|e| format!("Failed to seek remote file: {}", e))?;
+                local_file.seek(SeekFrom::Start(resume_offset))
+                    .map_err(|e| format!("Failed to seek local file: {}", e))?;
+                rf
+            } else {
+                sftp.create(r_path)
+                    .map_err(|e| format!("Failed to create remote file: {}", e))?
+            };
+
+            let mut transferred = if is_resume { resume_offset } else { 0 };
+            let mut buffer = vec![0u8; 1048576].into_boxed_slice();
+            let mut last_emit = std::time::Instant::now();
+
+            let _ = app_handle.emit("sftp-progress", ProgressPayload {
+                jid: jid.clone(),
+                file: local_path.clone(),
+                transferred,
+                total: total_size,
+            });
+
+            loop {
+                {
+                    let cancel_lock = cancelled_set.lock().unwrap();
+                    if cancel_lock.contains(&jid) {
+                        return Err("Transfer cancelled by user".to_string());
+                    }
+                }
+
+                let n = local_file.read(&mut buffer)
+                    .map_err(|e| format!("Local read failed: {}", e))?;
+                if n == 0 {
+                    break;
+                }
+                
+                remote_file.write_all(&buffer[..n])
+                    .map_err(|e| format!("Remote write failed: {}", e))?;
+                    
+                transferred += n as u64;
+                
+                let now = std::time::Instant::now();
+                if now.duration_since(last_emit) >= std::time::Duration::from_millis(150) {
+                    let _ = app_handle.emit("sftp-progress", ProgressPayload {
+                        jid: jid.clone(),
+                        file: local_path.clone(),
+                        transferred,
+                        total: total_size,
+                    });
+                    last_emit = now;
                 }
             }
 
-            let n = local_file.read(&mut buffer)
-                .map_err(|e| format!("Local read failed: {}", e))?;
-            if n == 0 {
-                break;
-            }
-            
-            remote_file.write_all(&buffer[..n])
-                .map_err(|e| format!("Remote write failed: {}", e))?;
-                
-            transferred += n as u64;
-            
-            // Throttle progress events to at most once every 150ms to prevent IPC bottlenecking
-            let now = std::time::Instant::now();
-            if now.duration_since(last_emit) >= std::time::Duration::from_millis(150) {
-                let _ = app_handle.emit("sftp-progress", ProgressPayload {
-                    jid: jid.clone(),
-                    file: local_path.clone(),
-                    transferred,
-                    total: total_size,
-                });
-                last_emit = now;
-            }
-        }
-        
-        // Emit final progress to ensure it registers as 100% complete
-        let _ = app_handle.emit("sftp-progress", ProgressPayload {
-            jid: jid.clone(),
-            file: local_path.clone(),
-            transferred,
-            total: total_size,
-        });
+            let _ = app_handle.emit("sftp-progress", ProgressPayload {
+                jid: jid.clone(),
+                file: local_path.clone(),
+                transferred: total_size,
+                total: total_size,
+            });
 
-        Ok(true)
+            Ok(true)
+        }
     })
     .await
     .map_err(|_| "Task panicked".to_string())?
 }
 
-// SFTP Download with chunking and cancellation support
+// SFTP Download with chunking, recursive dir and cancellation support
 #[tauri::command]
 pub async fn sftp_download(
     app_handle: AppHandle,
@@ -906,113 +1202,129 @@ pub async fn sftp_download(
     remote_path: String,
     local_path: String,
     jid: String,
+    options: Option<TransferOptions>,
 ) -> Result<bool, String> {
     let sessions_arc = state.sessions.clone();
     let cancelled_set = Arc::clone(&state.cancelled_transfers);
 
     tokio::task::spawn_blocking(move || {
-        // Acquire a lock temporarily to clone necessary connection parameters
-        let (host, port, username, password, key_path) = {
-            let sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
-            let ssh_session = sessions.get(&id).ok_or_else(|| "No active SSH connection".to_string())?;
-            (
-                ssh_session.host.clone(),
-                ssh_session.port,
-                ssh_session.username.clone(),
-                ssh_session.password.clone(),
-                ssh_session.key_path.clone(),
-            )
-        }; // Lock is dropped here!
-        
-        // Connect a dedicated session just for this file transfer
-        let (transfer_session, _tcp) = connect_session(
-            &host,
-            port,
-            &username,
-            password.as_deref(),
-            key_path.as_deref(),
-            10
-        )?;
+        let transfer_session = get_or_create_transfer_session(&id, &sessions_arc)?;
         
         let sftp = transfer_session.sftp()
             .map_err(|e| format!("Failed to start SFTP session: {}", e))?;
-        
-        let remote_stat = sftp.stat(Path::new(&remote_path)).map_err(|e| e.to_string())?;
-        let total_size = remote_stat.size.unwrap_or(0);
-
-        let mut remote_file = sftp.open(Path::new(&remote_path))
-            .map_err(|e| format!("Failed to open remote file: {}", e))?;
-            
-        let mut local_file = File::create(&local_path)
-            .map_err(|e| format!("Failed to create local file: {}", e))?;
 
         {
             let mut cancel_lock = cancelled_set.lock().unwrap();
             cancel_lock.remove(&jid);
         }
-        
-        let mut buffer = vec![0u8; 1048576].into_boxed_slice(); // Optimized 1MB heap-allocated buffer
-        let mut transferred = 0;
-        
-        #[derive(Serialize, Clone)]
-        struct ProgressPayload {
-            jid: String,
-            file: String,
-            transferred: u64,
-            total: u64,
-        }
 
-        let mut last_emit = std::time::Instant::now();
-        // Emit initial progress
-        let _ = app_handle.emit("sftp-progress", ProgressPayload {
-            jid: jid.clone(),
-            file: remote_path.clone(),
-            transferred,
-            total: total_size,
-        });
+        let r_path = Path::new(&remote_path);
+        let l_path = Path::new(&local_path);
 
-        loop {
-            // Check cancellation
-            {
-                let cancel_lock = cancelled_set.lock().unwrap();
-                if cancel_lock.contains(&jid) {
-                    return Err("Transfer cancelled by user".to_string());
+        let remote_stat = sftp.stat(r_path).map_err(|e| e.to_string())?;
+
+        if remote_stat.is_dir() {
+            let total_size = calc_remote_dir_size(&sftp, r_path);
+            let mut transferred = 0u64;
+            let mut last_emit = std::time::Instant::now();
+
+            download_dir_recursive(
+                &sftp,
+                r_path,
+                l_path,
+                &app_handle,
+                &jid,
+                &cancelled_set,
+                &mut transferred,
+                total_size,
+                &mut last_emit,
+            )?;
+
+            let _ = app_handle.emit("sftp-progress", ProgressPayload {
+                jid: jid.clone(),
+                file: remote_path.clone(),
+                transferred: total_size,
+                total: total_size,
+            });
+            Ok(true)
+        } else {
+            let total_size = remote_stat.size.unwrap_or(0);
+            let is_resume = options.as_ref().and_then(|o| o.resume).unwrap_or(false);
+            let resume_offset = options.as_ref().and_then(|o| o.remote_size).unwrap_or(0);
+
+            use std::io::Seek;
+            use std::io::SeekFrom;
+
+            let mut remote_file = sftp.open(r_path)
+                .map_err(|e| format!("Failed to open remote file: {}", e))?;
+
+            let mut local_file = if is_resume && resume_offset > 0 {
+                let mut lf = std::fs::OpenOptions::new()
+                    .write(true)
+                    .read(true)
+                    .open(l_path)
+                    .map_err(|e| format!("Failed to open local file for resume: {}", e))?;
+                lf.seek(SeekFrom::Start(resume_offset))
+                    .map_err(|e| format!("Failed to seek local file: {}", e))?;
+                remote_file.seek(SeekFrom::Start(resume_offset))
+                    .map_err(|e| format!("Failed to seek remote file: {}", e))?;
+                lf
+            } else {
+                File::create(l_path)
+                    .map_err(|e| format!("Failed to create local file: {}", e))?
+            };
+
+            let mut transferred = if is_resume { resume_offset } else { 0 };
+            let mut buffer = vec![0u8; 1048576].into_boxed_slice();
+            let mut last_emit = std::time::Instant::now();
+
+            let _ = app_handle.emit("sftp-progress", ProgressPayload {
+                jid: jid.clone(),
+                file: remote_path.clone(),
+                transferred,
+                total: total_size,
+            });
+
+            loop {
+                {
+                    let cancel_lock = cancelled_set.lock().unwrap();
+                    if cancel_lock.contains(&jid) {
+                        return Err("Transfer cancelled by user".to_string());
+                    }
+                }
+
+                let n = remote_file.read(&mut buffer)
+                    .map_err(|e| format!("Remote read failed: {}", e))?;
+                if n == 0 {
+                    break;
+                }
+                
+                local_file.write_all(&buffer[..n])
+                    .map_err(|e| format!("Local write failed: {}", e))?;
+                    
+                transferred += n as u64;
+                
+                let now = std::time::Instant::now();
+                if now.duration_since(last_emit) >= std::time::Duration::from_millis(150) {
+                    let _ = app_handle.emit("sftp-progress", ProgressPayload {
+                        jid: jid.clone(),
+                        file: remote_path.clone(),
+                        transferred,
+                        total: total_size,
+                    });
+                    last_emit = now;
                 }
             }
 
-            let n = remote_file.read(&mut buffer)
-                .map_err(|e| format!("Remote read failed: {}", e))?;
-            if n == 0 {
-                break;
-            }
-            
-            local_file.write_all(&buffer[..n])
-                .map_err(|e| format!("Local write failed: {}", e))?;
-                
-            transferred += n as u64;
-            
-            // Throttle progress events to at most once every 150ms to prevent IPC bottlenecking
-            let now = std::time::Instant::now();
-            if now.duration_since(last_emit) >= std::time::Duration::from_millis(150) {
-                let _ = app_handle.emit("sftp-progress", ProgressPayload {
-                    jid: jid.clone(),
-                    file: remote_path.clone(),
-                    transferred,
-                    total: total_size,
-                });
-                last_emit = now;
-            }
+            let _ = app_handle.emit("sftp-progress", ProgressPayload {
+                jid: jid.clone(),
+                file: remote_path.clone(),
+                transferred: total_size,
+                total: total_size,
+            });
+
+            Ok(true)
         }
-
-        // Emit final progress to ensure it registers as 100% complete
-        let _ = app_handle.emit("sftp-progress", ProgressPayload {
-            jid: jid.clone(),
-            file: remote_path.clone(),
-            transferred,
-            total: total_size,
-        });
-
-        Ok(true)
     })
     .await
     .map_err(|_| "Task panicked".to_string())?
@@ -1146,11 +1458,11 @@ pub async fn ssh_forward_local(
                                 }
 
                                 if active {
-                                    delay = 5;
+                                    delay = 1;
                                 } else {
                                     thread::sleep(std::time::Duration::from_millis(delay));
-                                    if delay < 120 {
-                                        delay += 15; // Backoff up to 120ms
+                                    if delay < 20 {
+                                        delay += 3; // Backoff up to 20ms
                                     }
                                 }
                             }
@@ -1158,8 +1470,8 @@ pub async fn ssh_forward_local(
                     });
                 } else {
                     thread::sleep(std::time::Duration::from_millis(accept_delay));
-                    if accept_delay < 250 {
-                        accept_delay += 25; // Backoff accept loop up to 250ms when idle
+                    if accept_delay < 30 {
+                        accept_delay += 5; // Backoff accept loop up to 30ms when idle
                     }
                 }
             }
@@ -1260,11 +1572,11 @@ pub async fn ssh_forward_remote(
                             }
 
                             if active {
-                                delay = 5;
+                                delay = 1;
                             } else {
                                 thread::sleep(std::time::Duration::from_millis(delay));
-                                if delay < 120 {
-                                    delay += 15; // Backoff up to 120ms
+                                if delay < 20 {
+                                    delay += 3; // Backoff up to 20ms
                                 }
                             }
                         }
@@ -1272,8 +1584,8 @@ pub async fn ssh_forward_remote(
                 });
             } else {
                 thread::sleep(std::time::Duration::from_millis(accept_delay));
-                if accept_delay < 250 {
-                    accept_delay += 25; // Backoff accept loop up to 250ms when idle
+                if accept_delay < 30 {
+                    accept_delay += 5; // Backoff accept loop up to 30ms when idle
                 }
             }
             }

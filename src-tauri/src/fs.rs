@@ -99,6 +99,89 @@ pub async fn local_list_dir(dir_path: String) -> Result<Vec<FileNode>, String> {
     .map_err(|e| e.to_string())?
 }
 
+const SEARCH_IGNORED_DIRS: &[&str] = &[
+    ".git", "node_modules", "dist", "build", "target",
+    ".vscode", ".idea", "__pycache__", "env", "venv", ".next"
+];
+
+fn search_dir_recursive(
+    dir: &Path,
+    query: &str,
+    results: &mut Vec<FileNode>,
+    limit: usize,
+    depth: usize,
+) {
+    if results.len() >= limit || depth > 12 {
+        return;
+    }
+
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        if results.len() >= limit {
+            break;
+        }
+
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        let file_path = entry.path();
+        let is_dir = file_type.is_dir();
+
+        let name_lower = file_name.to_lowercase();
+        if name_lower.contains(query) {
+            results.push(FileNode {
+                name: file_name.clone(),
+                path: file_path.to_string_lossy().into_owned(),
+                is_dir,
+                size: 0,
+                mtime: 0,
+            });
+        }
+
+        if is_dir {
+            let should_ignore = SEARCH_IGNORED_DIRS.iter().any(|&ignored| name_lower == ignored);
+            if !should_ignore {
+                search_dir_recursive(&file_path, query, results, limit, depth + 1);
+            }
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn local_search_files(
+    root_path: String,
+    query: String,
+    max_results: Option<usize>,
+) -> Result<Vec<FileNode>, String> {
+    tokio::task::spawn_blocking(move || {
+        let root = Path::new(&root_path);
+        if !root.exists() || !root.is_dir() {
+            return Ok(Vec::new());
+        }
+
+        let q = query.trim().to_lowercase();
+        if q.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let limit = max_results.unwrap_or(100);
+        let mut results = Vec::with_capacity(limit);
+
+        search_dir_recursive(root, &q, &mut results, limit, 0);
+
+        Ok(results)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 pub fn local_home_dir(app_handle: tauri::AppHandle) -> Result<String, String> {
     app_handle.path().home_dir()
@@ -174,6 +257,20 @@ pub fn local_copy_file(src_path: String, dest_path: String) -> Result<bool, Stri
     } else {
         std::fs::copy(src, dest).map_err(|e| e.to_string())?;
     }
+    Ok(true)
+}
+
+#[tauri::command]
+pub fn local_rename_node(old_path: String, new_path: String) -> Result<bool, String> {
+    let old_p = Path::new(&old_path);
+    let new_p = Path::new(&new_path);
+    if !old_p.exists() {
+        return Err("源文件或目录不存在".to_string());
+    }
+    if let Some(parent) = new_p.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    fs::rename(old_p, new_p).map_err(|e| e.to_string())?;
     Ok(true)
 }
 

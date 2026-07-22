@@ -76,6 +76,8 @@ interface WorkspaceState {
   closeOthers: (path: string) => void;
   closeLeft: (path: string) => void;
   closeRight: (path: string) => void;
+  closeTabsUnderPath: (targetPath: string) => void;
+  renameNode: (oldPath: string, newPath: string) => Promise<void>;
   
   // Git Actions
   refreshGitStatus: () => Promise<void>;
@@ -534,5 +536,100 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     const projectPath = currentProject.codePath || currentProject.path;
     await window.electronAPI.gitInit(projectPath);
     await refreshGitStatus();
+  },
+
+  closeTabsUnderPath: (targetPath: string) => {
+    const normTarget = normalizePath(targetPath);
+    set((state) => {
+      const remainingTabs = state.openTabs.filter((t) => {
+        const normTab = normalizePath(t.path);
+        return normTab !== normTarget && !normTab.startsWith(normTarget + '/');
+      });
+
+      let newActive = state.activeTabPath;
+      if (state.activeTabPath) {
+        const normActive = normalizePath(state.activeTabPath);
+        if (normActive === normTarget || normActive.startsWith(normTarget + '/')) {
+          newActive = remainingTabs.length > 0 ? remainingTabs[remainingTabs.length - 1].path : null;
+        }
+      }
+
+      return {
+        openTabs: remainingTabs,
+        activeTabPath: newActive,
+        gitBranch: getBranchForPath(newActive, state.gitRoots, state.gitRepoBranches)
+      };
+    });
+  },
+
+  renameNode: async (oldPath: string, newPath: string) => {
+    const normOld = normalizePath(oldPath);
+    const normNew = normalizePath(newPath);
+    if (normOld === normNew) return;
+
+    await window.electronAPI.localRenameNode(normOld, normNew);
+
+    const newName = normNew.substring(Math.max(normNew.lastIndexOf('/'), normNew.lastIndexOf('\\')) + 1);
+
+    set((state) => {
+      const updatedTabs = state.openTabs.map((t) => {
+        const normTabPath = normalizePath(t.path);
+        if (normTabPath === normOld) {
+          return { ...t, path: normNew, name: newName };
+        }
+        if (normTabPath.startsWith(normOld + '/')) {
+          const subPath = normTabPath.substring(normOld.length);
+          const updatedPath = normNew + subPath;
+          return { ...t, path: updatedPath };
+        }
+        return t;
+      });
+
+      let updatedActiveTab = state.activeTabPath;
+      if (state.activeTabPath) {
+        const normActive = normalizePath(state.activeTabPath);
+        if (normActive === normOld) {
+          updatedActiveTab = normNew;
+        } else if (normActive.startsWith(normOld + '/')) {
+          updatedActiveTab = normNew + normActive.substring(normOld.length);
+        }
+      }
+
+      const updatedExpanded: Record<string, boolean> = {};
+      Object.keys(state.expandedFolders).forEach((k) => {
+        const normK = normalizePath(k);
+        if (normK === normOld) {
+          updatedExpanded[normNew] = state.expandedFolders[k];
+        } else if (normK.startsWith(normOld + '/')) {
+          updatedExpanded[normNew + normK.substring(normOld.length)] = state.expandedFolders[k];
+        } else {
+          updatedExpanded[k] = state.expandedFolders[k];
+        }
+      });
+
+      const updatedSelected = state.selectedFilePaths.map((p) => {
+        const normP = normalizePath(p);
+        if (normP === normOld) return normNew;
+        if (normP.startsWith(normOld + '/')) return normNew + normP.substring(normOld.length);
+        return p;
+      });
+
+      let updatedLastSelected = state.lastSelectedFilePath;
+      if (state.lastSelectedFilePath) {
+        const normLast = normalizePath(state.lastSelectedFilePath);
+        if (normLast === normOld) updatedLastSelected = normNew;
+        else if (normLast.startsWith(normOld + '/')) updatedLastSelected = normNew + normLast.substring(normOld.length);
+      }
+
+      return {
+        openTabs: updatedTabs,
+        activeTabPath: updatedActiveTab,
+        expandedFolders: updatedExpanded,
+        selectedFilePaths: updatedSelected,
+        lastSelectedFilePath: updatedLastSelected,
+      };
+    });
+
+    await get().refreshGitStatus();
   },
 }));

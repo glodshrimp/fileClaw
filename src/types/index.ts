@@ -220,12 +220,14 @@ declare global {
 
       // 本地文件系统
       localListDir: (dirPath: string) => Promise<any[]>;
+      localSearchFiles: (rootPath: string, query: string, maxResults?: number) => Promise<any[]>;
       localHomeDir: () => Promise<string>;
       localStat: (filePath: string) => Promise<{ size: number; mtime: number; ctime: number; isDir: boolean }>;
       localWriteFile: (filePath: string, content: string) => Promise<{ success: boolean }>;
       localCreateNode: (parentPath: string, name: string, isDir: boolean) => Promise<{ success: boolean; path: string }>;
       localDeleteNode: (filePath: string) => Promise<{ success: boolean }>;
       localCopyFile: (srcPath: string, destPath: string) => Promise<boolean>;
+      localRenameNode: (oldPath: string, newPath: string) => Promise<boolean>;
       localWriteFileToClipboard: (path: string) => Promise<boolean>;
       localReadFileFromClipboard: () => Promise<string>;
 
