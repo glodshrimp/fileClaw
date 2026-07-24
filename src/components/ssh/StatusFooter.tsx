@@ -216,56 +216,56 @@ const StatusFooter: React.FC<StatusFooterProps> = ({ sshId, isConnected, isVisib
       {/* Expanded detail panel */}
       {expanded && (
         <div
-          className="absolute bottom-full left-0 w-full border-t border-border px-3 py-2 grid grid-cols-2 sm:grid-cols-4 gap-x-6 gap-y-1.5 text-[10px] animate-fade-in bg-background"
+          className="absolute bottom-full left-0 w-full border-t border-white/10 bg-[#141928]/90 backdrop-blur-md px-4 py-2.5 grid grid-cols-2 sm:grid-cols-4 gap-x-6 gap-y-2 text-[10px] animate-fade-in shadow-2xl shadow-black/50 z-50"
         >
           {/* Hostname */}
           <div className="flex items-center gap-1.5">
-            <Server className="w-3 h-3 text-slate-500" />
-            <span className="text-slate-500">主机:</span>
-            <span className="text-slate-300 font-mono truncate">{metrics.hostname || '--'}</span>
+            <Server className="w-3.5 h-3.5 text-blue-400" />
+            <span className="text-slate-400">主机:</span>
+            <span className="text-slate-200 font-mono font-medium truncate">{metrics.hostname || '--'}</span>
           </div>
           {/* Kernel */}
           <div className="flex items-center gap-1.5">
-            <Activity className="w-3 h-3 text-slate-500" />
-            <span className="text-slate-500">内核:</span>
-            <span className="text-slate-300 font-mono truncate">{metrics.kernelVersion || '--'}</span>
+            <Activity className="w-3.5 h-3.5 text-cyan-400" />
+            <span className="text-slate-400">内核:</span>
+            <span className="text-slate-200 font-mono font-medium truncate">{metrics.kernelVersion || '--'}</span>
           </div>
           {/* Memory detail */}
           <div className="flex items-center gap-1.5">
-            <MemoryStick className="w-3 h-3 text-slate-500" />
-            <span className="text-slate-500">内存:</span>
-            <span className={`font-mono ${severityColor(mem)}`}>
+            <MemoryStick className="w-3.5 h-3.5 text-purple-400" />
+            <span className="text-slate-400">内存:</span>
+            <span className={`font-mono font-medium ${severityColor(mem)}`}>
               {metrics.memUsed ?? '--'}M / {metrics.memTotal ?? '--'}M
             </span>
           </div>
           {/* Disk */}
           <div className="flex items-center gap-1.5">
-            <HardDrive className="w-3 h-3 text-slate-500" />
-            <span className="text-slate-500">磁盘:</span>
-            <span className={`font-mono ${severityColor(disk, 80, 95)}`}>
+            <HardDrive className="w-3.5 h-3.5 text-amber-400" />
+            <span className="text-slate-400">磁盘:</span>
+            <span className={`font-mono font-medium ${severityColor(disk, 80, 95)}`}>
               {metrics.diskUsed || '--'} / {metrics.diskTotal || '--'}
             </span>
           </div>
           {/* Load */}
           <div className="flex items-center gap-1.5">
-            <Cpu className="w-3 h-3 text-slate-500" />
-            <span className="text-slate-500">负载:</span>
-            <span className="text-slate-300 font-mono">{metrics.loadAvg || '--'}</span>
+            <Cpu className="w-3.5 h-3.5 text-emerald-400" />
+            <span className="text-slate-400">负载:</span>
+            <span className="text-slate-200 font-mono font-medium">{metrics.loadAvg || '--'}</span>
           </div>
           {/* Uptime */}
           <div className="flex items-center gap-1.5">
-            <Clock className="w-3 h-3 text-slate-500" />
-            <span className="text-slate-500">运行:</span>
-            <span className="text-slate-300 font-mono">{formatUptime(metrics.uptime ?? 0)}</span>
+            <Clock className="w-3.5 h-3.5 text-indigo-400" />
+            <span className="text-slate-400">运行:</span>
+            <span className="text-slate-200 font-mono font-medium">{formatUptime(metrics.uptime ?? 0)}</span>
           </div>
           {/* Last update */}
           <div className="flex items-center gap-1.5 col-span-2 sm:col-span-2">
-            <RefreshCw className="w-3 h-3 text-slate-500" />
-            <span className="text-slate-500">刷新:</span>
-            <span className="text-slate-400 font-mono">
+            <RefreshCw className="w-3.5 h-3.5 text-slate-400" />
+            <span className="text-slate-400">刷新:</span>
+            <span className="text-slate-300 font-mono">
               {metrics.lastUpdated ? new Date(metrics.lastUpdated).toLocaleTimeString() : '--'}
             </span>
-            <span className="text-slate-600 ml-1">· 每 5 秒</span>
+            <span className="text-slate-500 ml-1">· 每 5 秒</span>
           </div>
         </div>
       )}

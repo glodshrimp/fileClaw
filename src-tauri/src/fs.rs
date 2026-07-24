@@ -74,13 +74,23 @@ pub async fn local_list_dir(dir_path: String) -> Result<Vec<FileNode>, String> {
             let file_name = entry.file_name().to_string_lossy().into_owned();
             let file_path = path.join(&file_name).to_string_lossy().into_owned();
 
-            // Tree view only needs name/path/isDir; size/mtime fetched on demand via local_stat.
+            let (size, mtime) = if let Ok(meta) = entry.metadata() {
+                let size = if file_type.is_dir() { 0 } else { meta.len() };
+                let mtime = meta.modified().ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                (size, mtime)
+            } else {
+                (0, 0)
+            };
+
             list.push(FileNode {
                 name: file_name,
                 path: file_path,
                 is_dir: file_type.is_dir(),
-                size: 0,
-                mtime: 0,
+                size,
+                mtime,
             });
         }
 

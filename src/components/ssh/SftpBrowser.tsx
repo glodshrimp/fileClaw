@@ -63,8 +63,13 @@ const formatSize = (bytes: number, isDir: boolean) => {
   const i = Math.min(Math.floor(Math.log(bytes) / Math.log(k)), 3);
   return (bytes / Math.pow(k, i)).toFixed(1) + ' ' + sz[i];
 };
-const formatDate = (ms: number) =>
-  ms ? new Date(ms).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '-';
+const formatDate = (ms: number) => {
+  if (!ms) return '-';
+  const d = new Date(ms);
+  if (isNaN(d.getTime())) return '-';
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+};
 
 /** Format bytes/s into human-readable speed string with auto unit switching */
 const formatSpeed = (bytesPerSec: number): string => {
@@ -624,18 +629,17 @@ const FilePane: React.FC<PaneProps> = ({
               <th className="w-8 py-2 px-2"></th>
               <th className="text-left font-medium py-2 px-1">文件名</th>
               <th className="text-right font-medium py-2 px-3 w-20">大小</th>
-              <th className="text-right font-medium py-2 px-3 w-32 hidden lg:table-cell">创建时间</th>
-              <th className="text-right font-medium py-2 px-3 w-32 hidden xl:table-cell">修改时间</th>
+              <th className="text-right font-medium py-2 px-3 w-36 whitespace-nowrap">最近变更时间</th>
             </tr>
           </thead>
           <tbody>
             {items.length === 0 && !loading ? (
-              <tr><td colSpan={5} className="py-10 text-center text-gray-300 text-sm">空目录</td></tr>
+              <tr><td colSpan={4} className="py-10 text-center text-gray-300 text-sm">空目录</td></tr>
             ) : (
               <>
                 {rowVirtualizer.getVirtualItems().length > 0 && (
                   <tr style={{ height: `${rowVirtualizer.getVirtualItems()[0].start}px` }}>
-                    <td colSpan={5} />
+                    <td colSpan={4} />
                   </tr>
                 )}
                 {rowVirtualizer.getVirtualItems().map((virtualRow) => {
@@ -684,10 +688,7 @@ const FilePane: React.FC<PaneProps> = ({
                       <td className="py-2 px-3 text-right text-text-secondary font-mono text-[11px] w-20">
                         {formatSize(item.size, item.isDir)}
                       </td>
-                      <td className="py-2 px-3 text-right text-text-tertiary text-[11px] w-32 hidden lg:table-cell">
-                        {formatDate(item.ctime)}
-                      </td>
-                      <td className="py-2 px-3 text-right text-text-tertiary text-[11px] w-32 hidden xl:table-cell">
+                      <td className="py-2 px-3 text-right text-text-tertiary font-mono text-[11px] w-36 whitespace-nowrap">
                         {formatDate(item.mtime)}
                       </td>
                     </tr>
@@ -697,7 +698,7 @@ const FilePane: React.FC<PaneProps> = ({
                   <tr style={{
                     height: `${rowVirtualizer.getTotalSize() - (rowVirtualizer.getVirtualItems()[rowVirtualizer.getVirtualItems().length - 1]?.end || 0) - 36}px`
                   }}>
-                    <td colSpan={5} />
+                    <td colSpan={4} />
                   </tr>
                 )}
               </>
