@@ -616,8 +616,17 @@ const FilePane: React.FC<PaneProps> = ({
       </div>
 
       {error && (
-        <div className="px-3 py-1.5 text-xs text-red-600 bg-red-50 border-b border-red-100 flex-shrink-0">
-          ⚠ {error}
+        <div className="px-3 py-1.5 text-xs text-red-600 bg-red-50 border-b border-red-100 flex-shrink-0 flex items-center justify-between">
+          <span className="truncate flex-1 mr-2" title={error}>⚠ {error}</span>
+          <button
+            onClick={() => onNavigate(path)}
+            disabled={loading}
+            className="px-2 py-0.5 text-[11px] font-medium bg-red-100 hover:bg-red-200 text-red-700 rounded transition-colors flex-shrink-0 flex items-center gap-1"
+            title="重新连接并刷新"
+          >
+            <RefreshCw className={`w-3 h-3 ${loading ? 'animate-spin' : ''}`} />
+            重连 / 刷新
+          </button>
         </div>
       )}
 

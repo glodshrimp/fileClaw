@@ -85,6 +85,14 @@ fn connect_tcp_with_timeout(host: &str, port: u16, timeout_secs: u64) -> Result<
         
     // Disable Nagle's algorithm for low latency interaction
     let _ = tcp.set_nodelay(true);
+
+    // Enable TCP keepalive at socket level to prevent NAT/firewall idle timeout
+    if let Ok(socket) = tcp.try_clone() {
+        let socket = socket2::Socket::from(socket);
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(15));
+        let _ = socket.set_tcp_keepalive(&keepalive);
+    }
         
     Ok(tcp)
 }
@@ -222,6 +230,8 @@ fn connect_session(
     if !session.authenticated() {
         return Err("Authentication failed".to_string());
     }
+
+    session.set_keepalive(true, 10);
     
     Ok((session, tcp))
 }
@@ -614,14 +624,60 @@ pub async fn ssh_exec(
     .map_err(|_| "Task panicked".to_string())?
 }
 
-// Helper to open or cache SFTP
-fn get_sftp<'a>(ssh_session: &'a mut SshSession) -> Result<&'a ssh2::Sftp, String> {
-    if ssh_session.sftp.is_none() {
-        let sftp = ssh_session.session.sftp()
-            .map_err(|e| format!("Failed to start SFTP session: {}", e))?;
-        ssh_session.sftp = Some(sftp);
+impl SshSession {
+    pub fn reset_and_reconnect(&mut self) -> Result<(), String> {
+        self.sftp = None;
+        let (new_session, new_tcp) = connect_session(
+            &self.host,
+            self.port,
+            &self.username,
+            self.password.as_deref(),
+            self.key_path.as_deref(),
+            10,
+        )?;
+        self.session = new_session;
+        self._tcp = new_tcp;
+        Ok(())
     }
-    Ok(ssh_session.sftp.as_ref().unwrap())
+
+    pub fn ensure_sftp<'a>(&'a mut self) -> Result<&'a ssh2::Sftp, String> {
+        if self.sftp.is_none() {
+            match self.session.sftp() {
+                Ok(sftp) => {
+                    self.sftp = Some(sftp);
+                }
+                Err(_) => {
+                    self.reset_and_reconnect()?;
+                    let sftp = self.session.sftp()
+                        .map_err(|e| format!("Failed to start SFTP session after reconnect: {}", e))?;
+                    self.sftp = Some(sftp);
+                }
+            }
+        }
+        Ok(self.sftp.as_ref().unwrap())
+    }
+
+    pub fn invalidate_sftp(&mut self) {
+        self.sftp = None;
+    }
+}
+
+fn with_sftp<T, F>(ssh_session: &mut SshSession, f: F) -> Result<T, String>
+where
+    F: Fn(&ssh2::Sftp) -> Result<T, String>,
+{
+    let sftp = ssh_session.ensure_sftp()?;
+    match f(sftp) {
+        Ok(res) => Ok(res),
+        Err(err_msg) => {
+            ssh_session.invalidate_sftp();
+            if let Err(reconnect_err) = ssh_session.reset_and_reconnect() {
+                return Err(format!("{}. Reconnect failed: {}", err_msg, reconnect_err));
+            }
+            let sftp = ssh_session.ensure_sftp()?;
+            f(sftp)
+        }
+    }
 }
 
 #[tauri::command]
@@ -634,47 +690,47 @@ pub async fn sftp_list(
     tokio::task::spawn_blocking(move || {
         let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
         let ssh_session = sessions.get_mut(&id).ok_or_else(|| "No active SSH connection".to_string())?;
-        let sftp = get_sftp(ssh_session)?;
 
-        let entries = sftp.readdir(Path::new(&path))
-            .map_err(|e| format!("Failed to read SFTP directory: {}", e))?;
+        with_sftp(ssh_session, |sftp| {
+            let entries = sftp.readdir(Path::new(&path))
+                .map_err(|e| format!("Failed to read SFTP directory: {}", e))?;
 
-        let mut list = Vec::new();
-        for (entry_path, stat) in entries {
-            let name = entry_path.file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| entry_path.to_string_lossy().into_owned());
-                
-            // Ignore dot files like "." and ".."
-            if name == "." || name == ".." {
-                continue;
+            let mut list = Vec::new();
+            for (entry_path, stat) in entries {
+                let name = entry_path.file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| entry_path.to_string_lossy().into_owned());
+                    
+                if name == "." || name == ".." {
+                    continue;
+                }
+
+                let is_dir = stat.is_dir();
+                let size = stat.size.unwrap_or(0);
+                let mtime = stat.mtime.unwrap_or(0) * 1000;
+                let mode = stat.perm.unwrap_or(0);
+                let octal = format!("{:o}", mode & 0o777);
+
+                list.push(SftpFile {
+                    name,
+                    size,
+                    mtime,
+                    is_dir,
+                    mode,
+                    octal,
+                });
             }
 
-            let is_dir = stat.is_dir();
-            let size = stat.size.unwrap_or(0);
-            let mtime = stat.mtime.unwrap_or(0) * 1000; // ms
-            let mode = stat.perm.unwrap_or(0);
-            let octal = format!("{:o}", mode & 0o777);
-
-            list.push(SftpFile {
-                name,
-                size,
-                mtime,
-                is_dir,
-                mode,
-                octal,
+            list.sort_by(|a, b| {
+                if a.is_dir != b.is_dir {
+                    b.is_dir.cmp(&a.is_dir)
+                } else {
+                    a.name.to_lowercase().cmp(&b.name.to_lowercase())
+                }
             });
-        }
 
-        list.sort_by(|a, b| {
-            if a.is_dir != b.is_dir {
-                b.is_dir.cmp(&a.is_dir)
-            } else {
-                a.name.to_lowercase().cmp(&b.name.to_lowercase())
-            }
-        });
-
-        Ok(list)
+            Ok(list)
+        })
     })
     .await
     .map_err(|_| "Task panicked".to_string())?
@@ -686,9 +742,10 @@ pub async fn sftp_mkdir(state: tauri::State<'_, SshState>, id: String, path: Str
     tokio::task::spawn_blocking(move || {
         let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
         let ssh_session = sessions.get_mut(&id).ok_or_else(|| "No active SSH connection".to_string())?;
-        let sftp = get_sftp(ssh_session)?;
-        sftp.mkdir(Path::new(&path), 0o755).map_err(|e| e.to_string())?;
-        Ok(true)
+        with_sftp(ssh_session, |sftp| {
+            sftp.mkdir(Path::new(&path), 0o755).map_err(|e| e.to_string())?;
+            Ok(true)
+        })
     })
     .await
     .map_err(|_| "Task panicked".to_string())?
@@ -722,13 +779,13 @@ pub async fn sftp_rmdir(state: tauri::State<'_, SshState>, id: String, path: Str
     tokio::task::spawn_blocking(move || {
         let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
         let ssh_session = sessions.get_mut(&id).ok_or_else(|| "No active SSH connection".to_string())?;
-        let sftp = get_sftp(ssh_session)?;
-        let p = Path::new(&path);
-        if let Err(_) = sftp.rmdir(p) {
-            // Try recursive deletion if directory is non-empty
-            sftp_remove_dir_all_recursive(sftp, p)?;
-        }
-        Ok(true)
+        with_sftp(ssh_session, |sftp| {
+            let p = Path::new(&path);
+            if let Err(_) = sftp.rmdir(p) {
+                sftp_remove_dir_all_recursive(sftp, p)?;
+            }
+            Ok(true)
+        })
     })
     .await
     .map_err(|_| "Task panicked".to_string())?
@@ -740,9 +797,10 @@ pub async fn sftp_unlink(state: tauri::State<'_, SshState>, id: String, path: St
     tokio::task::spawn_blocking(move || {
         let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
         let ssh_session = sessions.get_mut(&id).ok_or_else(|| "No active SSH connection".to_string())?;
-        let sftp = get_sftp(ssh_session)?;
-        sftp.unlink(Path::new(&path)).map_err(|e| e.to_string())?;
-        Ok(true)
+        with_sftp(ssh_session, |sftp| {
+            sftp.unlink(Path::new(&path)).map_err(|e| e.to_string())?;
+            Ok(true)
+        })
     })
     .await
     .map_err(|_| "Task panicked".to_string())?
@@ -759,9 +817,10 @@ pub async fn sftp_rename(
     tokio::task::spawn_blocking(move || {
         let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
         let ssh_session = sessions.get_mut(&id).ok_or_else(|| "No active SSH connection".to_string())?;
-        let sftp = get_sftp(ssh_session)?;
-        sftp.rename(Path::new(&old_path), Path::new(&new_path), None).map_err(|e| e.to_string())?;
-        Ok(true)
+        with_sftp(ssh_session, |sftp| {
+            sftp.rename(Path::new(&old_path), Path::new(&new_path), None).map_err(|e| e.to_string())?;
+            Ok(true)
+        })
     })
     .await
     .map_err(|_| "Task panicked".to_string())?
@@ -777,21 +836,21 @@ pub async fn sftp_stat(
     tokio::task::spawn_blocking(move || {
         let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
         let ssh_session = sessions.get_mut(&id).ok_or_else(|| "No active SSH connection".to_string())?;
-        let sftp = get_sftp(ssh_session)?;
-        
-        let path = Path::new(&file_path);
-        let stat = sftp.stat(path).map_err(|e| e.to_string())?;
-        let name = path.file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        with_sftp(ssh_session, |sftp| {
+            let path = Path::new(&file_path);
+            let stat = sftp.stat(path).map_err(|e| e.to_string())?;
+            let name = path.file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
 
-        Ok(SftpFile {
-            name,
-            size: stat.size.unwrap_or(0),
-            mtime: stat.mtime.unwrap_or(0) * 1000,
-            is_dir: stat.is_dir(),
-            mode: stat.perm.unwrap_or(0),
-            octal: format!("{:o}", stat.perm.unwrap_or(0) & 0o777),
+            Ok(SftpFile {
+                name,
+                size: stat.size.unwrap_or(0),
+                mtime: stat.mtime.unwrap_or(0) * 1000,
+                is_dir: stat.is_dir(),
+                mode: stat.perm.unwrap_or(0),
+                octal: format!("{:o}", stat.perm.unwrap_or(0) & 0o777),
+            })
         })
     })
     .await
@@ -809,12 +868,12 @@ pub async fn sftp_chmod(
     tokio::task::spawn_blocking(move || {
         let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
         let ssh_session = sessions.get_mut(&id).ok_or_else(|| "No active SSH connection".to_string())?;
-        let sftp = get_sftp(ssh_session)?;
-
-        let mut stat = sftp.stat(Path::new(&file_path)).map_err(|e| e.to_string())?;
-        stat.perm = Some(mode);
-        sftp.setstat(Path::new(&file_path), stat).map_err(|e| e.to_string())?;
-        Ok(true)
+        with_sftp(ssh_session, |sftp| {
+            let mut stat = sftp.stat(Path::new(&file_path)).map_err(|e| e.to_string())?;
+            stat.perm = Some(mode);
+            sftp.setstat(Path::new(&file_path), stat).map_err(|e| e.to_string())?;
+            Ok(true)
+        })
     })
     .await
     .map_err(|_| "Task panicked".to_string())?
@@ -1030,36 +1089,15 @@ fn get_or_create_transfer_session(
     id: &str,
     sessions_arc: &Arc<Mutex<HashMap<String, SshSession>>>,
 ) -> Result<ssh2::Session, String> {
-    let (host, port, username, password, key_path, existing_session) = {
-        let sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
-        let ssh_session = sessions.get(id).ok_or_else(|| "No active SSH connection".to_string())?;
-        if ssh_session.session.authenticated() {
-            (String::new(), 0, String::new(), None, None, Some(ssh_session.session.clone()))
-        } else {
-            (
-                ssh_session.host.clone(),
-                ssh_session.port,
-                ssh_session.username.clone(),
-                ssh_session.password.clone(),
-                ssh_session.key_path.clone(),
-                None,
-            )
-        }
-    };
+    let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
+    let ssh_session = sessions.get_mut(id).ok_or_else(|| "No active SSH connection".to_string())?;
 
-    if let Some(sess) = existing_session {
-        Ok(sess)
-    } else {
-        let (session, _tcp) = connect_session(
-            &host,
-            port,
-            &username,
-            password.as_deref(),
-            key_path.as_deref(),
-            10
-        )?;
-        Ok(session)
+    if ssh_session.ensure_sftp().is_ok() {
+        return Ok(ssh_session.session.clone());
     }
+
+    ssh_session.reset_and_reconnect()?;
+    Ok(ssh_session.session.clone())
 }
 
 // SFTP Upload with chunking, recursive dir and cancellation support
