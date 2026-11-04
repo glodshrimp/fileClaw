@@ -132,13 +132,15 @@ const SystemsPage: React.FC = () => {
                   <h3 className="text-lg font-semibold text-text-primary">{system.name}</h3>
                 </div>
                 <div className="flex items-center space-x-1">
-                  <button
-                    onClick={() => handleOpenUrl(system.url)}
-                    className="p-2 hover-gradient-primary rounded-lg text-text-secondary"
-                    title="访问系统"
-                  >
-                    <ExternalLink className="w-4 h-4" />
-                  </button>
+                  {system.url && system.url.trim() && (
+                    <button
+                      onClick={() => handleOpenUrl(system.url)}
+                      className="p-2 hover-gradient-primary rounded-lg text-text-secondary"
+                      title="访问系统"
+                    >
+                      <ExternalLink className="w-4 h-4" />
+                    </button>
+                  )}
                   <button
                     onClick={(e) => handleCopyUrl(system.url, e)}
                     className="p-2 hover-gradient-primary rounded-lg text-text-secondary"
@@ -204,13 +206,13 @@ const SystemsPage: React.FC = () => {
                 />
               </div>
               <div>
-                <label className="block text-sm font-medium mb-1">URL</label>
+                <label className="block text-sm font-medium mb-1">URL (可选)</label>
                 <input
-                  type="url"
+                  type="text"
                   value={formData.url}
                   onChange={(e) => setFormData({ ...formData, url: e.target.value })}
                   className="input-base"
-                  required
+                  placeholder="例如: http://example.com"
                 />
               </div>
               <div>

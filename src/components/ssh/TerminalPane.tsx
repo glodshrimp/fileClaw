@@ -226,10 +226,12 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
   }, []);
 
   const [reconnectTrigger, setReconnectTrigger] = useState(0);
+  const shellExitedRef = useRef(false);
 
   useEffect(() => {
     if (isLocal) return;
     const removeListener = window.electronAPI.onSshReconnected(sshId, () => {
+      shellExitedRef.current = false;
       setReconnectTrigger(prev => prev + 1);
     });
     return () => {
@@ -250,6 +252,7 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
             console.error(`[TerminalPane] Failed to spawn local PTY:`, res.error);
           }
           if (!cancelled) {
+            shellExitedRef.current = false;
             shellReadyRef.current = true;
             // Force-sync terminal dimensions now that the PTY is ready.
             // The earlier setTimeout(100ms) resize likely fired before spawn completed.
@@ -271,6 +274,7 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
       try {
         await window.electronAPI.sshOpenShell(sshId, shellId);
         if (!cancelled) {
+          shellExitedRef.current = false;
           shellReadyRef.current = true;
           // Force-sync terminal dimensions now that the SSH shell is ready.
           // The earlier setTimeout(100ms) resize likely fired before the shell
@@ -296,7 +300,7 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
 
     const term = new XTerm({
       cursorBlink: true,
-      fontFamily: localStorage.getItem('termFontFamily') || '"Fira Code", "SauceCodePro Nerd Font", monospace',
+      fontFamily: localStorage.getItem('termFontFamily') || '"Fira Code", "SauceCodePro Nerd Font", "Cascadia Mono", Consolas, Menlo, Monaco, monospace',
       fontSize: parseInt(localStorage.getItem('termFontSize') || '14', 10),
       scrollback: 10000,
       allowProposedApi: true,
@@ -349,6 +353,7 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
     // that occurs when WKWebView's hidden textarea still fires an input event
     // despite our event.preventDefault().
     let suppressOnData = false;
+    const isMac = /mac|iphone|ipod|ipad/i.test(navigator.platform || navigator.userAgent);
 
     term.attachCustomKeyEventHandler((event) => {
       // ── Bypass macOS IME composition for Escape and Shift+key characters ────
@@ -357,8 +362,16 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
       // IME to switch modes, so the character never reaches xterm's hidden
       // textarea.  We intercept at keydown and write directly to the backend.
       if (event.type === 'keydown') {
-        // 1. Escape – always intercept
-        if (event.key === 'Escape') {
+        if (shellExitedRef.current && event.key === 'Enter') {
+          event.preventDefault();
+          event.stopPropagation();
+          shellExitedRef.current = false;
+          setReconnectTrigger(prev => prev + 1);
+          return false;
+        }
+
+        // 1. Escape – always intercept (when not in IME composition)
+        if (event.key === 'Escape' && !event.isComposing) {
           event.preventDefault();
           event.stopPropagation();
           suppressOnData = true;
@@ -375,10 +388,10 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
           return false;
         }
 
-        // 2. Shift + printable character (e.g. Shift+; → ":", Shift+1 → "!")
-        //    Only when no Ctrl/Meta/Alt modifiers are held (those have their
-        //    own handlers below).
-        if (event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey
+        // 2. macOS-only: Shift + printable character (e.g. Shift+; → ":", Shift+1 → "!")
+        //    Restricted to macOS so Windows WebView2 IME composition is not disrupted.
+        if (isMac && !event.isComposing && event.keyCode !== 229
+            && event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey
             && event.key.length === 1) {
           event.preventDefault();
           event.stopPropagation();
@@ -394,6 +407,29 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
           }
           onInputData?.(data);
           return false;
+        }
+
+        // 3. Windows / Linux copy & paste shortcuts (Ctrl+Shift+C/V, Ctrl+C with selection, Ctrl+V)
+        if (!isMac && event.ctrlKey && !event.altKey && !event.metaKey) {
+          const lowerKey = event.key.toLowerCase();
+          if (lowerKey === 'c' && (event.shiftKey || term.hasSelection())) {
+            const selection = term.getSelection();
+            if (selection) {
+              event.preventDefault();
+              const textToCopy = autoStripLineNumbers ? stripLineNumbers(selection) : selection;
+              writeClipboard(textToCopy);
+              showCopiedToast();
+              if (!event.shiftKey) term.clearSelection();
+              return false;
+            }
+          }
+          if (lowerKey === 'v') {
+            event.preventDefault();
+            navigator.clipboard.readText().then((text: string) => {
+              if (text) term.paste(text);
+            }).catch(() => {});
+            return false;
+          }
         }
       }
 
@@ -457,6 +493,13 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
         suppressOnData = false;
         return;
       }
+      if (shellExitedRef.current) {
+        if (data === '\r' || data === '\n') {
+          shellExitedRef.current = false;
+          setReconnectTrigger(prev => prev + 1);
+        }
+        return;
+      }
       if (!isLocal && !isDefaultShell && !shellReadyRef.current) return;
       if (isLocal) {
         window.electronAPI.ptyWrite(shellId, data);
@@ -489,6 +532,7 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
     // ── Output listener ───────────────────────────────────────────────────────
     let removeOutputListener: () => void;
     let removePtyExitListener: (() => void) | null = null;
+    let removeShellEofListener: (() => void) | null = null;
 
     if (isLocal) {
       // Local PTY mode — listen on pty-output channel
@@ -497,9 +541,10 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
           term.write(outputData);
         }
       });
-      // Listen for PTY exit to show a message
+      // Listen for PTY exit to show a message and allow Enter to restart
       removePtyExitListener = window.electronAPI.onPtyExit(shellId, (code: number) => {
-        term.write(`\r\n\x1b[90m[进程已退出，代码: ${code}]\x1b[0m\r\n`);
+        shellExitedRef.current = true;
+        term.write(`\r\n\x1b[90m[进程已退出，代码: ${code} (按回车键可重新启动终端)]\x1b[0m\r\n`);
       });
     } else {
       // SSH mode — for default shell, listen on sshId; for extra shells, listen on shellId
@@ -509,6 +554,11 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
           term.write(outputData);
         }
       });
+      if (window.electronAPI.onSshShellEof) {
+        removeShellEofListener = window.electronAPI.onSshShellEof(outputChannel, () => {
+          shellExitedRef.current = true;
+        });
+      }
     }
 
     // Context menu click-outside is handled by a separate useEffect below
@@ -518,6 +568,7 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
       onBinaryDisposable.dispose();
       removeOutputListener();
       if (removePtyExitListener) removePtyExitListener();
+      if (removeShellEofListener) removeShellEofListener();
       resizeObserver.disconnect();
       window.removeEventListener('resize', onWindowResize);
       termEl.removeEventListener('wheel', handleWheel);

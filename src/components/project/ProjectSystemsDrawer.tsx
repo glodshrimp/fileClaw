@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { X, Plus, Globe, Key, Copy, ExternalLink, Edit2, Trash2, ChevronDown, ChevronRight, Eye, EyeOff } from 'lucide-react';
+import { X, Plus, Globe, Copy, ExternalLink, Edit2, Trash2, ChevronDown, ChevronRight, Eye, EyeOff } from 'lucide-react';
 import { useApp } from '../../contexts/AppContext';
 import DeleteConfirmModal from '../DeleteConfirmModal';
 import { Project, OnlineSystem, Account } from '../../types';
@@ -10,6 +10,13 @@ interface Props {
   onClose: () => void;
 }
 
+const generateId = () => {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  return `${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+};
+
 const ProjectSystemsDrawer: React.FC<Props> = ({ project, onClose }) => {
   const { state, dispatch } = useApp();
   const [expandedSystem, setExpandedSystem] = useState<string | null>(null);
@@ -19,25 +26,32 @@ const ProjectSystemsDrawer: React.FC<Props> = ({ project, onClose }) => {
   const [addingSystem, setAddingSystem] = useState(false);
   const [editingSystemId, setEditingSystemId] = useState<string | null>(null);
   const [systemFormData, setSystemFormData] = useState({ name: '', url: '', description: '', tags: '' });
+  const [isSavingSystem, setIsSavingSystem] = useState(false);
   
   const [addingAccountFor, setAddingAccountFor] = useState<string | null>(null);
   const [editingAccountId, setEditingAccountId] = useState<string | null>(null);
   const [accountFormData, setAccountFormData] = useState({ platform: '', username: '', password: '', email: '', description: '' });
   const [visiblePasswords, setVisiblePasswords] = useState<Set<string>>(new Set());
+  const [isSavingAccount, setIsSavingAccount] = useState(false);
 
   if (!project) return null;
 
-  const projectSystems = state.systems.filter(s => s.projectId === project.id);
+  const rawProjectSystems = state.systems.filter(s => s.projectId === project.id);
+  const projectSystems = Array.from(new Map(rawProjectSystems.map(s => [s.id, s])).values());
 
   // System Handlers
   const handleSaveSystem = async (e: React.FormEvent) => {
     e.preventDefault();
+    e.stopPropagation();
+    if (isSavingSystem) return;
+    setIsSavingSystem(true);
+
     const systemData: OnlineSystem = {
-      id: editingSystemId || Date.now().toString(),
+      id: editingSystemId || generateId(),
       projectId: project.id,
-      name: systemFormData.name,
-      url: systemFormData.url,
-      description: systemFormData.description,
+      name: systemFormData.name.trim(),
+      url: systemFormData.url.trim(),
+      description: systemFormData.description.trim(),
       tags: systemFormData.tags.split(',').map(t => t.trim()).filter(Boolean),
       createdAt: editingSystemId ? (state.systems.find(s => s.id === editingSystemId)?.createdAt || new Date().toISOString()) : new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -58,13 +72,15 @@ const ProjectSystemsDrawer: React.FC<Props> = ({ project, onClose }) => {
       setSystemFormData({ name: '', url: '', description: '', tags: '' });
     } catch (error) {
       console.error('Failed to save system:', error);
+    } finally {
+      setIsSavingSystem(false);
     }
   };
 
   const handleEditSystem = (system: OnlineSystem) => {
     setSystemFormData({
       name: system.name,
-      url: system.url,
+      url: system.url || '',
       description: system.description,
       tags: system.tags.join(', ')
     });
@@ -106,14 +122,18 @@ const ProjectSystemsDrawer: React.FC<Props> = ({ project, onClose }) => {
   // Account Handlers
   const handleSaveAccount = async (e: React.FormEvent, systemId: string) => {
     e.preventDefault();
+    e.stopPropagation();
+    if (isSavingAccount) return;
+    setIsSavingAccount(true);
+
     const accountData: Account = {
-      id: editingAccountId || Date.now().toString(),
+      id: editingAccountId || generateId(),
       systemId,
-      platform: accountFormData.platform,
-      username: accountFormData.username,
+      platform: accountFormData.platform.trim(),
+      username: accountFormData.username.trim(),
       password: accountFormData.password,
-      email: accountFormData.email,
-      description: accountFormData.description,
+      email: accountFormData.email.trim(),
+      description: accountFormData.description.trim(),
       createdAt: editingAccountId ? (state.accounts.find(a => a.id === editingAccountId)?.createdAt || new Date().toISOString()) : new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
@@ -130,9 +150,12 @@ const ProjectSystemsDrawer: React.FC<Props> = ({ project, onClose }) => {
         dispatch({ type: 'ADD_ACCOUNT', payload: accountData });
       }
       setAddingAccountFor(null);
+      setEditingAccountId(null);
       setAccountFormData({ platform: '', username: '', password: '', email: '', description: '' });
     } catch (error) {
       console.error('Failed to save account:', error);
+    } finally {
+      setIsSavingAccount(false);
     }
   };
 
@@ -190,7 +213,15 @@ const ProjectSystemsDrawer: React.FC<Props> = ({ project, onClose }) => {
           <div className="flex items-center justify-between mb-6">
             <h3 className="text-lg font-bold text-text-primary">在线系统列表</h3>
             {!addingSystem && (
-              <button onClick={() => setAddingSystem(true)} className="btn-secondary py-1.5 px-3 text-xs flex items-center">
+              <button 
+                type="button"
+                onClick={() => {
+                  setEditingSystemId(null);
+                  setSystemFormData({ name: '', url: '', description: '', tags: '' });
+                  setAddingSystem(true);
+                }} 
+                className="btn-secondary py-1.5 px-3 text-xs flex items-center"
+              >
                 <Plus className="w-3.5 h-3.5 mr-1" /> 添加系统
               </button>
             )}
@@ -200,13 +231,40 @@ const ProjectSystemsDrawer: React.FC<Props> = ({ project, onClose }) => {
             <div className="bg-background-secondary p-5 rounded-xl mb-6 border border-border shadow-sm">
               <h4 className="text-sm font-bold text-text-primary mb-4">{editingSystemId ? '编辑系统' : '新增系统'}</h4>
               <form onSubmit={handleSaveSystem} className="space-y-4">
-                <input type="text" placeholder="系统名称" required className="input-base text-sm" value={systemFormData.name} onChange={e => setSystemFormData({...systemFormData, name: e.target.value})} />
-                <input type="url" placeholder="URL地址" required className="input-base text-sm" value={systemFormData.url} onChange={e => setSystemFormData({...systemFormData, url: e.target.value})} />
-                <textarea placeholder="描述" className="input-base text-sm" rows={2} value={systemFormData.description} onChange={e => setSystemFormData({...systemFormData, description: e.target.value})} />
-                <input type="text" placeholder="标签 (逗号分隔)" className="input-base text-sm" value={systemFormData.tags} onChange={e => setSystemFormData({...systemFormData, tags: e.target.value})} />
+                <input 
+                  type="text" 
+                  placeholder="系统名称" 
+                  required 
+                  className="input-base text-sm" 
+                  value={systemFormData.name} 
+                  onChange={e => setSystemFormData({...systemFormData, name: e.target.value})} 
+                />
+                <input 
+                  type="text" 
+                  placeholder="URL地址 (可选)" 
+                  className="input-base text-sm" 
+                  value={systemFormData.url} 
+                  onChange={e => setSystemFormData({...systemFormData, url: e.target.value})} 
+                />
+                <textarea 
+                  placeholder="描述" 
+                  className="input-base text-sm" 
+                  rows={2} 
+                  value={systemFormData.description} 
+                  onChange={e => setSystemFormData({...systemFormData, description: e.target.value})} 
+                />
+                <input 
+                  type="text" 
+                  placeholder="标签 (逗号分隔)" 
+                  className="input-base text-sm" 
+                  value={systemFormData.tags} 
+                  onChange={e => setSystemFormData({...systemFormData, tags: e.target.value})} 
+                />
                 <div className="flex justify-end space-x-2 pt-2">
                   <button type="button" onClick={cancelSystemForm} className="btn-secondary py-1.5 px-4">取消</button>
-                  <button type="submit" className="btn-primary py-1.5 px-4">保存</button>
+                  <button type="submit" disabled={isSavingSystem} className="btn-primary py-1.5 px-4 disabled:opacity-50">
+                    {isSavingSystem ? '保存中...' : '保存'}
+                  </button>
                 </div>
               </form>
             </div>
@@ -221,7 +279,8 @@ const ProjectSystemsDrawer: React.FC<Props> = ({ project, onClose }) => {
             <div className="space-y-4">
               {projectSystems.map(system => {
                 const isExpanded = expandedSystem === system.id;
-                const systemAccounts = state.accounts.filter(a => a.systemId === system.id);
+                const rawSystemAccounts = state.accounts.filter(a => a.systemId === system.id);
+                const systemAccounts = Array.from(new Map(rawSystemAccounts.map(a => [a.id, a])).values());
 
                 return (
                   <div key={system.id} className="border border-border rounded-xl overflow-hidden shadow-sm bg-background-secondary">
@@ -236,9 +295,11 @@ const ProjectSystemsDrawer: React.FC<Props> = ({ project, onClose }) => {
                         </div>
                       </div>
                       <div className="flex items-center space-x-2 flex-shrink-0">
-                        <button onClick={() => (window as any).electronAPI?.openExternal(system.url)} className="p-1.5 hover-gradient-primary rounded-lg text-text-secondary" title="访问">
-                          <ExternalLink className="w-4 h-4" />
-                        </button>
+                        {system.url && system.url.trim() && (
+                          <button onClick={() => (window as any).electronAPI?.openExternal(system.url)} className="p-1.5 hover-gradient-primary rounded-lg text-text-secondary" title="访问">
+                            <ExternalLink className="w-4 h-4" />
+                          </button>
+                        )}
                         <button onClick={(e) => { e.stopPropagation(); handleEditSystem(system); }} className="p-1.5 hover-gradient-primary rounded-lg text-text-secondary" title="编辑">
                           <Edit2 className="w-4 h-4" />
                         </button>
@@ -253,7 +314,15 @@ const ProjectSystemsDrawer: React.FC<Props> = ({ project, onClose }) => {
                         <div className="flex items-center justify-between mb-4">
                           <span className="text-xs font-bold text-text-secondary uppercase tracking-wider">账号列表</span>
                           {addingAccountFor !== system.id && (
-                            <button onClick={() => setAddingAccountFor(system.id)} className="text-[11px] text-primary font-bold flex items-center hover:opacity-80">
+                            <button 
+                              type="button"
+                              onClick={() => {
+                                setEditingAccountId(null);
+                                setAccountFormData({ platform: '', username: '', password: '', email: '', description: '' });
+                                setAddingAccountFor(system.id);
+                              }} 
+                              className="text-[11px] text-primary font-bold flex items-center hover:opacity-80"
+                            >
                               <Plus className="w-3.5 h-3.5 mr-1" /> 此系统账号
                             </button>
                           )}
@@ -271,7 +340,9 @@ const ProjectSystemsDrawer: React.FC<Props> = ({ project, onClose }) => {
                               <textarea placeholder="邮箱/账号信息 (可选，可多行)" className="input-base text-xs" rows={2} value={accountFormData.email} onChange={e => setAccountFormData({...accountFormData, email: e.target.value})} />
                               <div className="flex justify-end space-x-2 pt-2">
                                 <button type="button" onClick={cancelAccountForm} className="btn-secondary py-1.5 px-3 text-xs">取消</button>
-                                <button type="submit" className="btn-primary py-1.5 px-3 text-xs">保存</button>
+                                <button type="submit" disabled={isSavingAccount} className="btn-primary py-1.5 px-3 text-xs disabled:opacity-50">
+                                  {isSavingAccount ? '保存中...' : '保存'}
+                                </button>
                               </div>
                             </form>
                           </div>

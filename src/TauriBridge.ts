@@ -152,7 +152,12 @@ const electronAPI: any = {
   },
   addSystem: async (system: any) => {
     const db = await getDb();
-    db.data.systems.push(system);
+    const idx = db.data.systems.findIndex((s: any) => s.id === system.id);
+    if (idx >= 0) {
+      db.data.systems[idx] = system;
+    } else {
+      db.data.systems.push(system);
+    }
     await db.write();
   },
   updateSystem: async (id: string, system: any) => {
@@ -174,7 +179,12 @@ const electronAPI: any = {
   addAccount: async (account: any) => {
     const db = await getDb();
     const encrypted = { ...account, password: encryptString(account.password) };
-    db.data.accounts.push(encrypted);
+    const idx = db.data.accounts.findIndex((a: any) => a.id === account.id);
+    if (idx >= 0) {
+      db.data.accounts[idx] = encrypted;
+    } else {
+      db.data.accounts.push(encrypted);
+    }
     await db.write();
   },
   updateAccount: async (id: string, account: any) => {
@@ -390,8 +400,22 @@ const electronAPI: any = {
   sshWriteShell: (id: string, shellId: string, data: string) => invoke('ssh_write_shell', { id, shellId, data }),
   sshResizeShell: (id: string, shellId: string, cols: number, rows: number) => invoke('ssh_resize_shell', { id, shellId, cols, rows }),
   sshExec: (id: string, command: string) => invoke('ssh_exec', { id, command }),
-  sshForwardLocal: (id: string, tunnelId: string, localPort: number, remoteHost: string, remotePort: number) => invoke('ssh_forward_local', { id, tunnelId, localPort, remoteHost, remotePort }),
-  sshForwardRemote: (id: string, tunnelId: string, remotePort: number, localHost: string, localPort: number) => invoke('ssh_forward_remote', { id, tunnelId, remotePort, localHost, localPort }),
+  sshForwardLocal: async (id: string, tunnelId: string, localPort: number, remoteHost: string, remotePort: number) => {
+    try {
+      await invoke('ssh_forward_local', { id, tunnelId, localPort, remoteHost, remotePort });
+      return { success: true };
+    } catch (err: any) {
+      return { success: false, error: err?.message || String(err) };
+    }
+  },
+  sshForwardRemote: async (id: string, tunnelId: string, remotePort: number, localHost: string, localPort: number) => {
+    try {
+      await invoke('ssh_forward_remote', { id, tunnelId, remotePort, localHost, localPort });
+      return { success: true };
+    } catch (err: any) {
+      return { success: false, error: err?.message || String(err) };
+    }
+  },
   sshStopTunnel: (id: string, tunnelId: string) => invoke('ssh_stop_tunnel', { id, tunnelId }),
   
   sftpList: (id: string, path: string) => invoke('sftp_list', { id, path }),
@@ -434,6 +458,18 @@ const electronAPI: any = {
   onSshClosed: (id: string, callback: () => void) => {
     let active = true;
     const unlistenPromise = listen(`ssh-closed-${id}`, () => {
+      if (active) callback();
+    });
+    return () => {
+      active = false;
+      unlistenPromise.then(unlistenFn => {
+        if (typeof unlistenFn === 'function') unlistenFn();
+      }).catch(console.error);
+    };
+  },
+  onSshShellEof: (shellId: string, callback: () => void) => {
+    let active = true;
+    const unlistenPromise = listen(`ssh-shell-eof-${shellId}`, () => {
       if (active) callback();
     });
     return () => {

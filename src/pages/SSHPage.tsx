@@ -81,14 +81,55 @@ const SSHPage: React.FC = () => {
   const setActiveSessionKey = (key: string | null) => dispatch({ type: 'SET_ACTIVE_SESSION_KEY', payload: key });
 
   const [closingKey, setClosingKey] = useState<string | null>(null); // for disconnect confirm
+  const [activeTunnels, setActiveTunnels] = useState<Set<string>>(new Set());
 
   const reconnectAttemptsRef = React.useRef<Record<string, number>>({});
+  const reconnectTimersRef = React.useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const hasConnectedRef = React.useRef<Set<string>>(new Set());
   const sessionsRef = React.useRef(sessions);
   sessionsRef.current = sessions;
 
-  const autoSilentReconnect = (key: string) => {
+  const clearReconnectTimer = React.useCallback((key: string) => {
+    if (reconnectTimersRef.current[key]) {
+      clearTimeout(reconnectTimersRef.current[key]);
+      delete reconnectTimersRef.current[key];
+    }
+  }, []);
+
+  React.useEffect(() => {
+    return () => {
+      Object.keys(reconnectTimersRef.current).forEach(k => {
+        clearTimeout(reconnectTimersRef.current[k]);
+      });
+      reconnectTimersRef.current = {};
+    };
+  }, []);
+
+  const startSessionTunnels = async (sessionKey: string, tunnels?: SSHTunnel[]) => {
+    if (!tunnels || tunnels.length === 0) return;
+    for (const t of tunnels) {
+      try {
+        const res = t.type === 'local'
+          ? await window.electronAPI.sshForwardLocal(sessionKey, t.id, t.localPort, t.remoteHost, t.remotePort)
+          : await window.electronAPI.sshForwardRemote(sessionKey, t.id, t.remotePort, t.localHost, t.localPort);
+        if (!res || res.success !== false) {
+          setActiveTunnels(prev => new Set(prev).add(`${sessionKey}:${t.id}`));
+        }
+      } catch (err) {
+        console.error(`Failed to start tunnel ${t.name}:`, err);
+      }
+    }
+  };
+
+  const autoSilentReconnect = (key: string, fromChain = false) => {
     const s = sessionsRef.current.find(ss => ss.key === key);
-    if (!s) return;
+    if (!s || s.localMode) return;
+
+    // Deduplicate simultaneous onSshClosed + onSshError triggers
+    if (!fromChain && reconnectTimersRef.current[key]) {
+      return;
+    }
+    clearReconnectTimer(key);
 
     const attempts = reconnectAttemptsRef.current[key] || 0;
     if (attempts >= 3) {
@@ -118,7 +159,8 @@ const SSHPage: React.FC = () => {
       }
     });
 
-    setTimeout(() => {
+    reconnectTimersRef.current[key] = setTimeout(() => {
+      delete reconnectTimersRef.current[key];
       const sLatest = sessionsRef.current.find(ss => ss.key === key);
       if (!sLatest || sLatest.localMode || closingKey === key) {
         console.log(`[SSH Auto-reconnect] Session ${key} was closed or switched to localMode. Abort reconnect.`);
@@ -135,6 +177,7 @@ const SSHPage: React.FC = () => {
         .then(async (res) => {
           if (res.success) {
             console.log(`[SSH Auto-reconnect] Session ${key} successfully reconnected!`);
+            hasConnectedRef.current.add(key);
             window.electronAPI.emitSshOutput(key, `\r\n\x1b[32m[系统提示: SSH 连接第 ${nextAttempt} 次重连成功!]\x1b[0m\r\n`);
             window.electronAPI.emitSshReconnected(key);
             delete reconnectAttemptsRef.current[key];
@@ -144,29 +187,17 @@ const SSHPage: React.FC = () => {
               payload: { ...sLatest, connStatus: 'connected', connError: '' }
             });
 
-            if (sLatest.ssh.tunnels && sLatest.ssh.tunnels.length > 0) {
-              for (const t of sLatest.ssh.tunnels) {
-                try {
-                  if (t.type === 'local') {
-                    await window.electronAPI.sshForwardLocal(key, t.id, t.localPort, t.remoteHost, t.remotePort);
-                  } else {
-                    await window.electronAPI.sshForwardRemote(key, t.id, t.remotePort, t.localHost, t.localPort);
-                  }
-                } catch (err) {
-                  console.error(`Failed to restart tunnel ${t.name}:`, err);
-                }
-              }
-            }
+            await startSessionTunnels(key, sLatest.ssh.tunnels);
           } else {
             console.log(`[SSH Auto-reconnect] Session ${key} reconnect attempt #${nextAttempt} failed: ${res.error}`);
             window.electronAPI.emitSshOutput(key, `\r\n\x1b[31m[系统提示: 第 ${nextAttempt} 次重连失败: ${res.error || '未知原因'}]\x1b[0m\r\n`);
-            autoSilentReconnect(key);
+            autoSilentReconnect(key, true);
           }
         })
         .catch((err: any) => {
           console.error(`[SSH Auto-reconnect] Session ${key} reconnect attempt #${nextAttempt} caught error:`, err);
           window.electronAPI.emitSshOutput(key, `\r\n\x1b[31m[系统提示: 第 ${nextAttempt} 次重连异常: ${err?.message || err || '未知异常'}]\x1b[0m\r\n`);
-          autoSilentReconnect(key);
+          autoSilentReconnect(key, true);
         });
     }, 5000);
   };
@@ -190,28 +221,23 @@ const SSHPage: React.FC = () => {
 
     window.electronAPI.sshConnect(key, options)
       .then(async (res) => {
+        if (res.success) {
+          hasConnectedRef.current.add(key);
+        }
+        const latest = sessionsRef.current.find(ss => ss.key === key) || newSession;
         dispatch({
           type: 'UPDATE_SSH_SESSION',
-          payload: { ...newSession, connStatus: res.success ? 'connected' : 'error', connError: res.error || '连接失败' }
+          payload: { ...latest, connStatus: res.success ? 'connected' : 'error', connError: res.error || '连接失败' }
         });
-        if (res.success && ssh.tunnels && ssh.tunnels.length > 0) {
-          for (const t of ssh.tunnels) {
-            try {
-              if (t.type === 'local') {
-                await window.electronAPI.sshForwardLocal(key, t.id, t.localPort, t.remoteHost, t.remotePort);
-              } else {
-                await window.electronAPI.sshForwardRemote(key, t.id, t.remotePort, t.localHost, t.localPort);
-              }
-            } catch (err) {
-              console.error(`Failed to start tunnel ${t.name}:`, err);
-            }
-          }
+        if (res.success) {
+          await startSessionTunnels(key, ssh.tunnels);
         }
       })
       .catch((err: any) => {
+        const latest = sessionsRef.current.find(ss => ss.key === key) || newSession;
         dispatch({
           type: 'UPDATE_SSH_SESSION',
-          payload: { ...newSession, connStatus: 'error', connError: err?.message || '未知错误' }
+          payload: { ...latest, connStatus: 'error', connError: err?.message || '未知错误' }
         });
       });
   };
@@ -224,6 +250,16 @@ const SSHPage: React.FC = () => {
     const key = closingKey;
     const closingSession = sessions.find(s => s.key === key);
     setClosingKey(null);
+    clearReconnectTimer(key);
+    delete reconnectAttemptsRef.current[key];
+    hasConnectedRef.current.delete(key);
+    setActiveTunnels(prev => {
+      const next = new Set(prev);
+      Array.from(next).forEach(k => {
+        if (k.startsWith(`${key}:`)) next.delete(k);
+      });
+      return next;
+    });
 
     if (closingSession?.localMode) {
       // Local terminal mode: destroy all PTY processes (including split panes)
@@ -248,9 +284,10 @@ const SSHPage: React.FC = () => {
   };
 
   const retryConnect = (key: string) => {
-    const s = sessions.find(s => s.key === key);
+    const s = sessionsRef.current.find(ss => ss.key === key);
     if (!s) return;
 
+    clearReconnectTimer(key);
     delete reconnectAttemptsRef.current[key]; // clear automatic attempts count
 
     dispatch({ type: 'UPDATE_SSH_SESSION', payload: { ...s, connStatus: 'connecting', connError: '' } });
@@ -262,28 +299,25 @@ const SSHPage: React.FC = () => {
     };
     window.electronAPI.sshConnect(key, options)
       .then(async (res) => {
+        const latest = sessionsRef.current.find(ss => ss.key === key) || s;
+        if (res.success) {
+          hasConnectedRef.current.add(key);
+          window.electronAPI.emitSshOutput(key, `\r\n\x1b[32m[系统提示: 手动重连成功!]\x1b[0m\r\n`);
+          window.electronAPI.emitSshReconnected(key);
+        }
         dispatch({
           type: 'UPDATE_SSH_SESSION',
-          payload: { ...s, connStatus: res.success ? 'connected' : 'error', connError: res.error || '连接失败' }
+          payload: { ...latest, connStatus: res.success ? 'connected' : 'error', connError: res.error || '连接失败' }
         });
-        if (res.success && s.ssh.tunnels && s.ssh.tunnels.length > 0) {
-          for (const t of s.ssh.tunnels) {
-            try {
-              if (t.type === 'local') {
-                await window.electronAPI.sshForwardLocal(key, t.id, t.localPort, t.remoteHost, t.remotePort);
-              } else {
-                await window.electronAPI.sshForwardRemote(key, t.id, t.remotePort, t.localHost, t.localPort);
-              }
-            } catch (err) {
-              console.error(`Failed to restart tunnel ${t.name}:`, err);
-            }
-          }
+        if (res.success) {
+          await startSessionTunnels(key, latest.ssh.tunnels);
         }
       })
       .catch((err: any) => {
+        const latest = sessionsRef.current.find(ss => ss.key === key) || s;
         dispatch({
           type: 'UPDATE_SSH_SESSION',
-          payload: { ...s, connStatus: 'error', connError: err?.message || '未知错误' }
+          payload: { ...latest, connStatus: 'error', connError: err?.message || '未知错误' }
         });
       });
   };
@@ -694,32 +728,54 @@ const SSHPage: React.FC = () => {
                                                         </span>
                                                       </div>
                                                       <div className="flex items-center space-x-2">
-                                                        {activeSessions.length > 0 && activeSessions[0].connStatus === 'connected' && (
-                                                          <button
-                                                            onClick={async (e) => {
-                                                              e.stopPropagation();
-                                                              const session = activeSessions[0];
-                                                              // Stop any existing tunnel first to avoid port conflicts
-                                                              try {
-                                                                await window.electronAPI.sshStopTunnel(session.key, t.id);
-                                                                await new Promise(r => setTimeout(r, 300)); // Wait for OS to release port
-                                                              } catch (_) { /* ignore if not running */ }
-                                                              try {
-                                                                if (t.type === 'local') {
-                                                                  await window.electronAPI.sshForwardLocal(session.key, t.id, t.localPort, t.remoteHost, t.remotePort);
-                                                                } else {
-                                                                  await window.electronAPI.sshForwardRemote(session.key, t.id, t.remotePort, t.localHost, t.localPort);
+                                                        {activeSessions.length > 0 && activeSessions[0].connStatus === 'connected' && (() => {
+                                                          const session = activeSessions[0];
+                                                          const tunnelKey = `${session.key}:${t.id}`;
+                                                          const isRunning = activeTunnels.has(tunnelKey);
+                                                          return (
+                                                            <button
+                                                              onClick={async (e) => {
+                                                                e.stopPropagation();
+                                                                if (isRunning) {
+                                                                  try {
+                                                                    await window.electronAPI.sshStopTunnel(session.key, t.id);
+                                                                    setActiveTunnels(prev => {
+                                                                      const next = new Set(prev);
+                                                                      next.delete(tunnelKey);
+                                                                      return next;
+                                                                    });
+                                                                  } catch (err: any) {
+                                                                    console.error(`Failed to stop tunnel ${t.name}:`, err);
+                                                                  }
+                                                                  return;
                                                                 }
-                                                              } catch (err: any) {
-                                                                console.error(`Failed to start tunnel ${t.name}:`, err);
-                                                              }
-                                                            }}
-                                                            className="p-1 hover:bg-background-tertiary rounded text-text-tertiary hover:text-primary transition-colors"
-                                                            title="启动隧道"
-                                                          >
-                                                            <Power className="w-3 h-3" />
-                                                          </button>
-                                                        )}
+                                                                try {
+                                                                  await window.electronAPI.sshStopTunnel(session.key, t.id);
+                                                                } catch (_) { /* ignore if not running */ }
+                                                                try {
+                                                                  const res = t.type === 'local'
+                                                                    ? await window.electronAPI.sshForwardLocal(session.key, t.id, t.localPort, t.remoteHost, t.remotePort)
+                                                                    : await window.electronAPI.sshForwardRemote(session.key, t.id, t.remotePort, t.localHost, t.localPort);
+                                                                  if (res && res.success === false) {
+                                                                    alert(`启动隧道 "${t.name}" 失败: ${res.error || '端口可能被占用'}`);
+                                                                  } else {
+                                                                    setActiveTunnels(prev => new Set(prev).add(tunnelKey));
+                                                                  }
+                                                                } catch (err: any) {
+                                                                  alert(`启动隧道 "${t.name}" 失败: ${err?.message || String(err)}`);
+                                                                }
+                                                              }}
+                                                              className={`p-1 rounded transition-colors flex items-center gap-1 ${
+                                                                isRunning
+                                                                  ? 'bg-green-500/15 text-green-400 hover:bg-red-500/15 hover:text-red-400'
+                                                                  : 'hover:bg-background-tertiary text-text-tertiary hover:text-primary'
+                                                              }`}
+                                                              title={isRunning ? '隧道运行中（点击停止）' : '启动隧道'}
+                                                            >
+                                                              <Power className="w-3 h-3" />
+                                                            </button>
+                                                          );
+                                                        })()}
                                                       </div>
                                                     </div>
                                                   ))}
@@ -965,10 +1021,14 @@ const SSHPage: React.FC = () => {
                 </div>
               )}
 
-              {/* Terminal */}
+              {/* Terminal — stays mounted once connected so scrollback & split panes are preserved across reconnects */}
               <div className={`absolute inset-0 transition-opacity duration-200 ${s.activeTab === 'terminal' && (s.connStatus === 'connected' || s.connStatus === 'reconnecting') ? 'opacity-100 z-10' : 'opacity-0 z-0 pointer-events-none'
                 }`}>
-                <Terminal sshId={s.key} isConnected={s.connStatus === 'connected' || s.connStatus === 'reconnecting'} mode={s.localMode ? 'local' : 'ssh'} />
+                <Terminal
+                  sshId={s.key}
+                  isConnected={s.connStatus === 'connected' || s.connStatus === 'reconnecting' || hasConnectedRef.current.has(s.key)}
+                  mode={s.localMode ? 'local' : 'ssh'}
+                />
 
                 {/* Mini transfer overlay — shown only when in terminal tab with active transfers */}
                 {s.activeTab === 'terminal' && (s.connStatus === 'connected' || s.connStatus === 'reconnecting') && (() => {
@@ -1034,15 +1094,26 @@ const SSHPage: React.FC = () => {
                 })()}
               </div>
 
-              {/* SFTP — persistently mounted, CSS-hidden when not active to preserve upload state */}
-              {(s.connStatus === 'connected' || s.connStatus === 'reconnecting') && (
+              {/* SFTP — persistently mounted once connected, CSS-hidden when not active to preserve state */}
+              {!s.localMode && (s.connStatus === 'connected' || s.connStatus === 'reconnecting' || hasConnectedRef.current.has(s.key)) && (
                 <div className={`absolute inset-0 z-10 bg-background transition-opacity duration-200 ${
-                  s.activeTab === 'sftp' ? 'opacity-100' : 'opacity-0 pointer-events-none'
+                  s.activeTab === 'sftp' && (s.connStatus === 'connected' || s.connStatus === 'reconnecting') ? 'opacity-100' : 'opacity-0 pointer-events-none'
                 }`}>
                   <SftpBrowser sshId={s.key} />
                 </div>
               )}
             </div>
+
+            {/* Server Status Footer — real-time CPU, Memory, Disk, TCP, Load & Uptime */}
+            {!s.localMode && s.connStatus === 'connected' && (
+              <div className="relative flex items-center px-3 py-1 bg-background-secondary/95 border-t border-border-primary text-[11px] select-none flex-shrink-0 z-20">
+                <StatusFooter
+                  sshId={s.key}
+                  isConnected={s.connStatus === 'connected'}
+                  isVisible={s.key === activeSessionKey}
+                />
+              </div>
+            )}
           </div>
         ))}
 
@@ -1115,7 +1186,31 @@ const SSHPage: React.FC = () => {
               </div>
               <div>
                 <label className="block text-sm font-medium text-text-secondary mb-1.5">密钥路径（可选）</label>
-                <input type="text" value={formData.keyPath} onChange={(e) => setFormData({ ...formData, keyPath: e.target.value })} className="input-base" placeholder="~/.ssh/id_rsa" />
+                <div className="flex items-center gap-2">
+                  <input type="text" value={formData.keyPath} onChange={(e) => setFormData({ ...formData, keyPath: e.target.value })} className="input-base flex-1" placeholder="~/.ssh/id_rsa" />
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      try {
+                        const files = await window.electronAPI.selectFiles();
+                        if (files && files.length > 0) {
+                          const picked = files[0] as any;
+                          const filePath = typeof picked === 'string' ? picked : picked?.path;
+                          if (filePath) {
+                            setFormData(prev => ({ ...prev, keyPath: filePath }));
+                          }
+                        }
+                      } catch (err) {
+                        console.error('Failed to select key file:', err);
+                      }
+                    }}
+                    className="px-3 py-2 bg-background-secondary hover:bg-background-tertiary border border-border rounded-lg text-xs font-medium text-text-secondary hover:text-text-primary transition-colors flex-shrink-0 flex items-center gap-1.5"
+                    title="选择本地私钥文件"
+                  >
+                    <Folder className="w-3.5 h-3.5" />
+                    <span>浏览</span>
+                  </button>
+                </div>
               </div>
               <div>
                 <label className="block text-sm font-medium text-text-secondary mb-1.5">密码（可选）</label>

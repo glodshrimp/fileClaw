@@ -10,6 +10,7 @@ use std::time::Duration;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
+#[derive(Clone)]
 pub struct SshShell {
     write_tx: std::sync::mpsc::Sender<Vec<u8>>,
     resize_tx: std::sync::mpsc::Sender<(u16, u16)>,
@@ -26,7 +27,7 @@ pub struct SshSession {
     tunnels: HashMap<String, SshTunnel>,
     sftp: Option<ssh2::Sftp>,
     
-    // Connection parameters to lazy-connect a dedicated session for tunnels
+    // Connection parameters to lazy-connect dedicated sessions
     host: String,
     port: u16,
     username: String,
@@ -43,7 +44,24 @@ pub struct SshSession {
 #[derive(Default)]
 pub struct SshState {
     pub sessions: Arc<Mutex<HashMap<String, SshSession>>>,
+    /// Fast, non-blocking lookup table for shell write/resize channels so SFTP/exec never block typing
+    pub fast_shells: Arc<Mutex<HashMap<String, SshShell>>>,
     pub cancelled_transfers: Arc<Mutex<HashSet<String>>>,
+}
+
+/// Expand leading `~` or `~/` or `~\` to the user's home directory on both Windows and macOS/Linux
+fn expand_tilde(path_str: &str) -> std::path::PathBuf {
+    let trimmed = path_str.trim();
+    if trimmed == "~" || trimmed.starts_with("~/") || trimmed.starts_with("~\\") {
+        if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+            let home_path = std::path::PathBuf::from(home);
+            if trimmed == "~" {
+                return home_path;
+            }
+            return home_path.join(&trimmed[2..]);
+        }
+    }
+    std::path::PathBuf::from(trimmed)
 }
 
 #[derive(Serialize)]
@@ -108,12 +126,22 @@ pub async fn ssh_connect(
     key_path: Option<String>,
 ) -> Result<SshConnectResult, String> {
     let sessions_arc = state.sessions.clone();
+    let fast_shells_arc = state.fast_shells.clone();
 
     tokio::task::spawn_blocking(move || {
-        // Clean old session if it exists
+        // Clean old session and its fast_shells entries if it exists
         {
+            if let Ok(mut fast) = fast_shells_arc.lock() {
+                fast.remove(&id);
+                let split_prefix = format!("{}__split__", id);
+                fast.retain(|k, _| !k.starts_with(&split_prefix));
+            }
             let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
-            sessions.remove(&id);
+            if let Some(old_session) = sessions.remove(&id) {
+                for (_, tunnel) in old_session.tunnels {
+                    let _ = tunnel.shutdown_tx.send(());
+                }
+            }
         }
 
         let tcp = connect_tcp_with_timeout(&host, port, 10)?;
@@ -123,12 +151,12 @@ pub async fn ssh_connect(
         session.set_tcp_stream(tcp.try_clone().unwrap());
         session.handshake().map_err(|e| format!("SSH handshake failed: {}", e))?;
 
-        // Authentication
+        // Authentication (with ~ home directory expansion for Windows & macOS)
         if let Some(ref path_str) = key_path {
-            if !path_str.is_empty() {
-                let path = Path::new(path_str);
-                session.userauth_pubkey_file(&username, None, path, password.as_deref())
-                    .map_err(|e| format!("Public key authentication failed: {}", e))?;
+            if !path_str.trim().is_empty() {
+                let expanded_path = expand_tilde(path_str);
+                session.userauth_pubkey_file(&username, None, &expanded_path, password.as_deref())
+                    .map_err(|e| format!("Public key authentication failed ({}): {}", expanded_path.display(), e))?;
             } else if let Some(ref pass) = password {
                 session.userauth_password(&username, pass)
                     .map_err(|e| format!("Password authentication failed: {}", e))?;
@@ -207,15 +235,15 @@ fn connect_session(
     session.handshake().map_err(|e| format!("SSH handshake failed: {}", e))?;
 
     if let Some(path_str) = key_path {
-        if !path_str.is_empty() {
-            let path = Path::new(path_str);
+        if !path_str.trim().is_empty() {
+            let expanded_path = expand_tilde(path_str);
             session.userauth_pubkey_file(
                 username,
                 None,
-                path,
+                &expanded_path,
                 password,
             )
-            .map_err(|e| format!("Public key auth failed: {}", e))?;
+            .map_err(|e| format!("Public key auth failed ({}): {}", expanded_path.display(), e))?;
         } else if let Some(pass) = password {
             session.userauth_password(username, pass)
                 .map_err(|e| format!("Password auth failed: {}", e))?;
@@ -238,8 +266,17 @@ fn connect_session(
 
 #[tauri::command]
 pub fn ssh_disconnect(state: tauri::State<'_, SshState>, id: String) -> Result<(), String> {
+    if let Ok(mut fast) = state.fast_shells.lock() {
+        fast.remove(&id);
+        let split_prefix = format!("{}__split__", id);
+        fast.retain(|k, _| !k.starts_with(&split_prefix));
+    }
     let mut sessions = state.sessions.lock().map_err(|e| e.to_string())?;
-    sessions.remove(&id);
+    if let Some(old_session) = sessions.remove(&id) {
+        for (_, tunnel) in old_session.tunnels {
+            let _ = tunnel.shutdown_tx.send(());
+        }
+    }
     Ok(())
 }
 
@@ -277,7 +314,9 @@ fn get_or_create_dedicated_session(
             key_path.as_deref(),
             10
         )?;
-        session.set_blocking(false);
+        if !is_shell {
+            session.set_blocking(false);
+        }
         
         let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
         if let Some(ssh_session) = sessions.get_mut(id) {
@@ -301,6 +340,7 @@ pub async fn ssh_open_shell(
     shell_id: String,
 ) -> Result<(), String> {
     let sessions_arc = state.sessions.clone();
+    let fast_shells_arc = state.fast_shells.clone();
     
     // Acquire the lock to check if the shell is already registered or connecting.
     // If it is, return early to prevent double execution.
@@ -310,7 +350,6 @@ pub async fn ssh_open_shell(
         let ssh_session = sessions.get_mut(&id).ok_or_else(|| "No active SSH connection".to_string())?;
         
         if ssh_session.shells.contains_key(&shell_id) || ssh_session.connecting_shells.contains(&shell_id) {
-            println!("[SSH Debug] Shell {} already opened or currently connecting, skip duplicate request.", shell_id);
             return Ok(());
         }
         
@@ -330,21 +369,31 @@ pub async fn ssh_open_shell(
     
     let connect_res = tokio::task::spawn_blocking(move || {
         // Connect a dedicated session just for this shell tab/pane
-        let (shell_session, tcp) = connect_session(
+        let connect_outcome = connect_session(
             &host,
             port,
             &username,
             password.as_deref(),
             key_path.as_deref(),
             10
-        )?;
+        );
+        let (shell_session, tcp) = match connect_outcome {
+            Ok(pair) => pair,
+            Err(e) => {
+                if let Ok(mut sessions) = sessions_arc.lock() {
+                    if let Some(ssh_session) = sessions.get_mut(&id_for_thread) {
+                        ssh_session.connecting_shells.remove(&shell_id_for_thread);
+                    }
+                }
+                return Err(e);
+            }
+        };
         
         // Double-check if the connection request was cancelled in the meantime
         {
             let sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
             if let Some(ssh_session) = sessions.get(&id_for_thread) {
                 if !ssh_session.connecting_shells.contains(&shell_id_for_thread) {
-                    println!("[SSH Debug] Connection attempt for shell {} was cancelled during connect phase.", shell_id_for_thread);
                     return Err("Cancelled".to_string());
                 }
             } else {
@@ -372,37 +421,60 @@ pub async fn ssh_open_shell(
         let (resize_tx, resize_rx) = std::sync::mpsc::channel::<(u16, u16)>();
 
         let shell_id_clone = shell_id_for_thread.clone();
+        let id_clone = id_for_thread.clone();
         let app_handle_clone = app_handle.clone();
+        let sessions_cleanup_arc = sessions_arc.clone();
+        let fast_shells_cleanup_arc = fast_shells_arc.clone();
         
         let shell_session_clone = shell_session.clone();
         let tcp_clone = tcp.try_clone().unwrap();
 
         thread::spawn(move || {
-            let mut buffer = [0u8; 4096];
-            let mut utf8_remainder = Vec::<u8>::new();
+            let mut buffer = [0u8; 16384];
+            let mut utf8_remainder = Vec::<u8>::with_capacity(32768);
             
             // Keep session and tcp stream in this thread so they are kept alive
             let _session = shell_session_clone;
             let _tcp = tcp_clone;
             
-            // Perform an initial blocking read with the 1000ms timeout
-            // to ensure we capture the login banner and initial prompt (e.g. "[root@localhost ~]#")
-            let mut reader = channel.stream(0);
-            match reader.read(&mut buffer) {
-                Ok(n) => {
-                    let output = String::from_utf8_lossy(&buffer[..n]).into_owned();
-                    println!("[SSH Debug] Initial read Ok({}): {:?}", n, output);
-                    if n > 0 {
-                        let _ = app_handle_clone.emit(&format!("ssh-output-{}", shell_id_clone), output);
+            // Helper closure to flush decoded UTF-8 text while retaining incomplete trailing multi-byte sequences
+            let flush_utf8 = |buf: &mut Vec<u8>, app: &AppHandle, target_shell_id: &str| {
+                if buf.is_empty() {
+                    return;
+                }
+                match std::str::from_utf8(buf) {
+                    Ok(valid_str) => {
+                        let output = valid_str.to_string();
+                        buf.clear();
+                        let _ = app.emit(&format!("ssh-output-{}", target_shell_id), output);
+                    }
+                    Err(e) => {
+                        let valid_len = e.valid_up_to();
+                        if valid_len > 0 {
+                            let valid_str = String::from_utf8_lossy(&buf[..valid_len]).into_owned();
+                            let _ = app.emit(&format!("ssh-output-{}", target_shell_id), valid_str);
+                        }
+                        if let Some(error_len) = e.error_len() {
+                            buf.drain(..valid_len + error_len);
+                        } else {
+                            buf.drain(..valid_len);
+                        }
                     }
                 }
-                Err(e) => {
-                    println!("[SSH Debug] Initial read Err: {}", e);
+            };
+
+            // Perform an initial blocking read with the 1000ms timeout
+            // to ensure we capture the login banner and initial prompt
+            let mut reader = channel.stream(0);
+            if let Ok(n) = reader.read(&mut buffer) {
+                if n > 0 {
+                    utf8_remainder.extend_from_slice(&buffer[..n]);
+                    flush_utf8(&mut utf8_remainder, &app_handle_clone, &shell_id_clone);
                 }
             }
 
-            // Set the timeout to 50ms for regular, low-latency interaction
-            _session.set_timeout(50);
+            // Set the timeout to 25ms for responsive, low-latency interaction
+            _session.set_timeout(25);
             
             loop {
                 // 1. Handle any pending resize requests
@@ -413,7 +485,6 @@ pub async fn ssh_open_shell(
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                            // SshShell dropped, close thread cleanly
                             return;
                         }
                     }
@@ -429,16 +500,13 @@ pub async fn ssh_open_shell(
                             while written < bytes.len() {
                                 match channel.write(&bytes[written..]) {
                                     Ok(n) if n > 0 => {
-                                        println!("[SSH Debug] channel.write wrote {} bytes: {:?}", n, &bytes[written..written+n]);
                                         written += n;
                                     }
                                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock 
                                                || e.kind() == std::io::ErrorKind::TimedOut => {
-                                        // Timeout or would block during write, wait a moment and retry
                                         thread::sleep(std::time::Duration::from_millis(1));
                                     }
-                                    res => {
-                                        println!("[SSH Debug] channel.write non-success result: {:?}", res);
+                                    _ => {
                                         write_failed = true;
                                         break;
                                     }
@@ -447,68 +515,77 @@ pub async fn ssh_open_shell(
                             if write_failed {
                                 break;
                             }
-                            let flush_res = channel.flush();
-                            println!("[SSH Debug] channel.flush returned: {:?}", flush_res);
+                            let _ = channel.flush();
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                            // SshShell dropped, close thread cleanly
                             return;
                         }
                     }
                 }
 
-                // 3. Read from channel (blocking with 50ms timeout)
+                // 3. Read from channel (coalescing high-throughput output up to 64KB or 8ms window)
                 let mut reader = channel.stream(0);
                 match reader.read(&mut buffer) {
                     Ok(0) => {
-                        // EOF
-                        println!("[SSH Reader Loop Exit] shell_id: {}, detail: EOF", shell_id_clone);
+                        // Clean up dead shell registration so it can be reopened
+                        if let Ok(mut fast) = fast_shells_cleanup_arc.lock() {
+                            fast.remove(&shell_id_clone);
+                        }
+                        if let Ok(mut sessions) = sessions_cleanup_arc.lock() {
+                            if let Some(ssh_session) = sessions.get_mut(&id_clone) {
+                                ssh_session.shells.remove(&shell_id_clone);
+                                ssh_session.connecting_shells.remove(&shell_id_clone);
+                            }
+                        }
                         let _ = app_handle_clone.emit(
                             &format!("ssh-output-{}", shell_id_clone),
-                            "\r\n\x1b[33m[系统提示: SSH 终端连接已关闭 (EOF)]\x1b[0m\r\n".to_string()
+                            "\r\n\x1b[33m[系统提示: 终端会话已结束 (按回车键可重新打开终端)]\x1b[0m\r\n".to_string()
                         );
-                        let _ = app_handle_clone.emit(&format!("ssh-closed-{}", shell_id_clone), ());
+                        let _ = app_handle_clone.emit(&format!("ssh-shell-eof-{}", shell_id_clone), ());
                         break;
                     }
                     Ok(n) => {
                         utf8_remainder.extend_from_slice(&buffer[..n]);
-                        match std::str::from_utf8(&utf8_remainder) {
-                            Ok(valid_str) => {
-                                let output = valid_str.to_string();
-                                utf8_remainder.clear();
-                                let _ = app_handle_clone.emit(&format!("ssh-output-{}", shell_id_clone), output);
-                            }
-                            Err(e) => {
-                                let valid_len = e.valid_up_to();
-                                if valid_len > 0 {
-                                    let valid_str = String::from_utf8_lossy(&utf8_remainder[..valid_len]).into_owned();
-                                    let _ = app_handle_clone.emit(&format!("ssh-output-{}", shell_id_clone), valid_str);
-                                }
-                                if let Some(error_len) = e.error_len() {
-                                    // Skip invalid bytes
-                                    utf8_remainder.drain(..valid_len + error_len);
-                                } else {
-                                    // Keep incomplete UTF-8 bytes for the next read
-                                    utf8_remainder.drain(..valid_len);
+                        // If buffer was nearly full, drain available burst chunks up to 64KB within 8ms
+                        if n >= 4096 {
+                            let burst_start = std::time::Instant::now();
+                            _session.set_timeout(2);
+                            while utf8_remainder.len() < 65536 && burst_start.elapsed() < Duration::from_millis(8) {
+                                match reader.read(&mut buffer) {
+                                    Ok(more) if more > 0 => {
+                                        utf8_remainder.extend_from_slice(&buffer[..more]);
+                                    }
+                                    _ => break,
                                 }
                             }
+                            _session.set_timeout(25);
                         }
+                        flush_utf8(&mut utf8_remainder, &app_handle_clone, &shell_id_clone);
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock 
                                || e.kind() == std::io::ErrorKind::TimedOut 
                                || e.to_string().contains("timeout") 
                                || e.to_string().contains("WouldBlock") 
                                || e.to_string().contains("-30") => {
-                        // Expected timeout when no data is available, do nothing and loop
+                        // Expected timeout when no data is available
                     }
                     Err(ref e) => {
                         let err_detail = format!("I/O Error: {}", e);
-                        println!("[SSH Reader Loop Exit] shell_id: {}, detail: {}", shell_id_clone, err_detail);
+                        if let Ok(mut fast) = fast_shells_cleanup_arc.lock() {
+                            fast.remove(&shell_id_clone);
+                        }
+                        if let Ok(mut sessions) = sessions_cleanup_arc.lock() {
+                            if let Some(ssh_session) = sessions.get_mut(&id_clone) {
+                                ssh_session.shells.remove(&shell_id_clone);
+                                ssh_session.connecting_shells.remove(&shell_id_clone);
+                            }
+                        }
                         let _ = app_handle_clone.emit(
                             &format!("ssh-output-{}", shell_id_clone),
                             format!("\r\n\x1b[33m[系统提示: SSH 连接意外断开 ({})，正在尝试后台自动重连...]\x1b[0m\r\n", err_detail)
                         );
+                        let _ = app_handle_clone.emit(&format!("ssh-error-{}", id_clone), err_detail);
                         let _ = app_handle_clone.emit(&format!("ssh-closed-{}", shell_id_clone), ());
                         break;
                     }
@@ -516,15 +593,17 @@ pub async fn ssh_open_shell(
             }
         });
 
-        // Register the active SshShell to the session and remove from connecting set
+        // Register the active SshShell to the session and fast_shells, and remove from connecting set
         {
             let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
             if let Some(ssh_session) = sessions.get_mut(&id_for_thread) {
-                // If it was cancelled while we connected, don't insert it
                 if ssh_session.connecting_shells.remove(&shell_id_for_thread) {
-                    ssh_session.shells.insert(shell_id_for_thread, SshShell { write_tx, resize_tx });
+                    let shell_handle = SshShell { write_tx, resize_tx };
+                    if let Ok(mut fast) = fast_shells_arc.lock() {
+                        fast.insert(shell_id_for_thread.clone(), shell_handle.clone());
+                    }
+                    ssh_session.shells.insert(shell_id_for_thread, shell_handle);
                 } else {
-                    println!("[SSH Debug] Connection attempt for shell {} was cancelled after connect completed, cleaning up.", shell_id_for_thread);
                     return Err("Cancelled".to_string());
                 }
             }
@@ -549,7 +628,16 @@ pub fn ssh_write_shell(
     shell_id: String,
     data: String,
 ) -> Result<(), String> {
-    println!("[SSH Debug] ssh_write_shell shell_id={}: {:?}", shell_id, data);
+    // Fast path: lock only fast_shells (never blocked by SFTP or ssh_exec)
+    if let Ok(fast) = state.fast_shells.lock() {
+        if let Some(shell) = fast.get(&shell_id) {
+            return shell
+                .write_tx
+                .send(data.into_bytes())
+                .map_err(|e| format!("Failed to send write request: {}", e));
+        }
+    }
+
     let write_tx = {
         let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
         let ssh_session = sessions.get(&id).ok_or_else(|| "No active SSH connection".to_string())?;
@@ -569,6 +657,16 @@ pub fn ssh_resize_shell(
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
+    // Fast path: lock only fast_shells (never blocked by SFTP or ssh_exec)
+    if let Ok(fast) = state.fast_shells.lock() {
+        if let Some(shell) = fast.get(&shell_id) {
+            return shell
+                .resize_tx
+                .send((cols, rows))
+                .map_err(|e| format!("Failed to send resize request: {}", e));
+        }
+    }
+
     let resize_tx = {
         let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
         let ssh_session = sessions.get(&id).ok_or_else(|| "No active SSH connection".to_string())?;
@@ -586,11 +684,32 @@ pub fn ssh_close_shell(
     id: String,
     shell_id: String,
 ) -> Result<(), String> {
+    if let Ok(mut fast) = state.fast_shells.lock() {
+        fast.remove(&shell_id);
+    }
     let mut sessions = state.sessions.lock().map_err(|e| e.to_string())?;
     let ssh_session = sessions.get_mut(&id).ok_or_else(|| "No active SSH connection".to_string())?;
     ssh_session.shells.remove(&shell_id);
     ssh_session.connecting_shells.remove(&shell_id);
     Ok(())
+}
+
+fn run_exec_on_session(session: &ssh2::Session, command: &str) -> Result<ExecResult, String> {
+    session.set_blocking(true);
+    session.set_timeout(8000);
+    let mut channel = session.channel_session().map_err(|e| e.to_string())?;
+    channel.exec(command).map_err(|e| e.to_string())?;
+
+    let mut stdout = String::new();
+    channel.read_to_string(&mut stdout).map_err(|e| e.to_string())?;
+
+    let mut stderr = String::new();
+    channel.stderr().read_to_string(&mut stderr).map_err(|e| e.to_string())?;
+
+    channel.wait_close().unwrap_or(());
+    let code = channel.exit_status().unwrap_or(0);
+
+    Ok(ExecResult { stdout, stderr, code })
 }
 
 #[tauri::command]
@@ -602,23 +721,25 @@ pub async fn ssh_exec(
     let sessions_arc = state.sessions.clone();
 
     tokio::task::spawn_blocking(move || {
-        let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
-        let ssh_session = sessions.get_mut(&id).ok_or_else(|| "No active SSH connection".to_string())?;
-
-        let mut channel = ssh_session.session.channel_session()
-            .map_err(|e| e.to_string())?;
-        channel.exec(&command).map_err(|e| e.to_string())?;
-
-        let mut stdout = String::new();
-        channel.read_to_string(&mut stdout).map_err(|e| e.to_string())?;
-
-        let mut stderr = String::new();
-        channel.stderr().read_to_string(&mut stderr).map_err(|e| e.to_string())?;
-
-        channel.wait_close().unwrap_or(());
-        let code = channel.exit_status().unwrap_or(0);
-
-        Ok(ExecResult { stdout, stderr, code })
+        // Use dedicated shell_session (exec_session) without holding the global sessions Mutex during network I/O
+        let exec_session = get_or_create_dedicated_session(&id, &sessions_arc, true)?;
+        match run_exec_on_session(&exec_session, &command) {
+            Ok(res) => Ok(res),
+            Err(_) => {
+                // Invalidate dead exec_session and retry once with a fresh connection
+                {
+                    let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
+                    if let Some(ssh_session) = sessions.get_mut(&id) {
+                        ssh_session.shell_session = None;
+                        ssh_session._shell_tcp = None;
+                    } else {
+                        return Err("No active SSH connection".to_string());
+                    }
+                }
+                let retry_session = get_or_create_dedicated_session(&id, &sessions_arc, true)?;
+                run_exec_on_session(&retry_session, &command)
+            }
+        }
     })
     .await
     .map_err(|_| "Task panicked".to_string())?
@@ -627,6 +748,10 @@ pub async fn ssh_exec(
 impl SshSession {
     pub fn reset_and_reconnect(&mut self) -> Result<(), String> {
         self.sftp = None;
+        self.tunnel_session = None;
+        self._tunnel_tcp = None;
+        self.shell_session = None;
+        self._shell_tcp = None;
         let (new_session, new_tcp) = connect_session(
             &self.host,
             self.port,
@@ -1388,6 +1513,19 @@ pub async fn ssh_forward_local(
     let sessions_arc = state.sessions.clone();
     
     tokio::task::spawn_blocking(move || {
+        // Stop existing tunnel with the same ID if present
+        {
+            if let Ok(mut sessions) = sessions_arc.lock() {
+                if let Some(ssh_session) = sessions.get_mut(&id) {
+                    if let Some(old_tunnel) = ssh_session.tunnels.remove(&tunnel_id) {
+                        let _ = old_tunnel.shutdown_tx.send(());
+                        drop(sessions);
+                        thread::sleep(Duration::from_millis(60));
+                    }
+                }
+            }
+        }
+
         let tunnel_session = get_or_create_dedicated_session(&id, &sessions_arc, false)?;
 
         let addr: std::net::SocketAddr = format!("127.0.0.1:{}", local_port).parse()
@@ -1396,8 +1534,12 @@ pub async fn ssh_forward_local(
             .map_err(|e| format!("Failed to create socket: {}", e))?;
         socket.set_reuse_address(true)
             .map_err(|e| format!("Failed to set SO_REUSEADDR: {}", e))?;
-        socket.bind(&addr.into())
-            .map_err(|e| format!("Failed to bind local port: {}", e))?;
+        if let Err(_) = socket.bind(&addr.into()) {
+            // Wait briefly in case a previous listener thread is shutting down after reconnect
+            thread::sleep(Duration::from_millis(60));
+            socket.bind(&addr.into())
+                .map_err(|e| format!("Failed to bind local port {}: {}", local_port, e))?;
+        }
         socket.listen(128)
             .map_err(|e| format!("Failed to listen: {}", e))?;
         let listener: TcpListener = socket.into();

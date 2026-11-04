@@ -64,8 +64,18 @@ function appReducer(state: AppState, action: Action): AppState {
   switch (action.type) {
     case 'SET_PROJECTS':
       return { ...state, projects: action.payload };
-    case 'ADD_PROJECT':
+    case 'ADD_PROJECT': {
+      const exists = state.projects.some((p) => p.id === action.payload.id);
+      if (exists) {
+        return {
+          ...state,
+          projects: state.projects.map((p) =>
+            p.id === action.payload.id ? action.payload : p
+          ),
+        };
+      }
       return { ...state, projects: [...state.projects, action.payload] };
+    }
     case 'UPDATE_PROJECT':
       return {
         ...state,
@@ -80,8 +90,18 @@ function appReducer(state: AppState, action: Action): AppState {
       };
     case 'SET_SYSTEMS':
       return { ...state, systems: action.payload };
-    case 'ADD_SYSTEM':
+    case 'ADD_SYSTEM': {
+      const exists = state.systems.some((s) => s.id === action.payload.id);
+      if (exists) {
+        return {
+          ...state,
+          systems: state.systems.map((s) =>
+            s.id === action.payload.id ? action.payload : s
+          ),
+        };
+      }
       return { ...state, systems: [...state.systems, action.payload] };
+    }
     case 'UPDATE_SYSTEM':
       return {
         ...state,
@@ -96,8 +116,18 @@ function appReducer(state: AppState, action: Action): AppState {
       };
     case 'SET_ACCOUNTS':
       return { ...state, accounts: action.payload };
-    case 'ADD_ACCOUNT':
+    case 'ADD_ACCOUNT': {
+      const exists = state.accounts.some((a) => a.id === action.payload.id);
+      if (exists) {
+        return {
+          ...state,
+          accounts: state.accounts.map((a) =>
+            a.id === action.payload.id ? action.payload : a
+          ),
+        };
+      }
       return { ...state, accounts: [...state.accounts, action.payload] };
+    }
     case 'UPDATE_ACCOUNT':
       return {
         ...state,

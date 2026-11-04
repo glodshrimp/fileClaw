@@ -276,6 +276,7 @@ declare global {
       onSshOutput: (id: string, callback: (data: string) => void) => () => void;
       onSshError: (id: string, callback: (error: string) => void) => () => void;
       onSshClosed: (id: string, callback: () => void) => () => void;
+      onSshShellEof?: (id: string, callback: () => void) => () => void;
       onSftpProgress?: (callback: (data: { jid: string; file: string; transferred: number; total: number }) => void) => () => void;
       emitSshOutput: (id: string, data: string) => Promise<void>;
       emitSshReconnected: (id: string) => Promise<void>;

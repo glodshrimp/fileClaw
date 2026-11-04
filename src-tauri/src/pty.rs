@@ -58,10 +58,20 @@ pub fn pty_spawn(
 
     let mut cmd = CommandBuilder::new(&shell);
     
-    // login shell arguments
-    if !cfg!(target_os = "windows") {
+    // Platform-specific shell arguments and environment variables
+    if cfg!(target_os = "windows") {
+        cmd.arg("-NoLogo");
+    } else {
         cmd.arg("--login");
+        if std::env::var("LANG").unwrap_or_default().is_empty() {
+            cmd.env("LANG", "en_US.UTF-8");
+        }
+        if std::env::var("LC_ALL").unwrap_or_default().is_empty() {
+            cmd.env("LC_CTYPE", "UTF-8");
+        }
     }
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
 
     if let Some(ref path) = cwd {
         if !path.is_empty() {
@@ -95,24 +105,43 @@ pub fn pty_spawn(
     };
     sessions.insert(id.clone(), session);
 
-    // Spawn reading thread
+    // Spawn reading thread with UTF-8 boundary protection
     let id_clone = id.clone();
     let app_handle_clone = app_handle.clone();
     let sessions_map_clone = Arc::clone(&state.sessions);
 
     thread::spawn(move || {
-        let mut buffer = [0u8; 4096];
+        let mut buffer = [0u8; 16384];
+        let mut utf8_remainder = Vec::<u8>::new();
         loop {
             match reader.read(&mut buffer) {
                 Ok(n) if n > 0 => {
-                    let output = String::from_utf8_lossy(&buffer[..n]).into_owned();
-                    // Emit output to frontend
-                    let _ = app_handle_clone.emit(&format!("pty-output-{}", id_clone), output);
+                    utf8_remainder.extend_from_slice(&buffer[..n]);
+                    match std::str::from_utf8(&utf8_remainder) {
+                        Ok(valid_str) => {
+                            let output = valid_str.to_string();
+                            utf8_remainder.clear();
+                            let _ = app_handle_clone.emit(&format!("pty-output-{}", id_clone), output);
+                        }
+                        Err(e) => {
+                            let valid_len = e.valid_up_to();
+                            if valid_len > 0 {
+                                let valid_str = String::from_utf8_lossy(&utf8_remainder[..valid_len]).into_owned();
+                                let _ = app_handle_clone.emit(&format!("pty-output-{}", id_clone), valid_str);
+                            }
+                            if let Some(error_len) = e.error_len() {
+                                utf8_remainder.drain(..valid_len + error_len);
+                            } else {
+                                utf8_remainder.drain(..valid_len);
+                            }
+                        }
+                    }
                 }
                 _ => {
                     // PTY closed or read error, cleanup session
-                    let mut lock = sessions_map_clone.lock().unwrap();
-                    lock.remove(&id_clone);
+                    if let Ok(mut lock) = sessions_map_clone.lock() {
+                        lock.remove(&id_clone);
+                    }
                     let _ = app_handle_clone.emit(&format!("pty-exit-{}", id_clone), 0);
                     break;
                 }

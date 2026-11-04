@@ -46,15 +46,26 @@ const parentOf = (p: string) => {
   parts.pop();
   return parts.length === 0 ? sep : sep + parts.join(sep);
 };
+const normalizeLocalPath = (p: string) => p.replace(/\\/g, '/');
+const isLocalRoot = (p: string) => {
+  const norm = normalizeLocalPath(p).replace(/\/+$/, '');
+  return !norm || norm === '/' || /^[a-zA-Z]:$/.test(norm);
+};
 const localJoin = (base: string, name: string) => {
-  const s = base.endsWith('/') || base.endsWith('\\') ? base : base + '/';
+  const norm = normalizeLocalPath(base);
+  const s = norm.endsWith('/') ? norm : norm + '/';
   return s + name;
 };
 const localParent = (p: string) => {
-  // works for both macOS / Linux paths
-  const idx = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
-  if (idx <= 0) return p;
-  return p.slice(0, idx) || '/';
+  // Works for Windows drive roots (e.g. C:/Users -> C:/) as well as macOS / Linux paths
+  const norm = normalizeLocalPath(p).replace(/\/+$/, '');
+  if (!norm || norm === '/') return '/';
+  if (/^[a-zA-Z]:$/.test(norm)) return `${norm}/`;
+  const idx = norm.lastIndexOf('/');
+  if (idx < 0) return norm;
+  if (idx === 0) return '/';
+  const parent = norm.slice(0, idx);
+  return /^[a-zA-Z]:$/.test(parent) ? `${parent}/` : parent;
 };
 const formatSize = (bytes: number, isDir: boolean) => {
   if (isDir) return '-';
@@ -436,7 +447,7 @@ interface PaneProps {
   dragRef: React.MutableRefObject<DragPayload | null>;
   dropHighlight: boolean;
   onNavigate: (path: string) => void;
-  onDragStart: (payload: DragPayload) => void;
+  onDragStart: (payload: DragPayload, e?: React.MouseEvent | React.DragEvent) => void;
   onDrop: (targetPath: string, e: React.DragEvent) => void;
   onDragEnter: () => void;
   onDragLeave: () => void;
@@ -462,11 +473,19 @@ const FilePane: React.FC<PaneProps> = ({
     overscan: 10,
   });
 
-  const atRoot = path === sep || path === '';
-  const parts = path.split(sep).filter(Boolean);
-  const crumbs = [{ label: '/', path: sep }, ...parts.map((p, i) => ({
-    label: p, path: sep + parts.slice(0, i + 1).join(sep)
-  }))];
+  const normPath = side === 'local' ? normalizeLocalPath(path) : path;
+  const atRoot = side === 'local' ? isLocalRoot(normPath) : (normPath === sep || normPath === '');
+  const isWinDrivePath = side === 'local' && /^[a-zA-Z]:/.test(normPath);
+  const parts = normPath.split(sep).filter(Boolean);
+  const crumbs = isWinDrivePath
+    ? parts.map((p, i) => ({
+        label: p,
+        path: i === 0 ? `${p}/` : parts.slice(0, i + 1).join(sep),
+      }))
+    : [{ label: '/', path: sep }, ...parts.map((p, i) => ({
+        label: p,
+        path: sep + parts.slice(0, i + 1).join(sep),
+      }))];
 
   // ── Editable address bar ──
   const [isEditing, setIsEditing] = useState(false);
@@ -659,14 +678,10 @@ const FilePane: React.FC<PaneProps> = ({
                       key={virtualRow.key}
                       data-index={virtualRow.index}
                       ref={rowVirtualizer.measureElement}
-                      draggable
-                      onDragStart={(e) => {
-                        e.stopPropagation();
+                      onMouseDown={(e) => {
+                        if (e.button !== 0) return;
                         const fp = side === 'local' ? localJoin(path, item.name) : join(path, item.name);
-                        onDragStart({ item, fullPath: fp, side });
-                        e.dataTransfer.effectAllowed = 'copyMove';
-                        e.dataTransfer.setData('application/json', JSON.stringify({ name: item.name, side }));
-                        e.dataTransfer.setData('text/plain', item.name);
+                        onDragStart({ item, fullPath: fp, side }, e);
                       }}
                       onDoubleClick={() => {
                         if (item.isDir) {
@@ -801,8 +816,23 @@ const SftpBrowser: React.FC<SftpBrowserProps> = ({ sshId }) => {
   const [remoteLoading, setRemoteLoading] = useState(false);
   const [remoteError, setRemoteError] = useState<string | null>(null);
 
-  // Drag-and-drop
+  // Drag-and-drop (supports both pointer-based internal drag for Windows/macOS and Tauri external file drop)
+  const containerRef = useRef<HTMLDivElement>(null);
+  const localPaneRef = useRef<HTMLDivElement>(null);
+  const remotePaneRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<DragPayload | null>(null);
+  const pointerDragRef = useRef<{
+    payload: DragPayload;
+    startX: number;
+    startY: number;
+    active: boolean;
+  } | null>(null);
+  const [dragGhost, setDragGhost] = useState<{
+    payload: DragPayload;
+    x: number;
+    y: number;
+    targetSide: 'local' | 'remote' | null;
+  } | null>(null);
   const hoveredPaneRef = useRef<{ side: 'local' | 'remote', path: string } | null>(null);
   const [dropHL, setDropHL] = useState<'local' | 'remote' | null>(null);
 
@@ -934,11 +964,12 @@ const SftpBrowser: React.FC<SftpBrowserProps> = ({ sshId }) => {
   };
 
   const loadLocal = useCallback(async (p: string) => {
+    const norm = normalizeLocalPath(p);
     setLocalLoading(true); setLocalError(null);
     try {
-      const list = await window.electronAPI.localListDir(p);
-      setLocalItems(list); setLocalPath(p);
-      pathCache[sshId] = { ...pathCache[sshId], local: p };
+      const list = await window.electronAPI.localListDir(norm);
+      setLocalItems(list); setLocalPath(norm);
+      pathCache[sshId] = { ...pathCache[sshId], local: norm };
     } catch (e: any) { setLocalError(e.message || String(e)); }
     finally { setLocalLoading(false); }
   }, [sshId]);
@@ -962,7 +993,7 @@ const SftpBrowser: React.FC<SftpBrowserProps> = ({ sshId }) => {
   // ── Init ──
   useEffect(() => {
     (async () => {
-      const h = await window.electronAPI.localHomeDir();
+      const h = normalizeLocalPath(await window.electronAPI.localHomeDir());
       setHomeDir(h);
       const cachedLocal = pathCache[sshId]?.local;
       const defaultDir = localJoin(h, 'Documents');
@@ -971,6 +1002,15 @@ const SftpBrowser: React.FC<SftpBrowserProps> = ({ sshId }) => {
     
     const cachedRemote = pathCache[sshId]?.remote;
     loadRemote(cachedRemote || '/');
+
+    // Automatically refresh remote SFTP pane when SSH session reconnects
+    let unlistenReconnected: (() => void) | undefined;
+    if (window.electronAPI.onSshReconnected) {
+      unlistenReconnected = window.electronAPI.onSshReconnected(sshId, () => {
+        const targetRemote = latestRef.current?.remotePath || pathCache[sshId]?.remote || '/';
+        loadRemote(targetRemote);
+      });
+    }
 
     // Speed tracker: records { lastTransferred, lastTime, smoothedSpeed } per jobId
     // Used to compute EMA-smoothed bytes/s without touching Electron transfer code
@@ -1005,54 +1045,51 @@ const SftpBrowser: React.FC<SftpBrowserProps> = ({ sshId }) => {
         });
       });
     }
-    // Setup Tauri Window DragDrop Listener
+    // Setup Tauri Window DragDrop Listener (for external OS file drag from Windows Explorer / macOS Finder)
     let unlistenDragDrop: (() => void) | undefined;
     import('@tauri-apps/api/window').then(({ getCurrentWindow }) => {
       getCurrentWindow().onDragDropEvent((event) => {
+        // Ignore events when this SftpBrowser instance is hidden (e.g. inactive SSH tab or terminal tab active)
+        const containerEl = containerRef.current;
+        if (!containerEl) return;
+        const cRect = containerEl.getBoundingClientRect();
+        if (cRect.width === 0 || cRect.height === 0) return;
+        let curEl: HTMLElement | null = containerEl;
+        while (curEl) {
+          const st = window.getComputedStyle(curEl);
+          if (st.opacity === '0' || st.display === 'none' || st.visibility === 'hidden' || st.pointerEvents === 'none') {
+            return;
+          }
+          curEl = curEl.parentElement;
+        }
+
         const payload = event.payload;
         
-        // Helper to determine which pane is being hovered with 3-tier fallback for all DPI settings
-        const getTargetSide = (pos: { x: number, y: number }): 'local' | 'remote' | null => {
-          // Tier 1: Raw logical position
-          let el = document.elementFromPoint(pos.x, pos.y);
-          if (el) {
-            const paneLocal = el.closest('[data-pane-side="local"]');
-            if (paneLocal) return 'local';
-            const paneRemote = el.closest('[data-pane-side="remote"]');
-            if (paneRemote) return 'remote';
-          }
-          
-          // Tier 2: Scaled by devicePixelRatio
+        // Helper to determine which pane of THIS SftpBrowser instance is being hovered across all DPI settings
+        const getTargetSide = (pos?: { x: number, y: number }): 'local' | 'remote' | null => {
+          if (!pos) return null;
           const dpr = window.devicePixelRatio || 1;
-          if (dpr !== 1) {
-            el = document.elementFromPoint(pos.x / dpr, pos.y / dpr);
-            if (el) {
-              const paneLocal = el.closest('[data-pane-side="local"]');
-              if (paneLocal) return 'local';
-              const paneRemote = el.closest('[data-pane-side="remote"]');
-              if (paneRemote) return 'remote';
+          const candidates = dpr !== 1
+            ? [{ x: pos.x, y: pos.y }, { x: pos.x / dpr, y: pos.y / dpr }]
+            : [{ x: pos.x, y: pos.y }];
+
+          const localEl = localPaneRef.current;
+          const remoteEl = remotePaneRef.current;
+
+          for (const pt of candidates) {
+            if (localEl) {
+              const r = localEl.getBoundingClientRect();
+              if (pt.x >= r.left && pt.x <= r.right && pt.y >= r.top && pt.y <= r.bottom) {
+                return 'local';
+              }
+            }
+            if (remoteEl) {
+              const r = remoteEl.getBoundingClientRect();
+              if (pt.x >= r.left && pt.x <= r.right && pt.y >= r.top && pt.y <= r.bottom) {
+                return 'remote';
+              }
             }
           }
-
-          // Tier 3: Bounding box collision detection fallback
-          const localPaneEl = document.querySelector('[data-pane-side="local"]');
-          if (localPaneEl) {
-            const rect = localPaneEl.getBoundingClientRect();
-            if ((pos.x >= rect.left && pos.x <= rect.right && pos.y >= rect.top && pos.y <= rect.bottom) ||
-                (pos.x / dpr >= rect.left && pos.x / dpr <= rect.right && pos.y / dpr >= rect.top && pos.y / dpr <= rect.bottom)) {
-              return 'local';
-            }
-          }
-
-          const remotePaneEl = document.querySelector('[data-pane-side="remote"]');
-          if (remotePaneEl) {
-            const rect = remotePaneEl.getBoundingClientRect();
-            if ((pos.x >= rect.left && pos.x <= rect.right && pos.y >= rect.top && pos.y <= rect.bottom) ||
-                (pos.x / dpr >= rect.left && pos.x / dpr <= rect.right && pos.y / dpr >= rect.top && pos.y / dpr <= rect.bottom)) {
-              return 'remote';
-            }
-          }
-
           return null;
         };
 
@@ -1078,7 +1115,7 @@ const SftpBrowser: React.FC<SftpBrowserProps> = ({ sshId }) => {
           const { localPath: curLocal, remotePath: curRemote, doSafeUpload: curUp, loadLocal: curLoadLocal, handleDrop: curHandleDrop } = latestRef.current;
           
           if (!paths || paths.length === 0) {
-            // Internal HTML drag intercepted by Tauri!
+            // Internal HTML drag fallback
             if (dragRef.current && side) {
               if (dragRef.current.side !== side) {
                  const targetPath = side === 'local' ? curLocal : curRemote;
@@ -1090,7 +1127,7 @@ const SftpBrowser: React.FC<SftpBrowserProps> = ({ sshId }) => {
             return;
           }
           
-          // External OS Drag
+          // External OS Drag (Windows Explorer / macOS Finder)
           if (!side) return;
           const targetPath = side === 'local' ? curLocal : curRemote;
           window.electronAPI.printFrontendLog?.(`[DragDrop] targetPath: ${targetPath}`);
@@ -1127,10 +1164,104 @@ const SftpBrowser: React.FC<SftpBrowserProps> = ({ sshId }) => {
 
     return () => {
       unlisten?.();
+      unlistenReconnected?.();
       unlistenDragDrop?.();
       speedTracker.clear();
     };
   }, [sshId, loadLocal, loadRemote, dispatch]);
+
+  // ── Pointer-based Internal Drag-and-Drop (Works on both Windows WebView2 and macOS WKWebView) ──
+  const getPaneSideAtClientPoint = useCallback((clientX: number, clientY: number): 'local' | 'remote' | null => {
+    const localEl = localPaneRef.current;
+    if (localEl) {
+      const r = localEl.getBoundingClientRect();
+      if (clientX >= r.left && clientX <= r.right && clientY >= r.top && clientY <= r.bottom) {
+        return 'local';
+      }
+    }
+    const remoteEl = remotePaneRef.current;
+    if (remoteEl) {
+      const r = remoteEl.getBoundingClientRect();
+      if (clientX >= r.left && clientX <= r.right && clientY >= r.top && clientY <= r.bottom) {
+        return 'remote';
+      }
+    }
+    return null;
+  }, []);
+
+  const handleRowDragStart = useCallback((payload: DragPayload, e?: React.MouseEvent | React.DragEvent) => {
+    dragRef.current = payload;
+    if (e && 'clientX' in e) {
+      pointerDragRef.current = {
+        payload,
+        startX: e.clientX,
+        startY: e.clientY,
+        active: false,
+      };
+    }
+  }, []);
+
+  useEffect(() => {
+    const onMouseMove = (e: MouseEvent) => {
+      const pd = pointerDragRef.current;
+      if (!pd) return;
+      if (!pd.active) {
+        if (Math.hypot(e.clientX - pd.startX, e.clientY - pd.startY) < 5) {
+          return;
+        }
+        pd.active = true;
+        dragRef.current = pd.payload;
+      }
+
+      const overSide = getPaneSideAtClientPoint(e.clientX, e.clientY);
+      const validTarget = overSide && overSide !== pd.payload.side ? overSide : null;
+      setDropHL(validTarget);
+      if (validTarget && latestRef.current) {
+        const { localPath: curLocal, remotePath: curRemote } = latestRef.current;
+        hoveredPaneRef.current = { side: validTarget, path: validTarget === 'local' ? curLocal : curRemote };
+      } else {
+        hoveredPaneRef.current = null;
+      }
+      setDragGhost({
+        payload: pd.payload,
+        x: e.clientX,
+        y: e.clientY,
+        targetSide: validTarget,
+      });
+    };
+
+    const onMouseUp = (e: MouseEvent) => {
+      const pd = pointerDragRef.current;
+      if (!pd) return;
+      pointerDragRef.current = null;
+
+      if (!pd.active) {
+        dragRef.current = null;
+        return;
+      }
+
+      const overSide = getPaneSideAtClientPoint(e.clientX, e.clientY) || hoveredPaneRef.current?.side || null;
+      setDropHL(null);
+      setDragGhost(null);
+      hoveredPaneRef.current = null;
+
+      if (overSide && overSide !== pd.payload.side && latestRef.current) {
+        const { localPath: curLocal, remotePath: curRemote, handleDrop: curHandleDrop } = latestRef.current;
+        const targetPath = overSide === 'local' ? curLocal : curRemote;
+        dragRef.current = pd.payload;
+        curHandleDrop(overSide, targetPath);
+      } else {
+        dragRef.current = null;
+      }
+    };
+
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+    return () => {
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+    };
+  }, [getPaneSideAtClientPoint]);
 
   // ── Drag handlers ──
   const handleDrop = async (targetSide: 'local' | 'remote', targetPath: string, e?: React.DragEvent) => {
@@ -1253,7 +1384,7 @@ const SftpBrowser: React.FC<SftpBrowserProps> = ({ sshId }) => {
           finishJob(jid); loadLocal(destPath);
         } catch (e: any) { finishJob(jid, e.message || String(e)); }
       } else {
-        alert('本地剪贴板粘贴到本地请使用 Finder 操作');
+        alert('本地剪贴板粘贴到本地请使用系统文件管理器（资源管理器 / Finder）操作');
       }
     }
   };
@@ -1335,9 +1466,9 @@ const SftpBrowser: React.FC<SftpBrowserProps> = ({ sshId }) => {
 
   // ── Render ──
   return (
-    <div className="relative flex h-full gap-0.5 p-2">
+    <div ref={containerRef} className="relative flex h-full gap-0.5 p-2">
       {/* Local */}
-      <div className="flex-1 min-w-0 overflow-hidden" data-pane-side="local">
+      <div ref={localPaneRef} className="flex-1 min-w-0 overflow-hidden" data-pane-side="local">
         <FilePane
           title="本机文件" side="local"
           titleIcon={<HardDrive className="w-3.5 h-3.5 text-slate-500" />}
@@ -1345,7 +1476,7 @@ const SftpBrowser: React.FC<SftpBrowserProps> = ({ sshId }) => {
           homePath={homeDir} dragRef={dragRef}
           dropHighlight={dropHL === 'local'}
           onNavigate={loadLocal}
-          onDragStart={(p) => { dragRef.current = p; }}
+          onDragStart={handleRowDragStart}
           onDrop={(p, e) => handleDrop('local', p, e)}
           onDragEnter={() => {
             setDropHL('local');
@@ -1369,7 +1500,7 @@ const SftpBrowser: React.FC<SftpBrowserProps> = ({ sshId }) => {
       </div>
 
       {/* Remote */}
-      <div className="flex-1 min-w-0 overflow-hidden" data-pane-side="remote">
+      <div ref={remotePaneRef} className="flex-1 min-w-0 overflow-hidden" data-pane-side="remote">
         <FilePane
           title="远程主机" side="remote"
           titleIcon={<HardDrive className="w-3.5 h-3.5 text-blue-500" />}
@@ -1377,7 +1508,7 @@ const SftpBrowser: React.FC<SftpBrowserProps> = ({ sshId }) => {
           homePath="/" dragRef={dragRef}
           dropHighlight={dropHL === 'remote'}
           onNavigate={loadRemote}
-          onDragStart={(p) => { dragRef.current = p; }}
+          onDragStart={handleRowDragStart}
           onDrop={(p, e) => handleDrop('remote', p, e)}
           onDragEnter={() => {
             setDropHL('remote');
@@ -1391,6 +1522,31 @@ const SftpBrowser: React.FC<SftpBrowserProps> = ({ sshId }) => {
           onSyncPath={handleSyncPath}
         />
       </div>
+
+      {/* Floating pointer drag preview badge (Windows & macOS) */}
+      {dragGhost && (
+        <div
+          className={`fixed z-[300] pointer-events-none flex items-center gap-2 px-3 py-1.5 rounded-lg shadow-xl border text-xs font-medium backdrop-blur-md transition-colors ${
+            dragGhost.targetSide === 'remote'
+              ? 'bg-blue-600/90 border-blue-400 text-white'
+              : dragGhost.targetSide === 'local'
+                ? 'bg-emerald-600/90 border-emerald-400 text-white'
+                : 'bg-[#141928]/90 border-white/15 text-slate-200'
+          }`}
+          style={{ left: dragGhost.x + 14, top: dragGhost.y + 14 }}
+        >
+          {dragGhost.payload.item.isDir
+            ? <Folder className="w-3.5 h-3.5 text-amber-400 flex-shrink-0" />
+            : <FileIcon className="w-3.5 h-3.5 opacity-80 flex-shrink-0" />}
+          <span className="max-w-[200px] truncate">{dragGhost.payload.item.name}</span>
+          {dragGhost.targetSide === 'remote' && (
+            <span className="ml-1 px-1.5 py-0.5 rounded bg-white/20 text-[10px]">↑ 松手上传到远程</span>
+          )}
+          {dragGhost.targetSide === 'local' && (
+            <span className="ml-1 px-1.5 py-0.5 rounded bg-white/20 text-[10px]">↓ 松手下载到本机</span>
+          )}
+        </div>
+      )}
 
       {/* Context menu */}
       {ctxMenu && (
