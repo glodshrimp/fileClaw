@@ -126,8 +126,8 @@ export interface TerminalPaneProps {
   onClose?: () => void;
   /** Whether to show the close button (hidden for single-pane) */
   showClose?: boolean;
-  /** Terminal mode: 'ssh' for remote shell, 'local' for local PTY (zsh/powershell) */
-  mode?: 'ssh' | 'local';
+  /** Terminal mode: 'ssh' for remote shell, 'local' for local PTY, 'serial' for serial port */
+  mode?: 'ssh' | 'local' | 'serial';
   /** Broadcast keystroke data back to parent for syncing splits */
   onInputData?: (data: string) => void;
   /** Whether to automatically strip line numbers when copying */
@@ -140,6 +140,12 @@ export interface TerminalPaneProps {
   isDragging?: boolean;
   /** Custom working directory for local terminals */
   cwd?: string;
+  /** Custom shell binary for local terminals */
+  shell?: string;
+  /** Local echo for serial port mode */
+  localEcho?: boolean;
+  /** Line ending mapping for serial port mode */
+  lineEnding?: 'cr' | 'lf' | 'crlf';
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -148,8 +154,14 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
   sshId, shellId, isFocused, isDefaultShell, onFocus, onClose, showClose,
   mode = 'ssh', onInputData, autoStripLineNumbers = false,
   isMaximized = false, onToggleMaximize, isDragging = false, cwd,
+  shell, localEcho = false, lineEnding = 'cr',
 }) => {
   const isLocal = mode === 'local';
+  const isSerial = mode === 'serial';
+  const localEchoRef = useRef(localEcho);
+  localEchoRef.current = localEcho;
+  const lineEndingRef = useRef(lineEnding);
+  lineEndingRef.current = lineEnding;
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermRef = useRef<XTerm | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
@@ -189,7 +201,9 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
       if (cols && rows && cols > 0 && rows > 0) {
         if (cols !== lastSizeRef.current.cols || rows !== lastSizeRef.current.rows) {
           lastSizeRef.current = { cols, rows };
-          if (isLocal) {
+          if (isSerial) {
+            // Serial ports do not use PTY dimensions
+          } else if (isLocal) {
             window.electronAPI.ptyResize(shellId, cols, rows);
           } else if (isDefaultShell) {
             window.electronAPI.sshResize(sshId, cols, rows);
@@ -199,7 +213,7 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
         }
       }
     }
-  }, [sshId, shellId, isDefaultShell, isLocal]);
+  }, [sshId, shellId, isDefaultShell, isLocal, isSerial]);
 
   const handleResizeRef = useRef(handleResize);
   handleResizeRef.current = handleResize;
@@ -241,13 +255,21 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
 
   // ── Open shell (non-default panes) or spawn local PTY ───────────────────────
 
-   useEffect(() => {
+  useEffect(() => {
+    if (isSerial) {
+      shellExitedRef.current = false;
+      shellReadyRef.current = true;
+      lastSizeRef.current = { cols: 0, rows: 0 };
+      handleResizeRef.current();
+      return;
+    }
+
     if (isLocal) {
       // Local mode: spawn PTY process
       let cancelled = false;
       (async () => {
         try {
-          const res = await window.electronAPI.ptySpawn(shellId, cwd);
+          const res = await window.electronAPI.ptySpawn(shellId, cwd, shell);
           if (res && !res.success) {
             console.error(`[TerminalPane] Failed to spawn local PTY:`, res.error);
           }
@@ -291,7 +313,7 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
       // Close the shell when pane unmounts
       window.electronAPI.sshCloseShell(sshId, shellId);
     };
-  }, [sshId, shellId, isLocal, cwd, reconnectTrigger]);
+  }, [sshId, shellId, isLocal, isSerial, cwd, shell, reconnectTrigger]);
 
   // ── Initialize xterm ────────────────────────────────────────────────────────
 
@@ -355,6 +377,25 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
     let suppressOnData = false;
     const isMac = /mac|iphone|ipod|ipad/i.test(navigator.platform || navigator.userAgent);
 
+    const sendSerialData = (raw: string) => {
+      let out = raw;
+      if (lineEndingRef.current === 'crlf') {
+        out = raw.replace(/\r(?!\n)/g, '\r\n');
+      } else if (lineEndingRef.current === 'lf') {
+        out = raw.replace(/\r/g, '\n');
+      }
+      if (localEchoRef.current) {
+        if (raw === '\r' || raw === '\n' || raw === '\r\n') {
+          term.write('\r\n');
+        } else if (raw === '\x7f' || raw === '\b') {
+          term.write('\b \b');
+        } else {
+          term.write(raw);
+        }
+      }
+      window.electronAPI.serialWrite(sshId, out);
+    };
+
     term.attachCustomKeyEventHandler((event) => {
       // ── Bypass macOS IME composition for Escape and Shift+key characters ────
       // On macOS with Chinese IME (e.g. Pinyin), the Shift key doubles as an
@@ -377,7 +418,9 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
           suppressOnData = true;
           setTimeout(() => { suppressOnData = false; }, 0);
           const data = '\x1b';
-          if (isLocal) {
+          if (isSerial) {
+            sendSerialData(data);
+          } else if (isLocal) {
             window.electronAPI.ptyWrite(shellId, data);
           } else if (isDefaultShell) {
             window.electronAPI.sshWrite(sshId, data);
@@ -398,7 +441,9 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
           suppressOnData = true;
           setTimeout(() => { suppressOnData = false; }, 0);
           const data = event.key;  // already the shifted character (e.g. ":", "!", "A")
-          if (isLocal) {
+          if (isSerial) {
+            sendSerialData(data);
+          } else if (isLocal) {
             window.electronAPI.ptyWrite(shellId, data);
           } else if (isDefaultShell) {
             window.electronAPI.sshWrite(sshId, data);
@@ -500,8 +545,10 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
         }
         return;
       }
-      if (!isLocal && !isDefaultShell && !shellReadyRef.current) return;
-      if (isLocal) {
+      if (!isSerial && !isLocal && !isDefaultShell && !shellReadyRef.current) return;
+      if (isSerial) {
+        sendSerialData(data);
+      } else if (isLocal) {
         window.electronAPI.ptyWrite(shellId, data);
       } else if (isDefaultShell) {
         window.electronAPI.sshWrite(sshId, data);
@@ -511,8 +558,10 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
       onInputData?.(data);
     });
     const onBinaryDisposable = term.onBinary((data) => {
-      if (!isLocal && !isDefaultShell && !shellReadyRef.current) return;
-      if (isLocal) {
+      if (!isSerial && !isLocal && !isDefaultShell && !shellReadyRef.current) return;
+      if (isSerial) {
+        sendSerialData(data);
+      } else if (isLocal) {
         window.electronAPI.ptyWrite(shellId, data);
       } else if (isDefaultShell) {
         window.electronAPI.sshWrite(sshId, data);
@@ -534,7 +583,16 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
     let removePtyExitListener: (() => void) | null = null;
     let removeShellEofListener: (() => void) | null = null;
 
-    if (isLocal) {
+    if (isSerial) {
+      removeOutputListener = window.electronAPI.onSerialOutput(sshId, (outputData: string) => {
+        if (typeof outputData === 'string') {
+          term.write(outputData);
+        }
+      });
+      removeShellEofListener = window.electronAPI.onSerialClosed(sshId, () => {
+        shellExitedRef.current = true;
+      });
+    } else if (isLocal) {
       // Local PTY mode — listen on pty-output channel
       removeOutputListener = window.electronAPI.onPtyOutput(shellId, (outputData: string) => {
         if (typeof outputData === 'string') {
@@ -581,7 +639,7 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
 
       term.dispose();
     };
-  }, [sshId, shellId, isDefaultShell, isLocal]);
+  }, [sshId, shellId, isDefaultShell, isLocal, isSerial]);
 
   // ── Focus management ────────────────────────────────────────────────────────
 
@@ -636,7 +694,20 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
   };
 
   const writeToShell = (data: string) => {
-    if (isLocal) {
+    if (isSerial) {
+      let out = data;
+      if (lineEndingRef.current === 'crlf') {
+        out = data.replace(/\r?\n|\r/g, '\r\n');
+      } else if (lineEndingRef.current === 'lf') {
+        out = data.replace(/\r\n|\r/g, '\n');
+      } else {
+        out = data.replace(/\r\n|\n/g, '\r');
+      }
+      if (localEchoRef.current && xtermRef.current) {
+        xtermRef.current.write(data.replace(/\r?\n|\r/g, '\r\n'));
+      }
+      window.electronAPI.serialWrite(sshId, out);
+    } else if (isLocal) {
       window.electronAPI.ptyWrite(shellId, data);
     } else if (isDefaultShell) {
       window.electronAPI.sshWrite(sshId, data);

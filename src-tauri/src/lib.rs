@@ -2,6 +2,7 @@ mod db;
 mod fs;
 mod git;
 mod pty;
+mod serial;
 mod ssh;
 
 use tauri::Manager;
@@ -14,6 +15,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .manage(pty::PtyState::default())
+        .manage(serial::SerialState::default())
         .manage(ssh::SshState::default())
         .setup(|app| {
             use tauri::{menu::{Menu, MenuItem}, tray::TrayIconBuilder};
@@ -108,6 +110,11 @@ pub fn run() {
             pty::pty_resize,
             pty::pty_destroy,
             pty::pty_destroy_session,
+            serial::serial_list_ports,
+            serial::serial_connect,
+            serial::serial_write,
+            serial::serial_set_signals,
+            serial::serial_disconnect,
             
             // SSH & SFTP Commands
             ssh::ssh_connect,

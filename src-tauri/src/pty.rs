@@ -30,6 +30,7 @@ pub fn pty_spawn(
     state: tauri::State<'_, PtyState>,
     id: String,
     cwd: Option<String>,
+    shell: Option<String>,
 ) -> Result<PtySpawnResult, String> {
     let mut sessions = state.sessions.lock().map_err(|e| e.to_string())?;
 
@@ -44,25 +45,35 @@ pub fn pty_spawn(
 
     let pty_system = NativePtySystem::default();
     
-    // Choose shell based on platform
-    let shell = if cfg!(target_os = "windows") {
-        "powershell.exe".to_string()
-    } else {
-        std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string())
+    // Choose shell based on explicit parameter or platform default
+    let resolved_shell = match shell.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(custom_shell) => custom_shell.to_string(),
+        None => {
+            if cfg!(target_os = "windows") {
+                "powershell.exe".to_string()
+            } else {
+                std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string())
+            }
+        }
     };
 
-    let shell_basename = std::path::Path::new(&shell)
+    let shell_basename = std::path::Path::new(&resolved_shell)
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| shell.clone());
+        .unwrap_or_else(|| resolved_shell.clone());
 
-    let mut cmd = CommandBuilder::new(&shell);
+    let mut cmd = CommandBuilder::new(&resolved_shell);
     
     // Platform-specific shell arguments and environment variables
+    let lower_shell = shell_basename.to_lowercase();
     if cfg!(target_os = "windows") {
-        cmd.arg("-NoLogo");
+        if lower_shell.contains("powershell") || lower_shell.contains("pwsh") {
+            cmd.arg("-NoLogo");
+        }
     } else {
-        cmd.arg("--login");
+        if lower_shell.contains("zsh") || lower_shell.contains("bash") || lower_shell.contains("sh") {
+            cmd.arg("--login");
+        }
         if std::env::var("LANG").unwrap_or_default().is_empty() {
             cmd.env("LANG", "en_US.UTF-8");
         }
@@ -73,10 +84,30 @@ pub fn pty_spawn(
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
 
+    let home_dir = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default();
+
     if let Some(ref path) = cwd {
-        if !path.is_empty() {
-            cmd.cwd(path);
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            let expanded = if trimmed == "~" && !home_dir.is_empty() {
+                home_dir.clone()
+            } else if (trimmed.starts_with("~/") || trimmed.starts_with("~\\")) && !home_dir.is_empty() {
+                format!("{}{}", home_dir, &trimmed[1..])
+            } else {
+                trimmed.to_string()
+            };
+            if std::path::Path::new(&expanded).is_dir() {
+                cmd.cwd(expanded);
+            } else if !home_dir.is_empty() {
+                cmd.cwd(home_dir);
+            }
+        } else if !home_dir.is_empty() {
+            cmd.cwd(home_dir);
         }
+    } else if !home_dir.is_empty() {
+        cmd.cwd(home_dir);
     }
 
     let pty_pair = pty_system

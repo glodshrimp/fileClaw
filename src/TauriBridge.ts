@@ -350,7 +350,7 @@ const electronAPI: any = {
   openExternal: (url: string) => invoke('opener_open_url', { url }), // Use tauri-plugin-opener standard command
 
   // PTY shell commands
-  ptySpawn: (id: string, cwd?: string) => invoke('pty_spawn', { id, cwd }),
+  ptySpawn: (id: string, cwd?: string, shell?: string) => invoke('pty_spawn', { id, cwd: cwd || null, shell: shell || null }),
   ptyWrite: (id: string, data: string) => invoke('pty_write', { id, data }),
   ptyResize: (id: string, cols: number, rows: number) => invoke('pty_resize', { id, cols, rows }),
   ptyDestroy: (id: string) => invoke('pty_destroy', { id }),
@@ -371,6 +371,82 @@ const electronAPI: any = {
     let active = true;
     const unlistenPromise = listen(`pty-exit-${id}`, (event: any) => {
       if (active) callback(event.payload);
+    });
+    return () => {
+      active = false;
+      unlistenPromise.then(unlistenFn => {
+        if (typeof unlistenFn === 'function') unlistenFn();
+      }).catch(console.error);
+    };
+  },
+
+  // Serial port commands
+  serialListPorts: async () => {
+    try {
+      return await invoke('serial_list_ports');
+    } catch (err) {
+      console.warn('serial_list_ports fallback:', err);
+      return [];
+    }
+  },
+  serialConnect: async (id: string, options: {
+    portName: string;
+    baudRate: number;
+    dataBits: number;
+    stopBits: number;
+    parity: string;
+    flowControl: string;
+  }) => {
+    try {
+      await invoke('serial_connect', {
+        id,
+        portName: options.portName,
+        baudRate: Number(options.baudRate) || 115200,
+        dataBits: Number(options.dataBits) || 8,
+        stopBits: Number(options.stopBits) || 1,
+        parity: options.parity || 'none',
+        flowControl: options.flowControl || 'none',
+      });
+      return { success: true };
+    } catch (err: any) {
+      return { success: false, error: err?.message || String(err) };
+    }
+  },
+  serialWrite: (id: string, data: string) => invoke('serial_write', { id, data }),
+  serialSetSignals: (id: string, dtr?: boolean, rts?: boolean) => invoke('serial_set_signals', {
+    id,
+    dtr: typeof dtr === 'boolean' ? dtr : null,
+    rts: typeof rts === 'boolean' ? rts : null,
+  }),
+  serialDisconnect: (id: string) => invoke('serial_disconnect', { id }),
+  onSerialOutput: (id: string, callback: (data: string) => void) => {
+    let active = true;
+    const unlistenPromise = listen(`serial-output-${id}`, (event: any) => {
+      if (active) callback(event.payload);
+    });
+    return () => {
+      active = false;
+      unlistenPromise.then(unlistenFn => {
+        if (typeof unlistenFn === 'function') unlistenFn();
+      }).catch(console.error);
+    };
+  },
+  onSerialError: (id: string, callback: (err: string) => void) => {
+    let active = true;
+    const unlistenPromise = listen(`serial-error-${id}`, (event: any) => {
+      if (active) callback(event.payload);
+    });
+    return () => {
+      active = false;
+      unlistenPromise.then(unlistenFn => {
+        if (typeof unlistenFn === 'function') unlistenFn();
+      }).catch(console.error);
+    };
+  },
+  onSerialClosed: (id: string, callback: () => void) => {
+    let active = true;
+    const unlistenPromise = listen(`serial-closed-${id}`, () => {
+      if (active) callback();
     });
     return () => {
       active = false;
@@ -531,10 +607,16 @@ const electronAPI: any = {
       }
     });
 
-    // Search SSH
+    // Search SSH / Serial / Local connections
     (db.data.sshInfo || []).forEach((s: any) => {
-      if (s.name?.toLowerCase().includes(kw) || s.host?.toLowerCase().includes(kw)) {
-        results.push({ type: 'ssh', id: s.id, title: s.name, description: `${s.username}@${s.host}`, data: s });
+      const targetStr = `${s.name || ''} ${s.host || ''} ${s.serialPort || ''} ${s.cwd || ''} ${s.description || ''}`.toLowerCase();
+      if (targetStr.includes(kw)) {
+        const desc = s.protocol === 'serial'
+          ? `${s.serialPort || 'COM1'} @ ${s.baudRate || 115200}`
+          : s.protocol === 'local'
+            ? `本地终端 (${s.cwd || '~'})`
+            : `${s.username}@${s.host}`;
+        results.push({ type: 'ssh', id: s.id, title: s.name, description: desc, data: s });
       }
     });
 

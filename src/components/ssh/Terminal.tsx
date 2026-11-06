@@ -234,14 +234,17 @@ interface TerminalProps {
   sshId: string;
   isConnected?: boolean;
   /** Terminal mode: 'ssh' for remote shell, 'local' for local PTY */
-  mode?: 'ssh' | 'local';
+  mode?: 'ssh' | 'local' | 'serial';
   /** Custom working directory for local PTY */
   cwd?: string;
+  shell?: string;
+  localEcho?: boolean;
+  lineEnding?: 'cr' | 'lf' | 'crlf';
 }
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-const Terminal: React.FC<TerminalProps> = ({ sshId, isConnected, mode = 'ssh', cwd }) => {
+const Terminal: React.FC<TerminalProps> = ({ sshId, isConnected, mode = 'ssh', cwd, shell, localEcho: initialLocalEcho = false, lineEnding: initialLineEnding = 'cr' }) => {
   const [tree, setTree] = useState<TreeNode>(() => createDefaultLeaf(sshId));
   const [focusedPaneId, setFocusedPaneId] = useState<string>('default');
   const [showToolbar, setShowToolbar] = useState(false);
@@ -253,6 +256,12 @@ const Terminal: React.FC<TerminalProps> = ({ sshId, isConnected, mode = 'ssh', c
   const [customSnippet, setCustomSnippet] = useState('');
   const containerRef = useRef<HTMLDivElement>(null);
   const dragStartRatioRef = useRef<number | null>(null);
+  const [serialLocalEcho, setSerialLocalEcho] = useState(initialLocalEcho);
+  const [serialLineEnding, setSerialLineEnding] = useState<'cr' | 'lf' | 'crlf'>(initialLineEnding);
+  const [dtrActive, setDtrActive] = useState(true);
+  const [rtsActive, setRtsActive] = useState(true);
+  useEffect(() => { setSerialLocalEcho(initialLocalEcho); }, [initialLocalEcho]);
+  useEffect(() => { setSerialLineEnding(initialLineEnding); }, [initialLineEnding]);
 
   const totalPanes = countLeaves(tree);
   const maxPanes = 9;
@@ -262,7 +271,12 @@ const Terminal: React.FC<TerminalProps> = ({ sshId, isConnected, mode = 'ssh', c
     const activePane = findLeaf(tree, focusedPaneId);
     if (!activePane) return;
     
-    const payload = cmd + '\n';
+    const eol = mode === 'serial' ? (serialLineEnding === 'crlf' ? '\r\n' : serialLineEnding === 'lf' ? '\n' : '\r') : '\n';
+    const payload = cmd + eol;
+    if (mode === 'serial') {
+      window.electronAPI.serialWrite(sshId, payload);
+      return;
+    }
     
     // 写入当前聚焦窗口
     if (mode === 'local') {
@@ -290,7 +304,7 @@ const Terminal: React.FC<TerminalProps> = ({ sshId, isConnected, mode = 'ssh', c
         }
       });
     }
-  }, [tree, focusedPaneId, sshId, mode, isSyncInput]);
+  }, [tree, focusedPaneId, sshId, mode, isSyncInput, serialLineEnding]);
 
   // ── Split actions ───────────────────────────────────────────────────────────
 
@@ -441,6 +455,9 @@ const Terminal: React.FC<TerminalProps> = ({ sshId, isConnected, mode = 'ssh', c
               autoStripLineNumbers={autoStripLineNumbers}
               isDragging={isDragging}
               cwd={cwd}
+              shell={shell}
+              localEcho={serialLocalEcho}
+              lineEnding={serialLineEnding}
               onToggleMaximize={totalPanes > 1 ? () => setMaximizedPaneId(node.id) : undefined}
               onInputData={(data) => {
                 // 如果开启了同步键入模式，将键盘输入广播分发给其他所有的叶子终端信道
@@ -521,7 +538,7 @@ const Terminal: React.FC<TerminalProps> = ({ sshId, isConnected, mode = 'ssh', c
         </div>
       );
     },
-    [sshId, focusedPaneId, closePane, totalPanes, refitAllPanes, mode, autoStripLineNumbers, isDragging, tree, isSyncInput, cwd]
+    [sshId, focusedPaneId, closePane, totalPanes, refitAllPanes, mode, autoStripLineNumbers, isDragging, tree, isSyncInput, cwd, shell, serialLocalEcho, serialLineEnding]
   );
 
   // ── Render ──────────────────────────────────────────────────────────────────
@@ -539,7 +556,7 @@ const Terminal: React.FC<TerminalProps> = ({ sshId, isConnected, mode = 'ssh', c
       {/* ── Split toolbar (normal flow, pushes terminal content down) ── */}
       <div
         className={`flex-shrink-0 flex items-center px-1.5 py-0 gap-0.5 border-b backdrop-blur-md transition-all duration-200 ${
-          totalPanes > 1 || showToolbar
+          totalPanes > 1 || showToolbar || mode === 'serial'
             ? 'opacity-100 h-6 border-white/[0.06]'
             : 'opacity-0 h-0 border-transparent overflow-hidden pointer-events-none'
         }`}
@@ -615,6 +632,59 @@ const Terminal: React.FC<TerminalProps> = ({ sshId, isConnected, mode = 'ssh', c
 
         {/* Spacer */}
         <div className="flex-1" />
+        {mode === 'serial' && (
+          <>
+            <button
+              onClick={() => setSerialLocalEcho(prev => !prev)}
+              className={`flex items-center gap-1 px-2 py-0.5 rounded-lg text-[10px] font-bold transition-all ${
+                serialLocalEcho
+                  ? 'bg-purple-500/20 text-purple-400 border border-purple-500/30'
+                  : 'hover:bg-white/10 text-slate-400 hover:text-white border border-transparent'
+              }`}
+              title="切换串口本地回显 (Local Echo)"
+            >
+              <span>回显:{serialLocalEcho ? '开' : '关'}</span>
+            </button>
+            <button
+              onClick={() => setSerialLineEnding(prev => prev === 'cr' ? 'crlf' : prev === 'crlf' ? 'lf' : 'cr')}
+              className="flex items-center gap-1 px-2 py-0.5 rounded-lg text-[10px] font-mono font-bold bg-white/5 hover:bg-white/10 text-amber-400 border border-amber-500/20 transition-all"
+              title="切换发送回车换行符模式 (CR / CRLF / LF)"
+            >
+              <span>EOL:{serialLineEnding.toUpperCase()}</span>
+            </button>
+            <button
+              onClick={() => {
+                const next = !dtrActive;
+                setDtrActive(next);
+                window.electronAPI.serialSetSignals?.(sshId, next, undefined).catch(() => {});
+              }}
+              className={`px-1.5 py-0.5 rounded text-[9px] font-mono font-bold transition-all ${
+                dtrActive
+                  ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                  : 'bg-white/5 text-slate-500 border border-transparent hover:text-slate-300'
+              }`}
+              title="切换 DTR (Data Terminal Ready) 电平"
+            >
+              DTR
+            </button>
+            <button
+              onClick={() => {
+                const next = !rtsActive;
+                setRtsActive(next);
+                window.electronAPI.serialSetSignals?.(sshId, undefined, next).catch(() => {});
+              }}
+              className={`px-1.5 py-0.5 rounded text-[9px] font-mono font-bold transition-all ${
+                rtsActive
+                  ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                  : 'bg-white/5 text-slate-500 border border-transparent hover:text-slate-300'
+              }`}
+              title="切换 RTS (Request To Send) 电平"
+            >
+              RTS
+            </button>
+            <div className="w-px h-3 bg-white/10 mx-1" />
+          </>
+        )}
 
         {/* 广播同步输入开关 */}
         {totalPanes > 1 && (
@@ -705,6 +775,9 @@ const Terminal: React.FC<TerminalProps> = ({ sshId, isConnected, mode = 'ssh', c
                   isDragging={false}
                   isMaximized={true}
                   cwd={cwd}
+                  shell={shell}
+                  localEcho={serialLocalEcho}
+                  lineEnding={serialLineEnding}
                   onToggleMaximize={() => setMaximizedPaneId(null)}
                   onInputData={(data) => {
                     if (isSyncInput) {

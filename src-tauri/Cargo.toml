@@ -25,6 +25,7 @@ portable-pty = "0.8"
 ssh2 = "0.9"
 base64 = "0.21"
 socket2 = "0.5"
+serialport = "4"
 
 [profile.release]
 codegen-units = 1

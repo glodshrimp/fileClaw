@@ -42,14 +42,43 @@ export interface SSHTunnel {
   name: string;
 }
 
+export type ConnectionProtocol = 'ssh' | 'serial' | 'local';
+export type SerialDataBits = 5 | 6 | 7 | 8;
+export type SerialStopBits = 1 | 2;
+export type SerialParity = 'none' | 'odd' | 'even';
+export type SerialFlowControl = 'none' | 'software' | 'hardware';
+
+export interface SerialPortDevice {
+  portName: string;
+  portType: string;
+  description: string;
+  manufacturer?: string;
+  product?: string;
+  vid?: number;
+  pid?: number;
+}
+
 export interface SSHInfo {
   id: string;
   name: string;
+  protocol?: ConnectionProtocol; // default 'ssh'
   host: string;
   port: number;
   username: string;
   keyPath?: string;
   password?: string;
+  // Serial protocol fields
+  serialPort?: string;
+  baudRate?: number;
+  dataBits?: SerialDataBits;
+  stopBits?: SerialStopBits;
+  parity?: SerialParity;
+  flowControl?: SerialFlowControl;
+  localEcho?: boolean;
+  lineEnding?: 'cr' | 'lf' | 'crlf';
+  // Local protocol fields
+  cwd?: string;
+  shell?: string;
   description: string;
   group?: string;
   tunnels?: SSHTunnel[];
@@ -173,8 +202,8 @@ declare global {
       deleteAccount: (id: string) => Promise<void>;
 
       getSSHInfo: () => Promise<SSHInfo[]>;
-      addSSHInfo: (sshInfo: SSHInfo) => Promise<void>;
-      updateSSHInfo: (id: string, sshInfo: SSHInfo) => Promise<void>;
+      addSSHInfo: (sshInfo: SSHInfo) => Promise<SSHInfo>;
+      updateSSHInfo: (id: string, sshInfo: SSHInfo) => Promise<SSHInfo>;
       deleteSSHInfo: (id: string) => Promise<void>;
       
       // 项目追踪
@@ -283,13 +312,30 @@ declare global {
       onSshReconnected: (id: string, callback: () => void) => () => void;
 
       // 本地终端 (PTY)
-      ptySpawn: (id: string, cwd?: string) => Promise<{success: boolean, shell?: string, error?: string}>;
+      ptySpawn: (id: string, cwd?: string, shell?: string) => Promise<{success: boolean, shell?: string, error?: string}>;
       ptyWrite: (id: string, data: string) => Promise<void>;
       ptyResize: (id: string, cols: number, rows: number) => Promise<void>;
       ptyDestroy: (id: string) => Promise<void>;
       ptyDestroySession: (sessionKey: string) => Promise<void>;
       onPtyOutput: (id: string, callback: (data: string) => void) => () => void;
       onPtyExit: (id: string, callback: (code: number) => void) => () => void;
+
+      // 串口终端 (Serial)
+      serialListPorts: () => Promise<SerialPortDevice[]>;
+      serialConnect: (id: string, options: {
+        portName: string;
+        baudRate: number;
+        dataBits: number;
+        stopBits: number;
+        parity: string;
+        flowControl: string;
+      }) => Promise<{success: boolean, error?: string}>;
+      serialWrite: (id: string, data: string) => Promise<void>;
+      serialSetSignals: (id: string, dtr?: boolean, rts?: boolean) => Promise<void>;
+      serialDisconnect: (id: string) => Promise<void>;
+      onSerialOutput: (id: string, callback: (data: string) => void) => () => void;
+      onSerialError: (id: string, callback: (error: string) => void) => () => void;
+      onSerialClosed: (id: string, callback: () => void) => () => void;
 
       globalSearch: (keyword: string) => Promise<SearchResult[]>;
       exportData: () => Promise<any>;
