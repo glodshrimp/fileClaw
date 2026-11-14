@@ -45,6 +45,9 @@ const SSHPage: React.FC = () => {
   const [availableSerialPorts, setAvailableSerialPorts] = useState<SerialPortDevice[]>([]);
   const [loadingSerialPorts, setLoadingSerialPorts] = useState(false);
   const [customSerialPortMode, setCustomSerialPortMode] = useState(false);
+  const [showSystemSerialPorts, setShowSystemSerialPorts] = useState(false);
+  const [customBaudRateMode, setCustomBaudRateMode] = useState(false);
+  const [formError, setFormError] = useState('');
   const [viewMode, setViewMode] = useState<'card' | 'list'>(() => {
     return (localStorage.getItem('ssh_view_mode') as 'card' | 'list') || 'card';
   });
@@ -74,10 +77,16 @@ const SSHPage: React.FC = () => {
       return next;
     });
   };
+  const PRESET_BAUD_RATES = [
+    '1200', '2400', '4800', '9600', '19200', '38400', '57600', '74880',
+    '115200', '128000', '230400', '250000', '256000', '460800', '500000',
+    '921600', '1000000', '1500000', '2000000', '3000000',
+  ];
+
   const [formData, setFormData] = useState({
     protocol: 'ssh' as ConnectionProtocol,
     name: '', host: '', port: '22', username: '', keyPath: '', password: '', description: '', group: '',
-    serialPort: 'COM1',
+    serialPort: '',
     baudRate: '115200',
     dataBits: '8',
     stopBits: '1',
@@ -91,6 +100,26 @@ const SSHPage: React.FC = () => {
   });
 
   const getProtocol = (ssh: SSHInfo): ConnectionProtocol => ssh.protocol || 'ssh';
+
+  const usefulSerialPorts = React.useMemo(
+    () =>
+      availableSerialPorts.filter(
+        p => p.portName && p.portName.trim() !== '' && (!p.isSystem || showSystemSerialPorts)
+      ),
+    [availableSerialPorts, showSystemSerialPorts]
+  );
+
+  const systemSerialPortCount = React.useMemo(
+    () => availableSerialPorts.filter(p => p.portName && p.portName.trim() !== '' && p.isSystem).length,
+    [availableSerialPorts]
+  );
+
+  const customSerialPortModeRef = React.useRef(customSerialPortMode);
+  customSerialPortModeRef.current = customSerialPortMode;
+  const showSystemSerialPortsRef = React.useRef(showSystemSerialPorts);
+  showSystemSerialPortsRef.current = showSystemSerialPorts;
+  const editingSSHRef = React.useRef(editingSSH);
+  editingSSHRef.current = editingSSH;
 
   const formatParityShort = (parity?: SerialParity) => {
     if (parity === 'odd') return 'O';
@@ -113,7 +142,7 @@ const SSHPage: React.FC = () => {
   const formatConnectionSummary = (ssh: SSHInfo) => {
     const proto = getProtocol(ssh);
     if (proto === 'serial') {
-      return `${ssh.serialPort || 'COM1'} @ ${ssh.baudRate || 115200} (${ssh.dataBits || 8}${formatParityShort(ssh.parity)}${ssh.stopBits || 1})`;
+      return `${ssh.serialPort || '未指定端口'} @ ${ssh.baudRate || 115200} (${ssh.dataBits || 8}${formatParityShort(ssh.parity)}${ssh.stopBits || 1})`;
     }
     if (proto === 'local') {
       return `${ssh.cwd || '~'} (${ssh.shell || '默认 Shell'})`;
@@ -121,29 +150,60 @@ const SSHPage: React.FC = () => {
     return `${ssh.username}@${ssh.host}:${ssh.port}`;
   };
 
-  const refreshSerialPorts = React.useCallback(async () => {
-    setLoadingSerialPorts(true);
+  const refreshSerialPorts = React.useCallback(async (silent = false) => {
+    if (!silent) {
+      setLoadingSerialPorts(true);
+    }
     try {
-      const ports = await window.electronAPI.serialListPorts?.() || [];
-      setAvailableSerialPorts(ports);
+      const rawPorts = (await window.electronAPI.serialListPorts?.()) || [];
+      const validPorts = rawPorts.filter(
+        p => p && typeof p.portName === 'string' && p.portName.trim() !== ''
+      );
+      setAvailableSerialPorts(validPorts);
+
+      const portsToUse = validPorts.filter(
+        p => !p.isSystem || showSystemSerialPortsRef.current
+      );
       setFormData(prev => {
-        if (ports.length > 0 && (!prev.serialPort || (prev.serialPort === 'COM1' && !ports.some(p => p.portName === 'COM1')))) {
-          return { ...prev, serialPort: ports[0].portName };
+        if (portsToUse.length === 0) {
+          return prev;
+        }
+        const currentPort = prev.serialPort.trim();
+        const isCurrentValid = portsToUse.some(p => p.portName === currentPort);
+        if (!currentPort) {
+          return { ...prev, serialPort: portsToUse[0].portName };
+        }
+        if (!editingSSHRef.current && !customSerialPortModeRef.current && !isCurrentValid) {
+          return { ...prev, serialPort: portsToUse[0].portName };
         }
         return prev;
       });
     } catch (e) {
       console.error('Failed to list serial ports:', e);
     } finally {
-      setLoadingSerialPorts(false);
+      if (!silent) {
+        setLoadingSerialPorts(false);
+      }
     }
   }, []);
 
   React.useEffect(() => {
-    if (isModalOpen && formData.protocol === 'serial') {
-      refreshSerialPorts();
-    }
+    if (!isModalOpen || formData.protocol !== 'serial') return;
+    refreshSerialPorts(false);
+    const timer = setInterval(() => {
+      refreshSerialPorts(true);
+    }, 2500);
+    return () => clearInterval(timer);
   }, [isModalOpen, formData.protocol, refreshSerialPorts]);
+
+  React.useEffect(() => {
+    if (!isModalOpen || formData.protocol !== 'serial' || customSerialPortMode) return;
+    if (!formData.serialPort.trim() && usefulSerialPorts.length > 0) {
+      setFormData(prev =>
+        prev.serialPort.trim() ? prev : { ...prev, serialPort: usefulSerialPorts[0].portName }
+      );
+    }
+  }, [isModalOpen, formData.protocol, formData.serialPort, customSerialPortMode, usefulSerialPorts]);
 
   // Multi-session state moved to AppContext
   const sessions = state.sshSessions;
@@ -252,7 +312,7 @@ const SSHPage: React.FC = () => {
 
       if (getProtocol(sLatest.ssh) === 'serial') {
         window.electronAPI.serialConnect(key, {
-          portName: sLatest.ssh.serialPort || 'COM1',
+          portName: sLatest.ssh.serialPort || '',
           baudRate: sLatest.ssh.baudRate || 115200,
           dataBits: sLatest.ssh.dataBits || 8,
           stopBits: sLatest.ssh.stopBits || 1,
@@ -337,7 +397,7 @@ const SSHPage: React.FC = () => {
 
     if (proto === 'serial') {
       window.electronAPI.serialConnect(key, {
-        portName: ssh.serialPort || 'COM1',
+        portName: ssh.serialPort || '',
         baudRate: ssh.baudRate || 115200,
         dataBits: ssh.dataBits || 8,
         stopBits: ssh.stopBits || 1,
@@ -476,7 +536,7 @@ const SSHPage: React.FC = () => {
 
     if (getProtocol(s.ssh) === 'serial') {
       window.electronAPI.serialConnect(key, {
-        portName: s.ssh.serialPort || 'COM1',
+        portName: s.ssh.serialPort || '',
         baudRate: s.ssh.baudRate || 115200,
         dataBits: s.ssh.dataBits || 8,
         stopBits: s.ssh.stopBits || 1,
@@ -558,52 +618,106 @@ const SSHPage: React.FC = () => {
     });
   };
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const saveConnection = async (connectImmediately: boolean) => {
+    setFormError('');
     const proto = formData.protocol || 'ssh';
-    const defaultName = proto === 'serial'
-      ? `${formData.serialPort || 'COM1'} (${formData.baudRate || 115200})`
-      : proto === 'local'
-        ? '本地终端'
-        : `${formData.username}@${formData.host}`;
+    const trimmedSerialPort = formData.serialPort.trim();
+    const parsedBaudRate = parseInt(formData.baudRate.trim(), 10);
+
+    if (proto === 'serial') {
+      if (!trimmedSerialPort) {
+        setFormError('请选择或输入串口端口号（例如 COM3 或 /dev/cu.usbserial-xxx）');
+        return;
+      }
+      if (!Number.isFinite(parsedBaudRate) || parsedBaudRate <= 0) {
+        setFormError('请输入有效的正整数波特率（例如 115200）');
+        return;
+      }
+    } else if (proto === 'ssh') {
+      if (!formData.name.trim()) {
+        setFormError('请输入连接名称');
+        return;
+      }
+      if (!formData.host.trim()) {
+        setFormError('请输入主机地址');
+        return;
+      }
+      const parsedPort = parseInt(formData.port, 10);
+      if (!Number.isFinite(parsedPort) || parsedPort <= 0 || parsedPort > 65535) {
+        setFormError('请输入有效端口号 (1-65535)');
+        return;
+      }
+      if (!formData.username.trim()) {
+        setFormError('请输入用户名');
+        return;
+      }
+    }
+
+    let defaultName = '';
+    if (proto === 'serial') {
+      const matchedDevice = availableSerialPorts.find(p => p.portName === trimmedSerialPort);
+      const genericDescs = new Set(['标准串口', '标准/虚拟串口', '串口设备', '蓝牙串口']);
+      const deviceLabel = matchedDevice?.description?.trim();
+      defaultName =
+        deviceLabel && !genericDescs.has(deviceLabel)
+          ? `${trimmedSerialPort} (${deviceLabel})`
+          : `${trimmedSerialPort} (${parsedBaudRate})`;
+    } else if (proto === 'local') {
+      defaultName = '本地终端';
+    } else {
+      defaultName = `${formData.username}@${formData.host}`;
+    }
+
     const sshData: SSHInfo = {
       id: editingSSH?.id || Date.now().toString(),
       name: formData.name.trim() || defaultName,
       protocol: proto,
-      host: proto === 'ssh' ? formData.host : (proto === 'serial' ? (formData.serialPort || 'COM1') : 'localhost'),
-      port: proto === 'ssh' ? (parseInt(formData.port) || 22) : (proto === 'serial' ? (parseInt(formData.baudRate) || 115200) : 0),
-      username: proto === 'ssh' ? formData.username : (proto === 'serial' ? 'serial' : 'local'),
-      keyPath: proto === 'ssh' ? (formData.keyPath || undefined) : undefined,
+      host: proto === 'ssh' ? formData.host.trim() : (proto === 'serial' ? trimmedSerialPort : 'localhost'),
+      port: proto === 'ssh' ? (parseInt(formData.port, 10) || 22) : (proto === 'serial' ? parsedBaudRate : 0),
+      username: proto === 'ssh' ? formData.username.trim() : (proto === 'serial' ? 'serial' : 'local'),
+      keyPath: proto === 'ssh' ? (formData.keyPath.trim() || undefined) : undefined,
       password: proto === 'ssh' ? (formData.password || undefined) : undefined,
-      serialPort: proto === 'serial' ? (formData.serialPort || 'COM1') : undefined,
-      baudRate: proto === 'serial' ? (parseInt(formData.baudRate) || 115200) : undefined,
-      dataBits: proto === 'serial' ? ((parseInt(formData.dataBits) || 8) as SerialDataBits) : undefined,
-      stopBits: proto === 'serial' ? ((parseInt(formData.stopBits) || 1) as SerialStopBits) : undefined,
+      serialPort: proto === 'serial' ? trimmedSerialPort : undefined,
+      baudRate: proto === 'serial' ? parsedBaudRate : undefined,
+      dataBits: proto === 'serial' ? ((parseInt(formData.dataBits, 10) || 8) as SerialDataBits) : undefined,
+      stopBits: proto === 'serial' ? ((parseInt(formData.stopBits, 10) || 1) as SerialStopBits) : undefined,
       parity: proto === 'serial' ? formData.parity : undefined,
       flowControl: proto === 'serial' ? formData.flowControl : undefined,
       localEcho: proto === 'serial' ? formData.localEcho : undefined,
       lineEnding: proto === 'serial' ? formData.lineEnding : undefined,
-      cwd: proto === 'local' ? (formData.cwd || undefined) : undefined,
-      shell: proto === 'local' ? (formData.shell || undefined) : undefined,
+      cwd: proto === 'local' ? (formData.cwd.trim() || undefined) : undefined,
+      shell: proto === 'local' ? (formData.shell.trim() || undefined) : undefined,
       description: formData.description,
-      group: formData.group || undefined,
+      group: formData.group.trim() || undefined,
       tunnels: proto === 'ssh' ? formData.tunnels : [],
       createdAt: editingSSH?.createdAt || new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
     try {
+      let savedSsh: SSHInfo = sshData;
       if (editingSSH) {
         const updated = await window.electronAPI?.updateSSHInfo(editingSSH.id, sshData);
-        dispatch({ type: 'UPDATE_SSH_INFO', payload: (updated as any) || sshData });
+        savedSsh = (updated as any) || sshData;
+        dispatch({ type: 'UPDATE_SSH_INFO', payload: savedSsh });
       } else {
         const added = await window.electronAPI?.addSSHInfo(sshData);
-        dispatch({ type: 'ADD_SSH_INFO', payload: (added as any) || sshData });
+        savedSsh = (added as any) || sshData;
+        dispatch({ type: 'ADD_SSH_INFO', payload: savedSsh });
       }
       setIsModalOpen(false);
       resetForm();
-    } catch (error) {
+      if (connectImmediately) {
+        handleConnect(savedSsh);
+      }
+    } catch (error: any) {
       console.error('Failed to save SSH info:', error);
+      setFormError(error?.message || String(error) || '保存连接配置失败');
     }
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await saveConnection(false);
   };
 
   const handleDeleteClick = (id: string) => {
@@ -629,7 +743,7 @@ const SSHPage: React.FC = () => {
     setFormData({
       protocol: 'ssh',
       name: '', host: '', port: '22', username: '', keyPath: '', password: '', description: '', group: '',
-      serialPort: 'COM1',
+      serialPort: '',
       baudRate: '115200',
       dataBits: '8',
       stopBits: '1',
@@ -642,19 +756,23 @@ const SSHPage: React.FC = () => {
       tunnels: [],
     });
     setCustomSerialPortMode(false);
+    setCustomBaudRateMode(false);
+    setShowSystemSerialPorts(false);
+    setFormError('');
     setEditingSSH(null);
   };
 
   const openEditModal = (ssh: SSHInfo) => {
+    const baudStr = (ssh.baudRate || 115200).toString();
     setEditingSSH(ssh);
     setFormData({
       protocol: getProtocol(ssh),
       name: ssh.name, host: ssh.host, port: (ssh.port || 22).toString(),
       username: ssh.username, keyPath: ssh.keyPath || '',
-      password: ssh.password || '', description: ssh.description,
+      password: ssh.password || '', description: ssh.description || '',
       group: ssh.group || '',
-      serialPort: ssh.serialPort || 'COM1',
-      baudRate: (ssh.baudRate || 115200).toString(),
+      serialPort: ssh.serialPort || '',
+      baudRate: baudStr,
       dataBits: (ssh.dataBits || 8).toString(),
       stopBits: (ssh.stopBits || 1).toString(),
       parity: ssh.parity || 'none',
@@ -666,6 +784,9 @@ const SSHPage: React.FC = () => {
       tunnels: ssh.tunnels || [],
     });
     setCustomSerialPortMode(false);
+    setCustomBaudRateMode(!PRESET_BAUD_RATES.includes(baudStr));
+    setShowSystemSerialPorts(false);
+    setFormError('');
     setIsModalOpen(true);
   };
 
@@ -857,6 +978,19 @@ const SSHPage: React.FC = () => {
               <button
                 onClick={() => {
                   resetForm();
+                  setFormData(prev => ({ ...prev, protocol: 'serial' }));
+                  setIsModalOpen(true);
+                }}
+                className="flex items-center space-x-1.5 px-2.5 py-1 text-xs font-medium rounded-lg bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-500 border border-cyan-500/20 transition-all"
+                title="快速新增串口 (Serial / COM) 连接"
+              >
+                <Cpu className="w-3.5 h-3.5" />
+                <span>新增串口</span>
+              </button>
+
+              <button
+                onClick={() => {
+                  resetForm();
                   if (protocolFilter !== 'all') {
                     setFormData(prev => ({ ...prev, protocol: protocolFilter }));
                   }
@@ -885,11 +1019,11 @@ const SSHPage: React.FC = () => {
                   const proto = getProtocol(ssh);
                   if (protocolFilter !== 'all' && proto !== protocolFilter) return false;
                   const q = searchQuery.toLowerCase();
-                  return ssh.name.toLowerCase().includes(q) ||
+                  return (ssh.name || '').toLowerCase().includes(q) ||
                     (ssh.host || '').toLowerCase().includes(q) ||
                     (ssh.serialPort || '').toLowerCase().includes(q) ||
                     (ssh.cwd || '').toLowerCase().includes(q) ||
-                    ssh.description.toLowerCase().includes(q) ||
+                    (ssh.description || '').toLowerCase().includes(q) ||
                     (ssh.group || '未分组').toLowerCase().includes(q);
                 });
                 if (filteredSSH.length === 0) {
@@ -1581,31 +1715,61 @@ const SSHPage: React.FC = () => {
               <h3 className="text-lg font-bold text-text-primary">
                 {editingSSH ? '编辑连接配置' : '新增连接配置'}
               </h3>
-              {/* Protocol Segmented Switcher */}
-              <div className="flex items-center p-0.5 bg-background-secondary border border-border rounded-lg text-xs">
-                {([
-                  { id: 'ssh', label: 'SSH 协议', icon: <Server className="w-3.5 h-3.5" /> },
-                  { id: 'serial', label: '串口 (Serial)', icon: <Cpu className="w-3.5 h-3.5" /> },
-                  { id: 'local', label: '本地 (Local)', icon: <Monitor className="w-3.5 h-3.5" /> },
-                ] as const).map(tab => (
-                  <button
-                    key={tab.id}
-                    type="button"
-                    onClick={() => setFormData({ ...formData, protocol: tab.id })}
-                    className={`flex items-center space-x-1.5 px-2.5 py-1 rounded-md font-medium transition-all ${
-                      formData.protocol === tab.id
-                        ? 'bg-primary text-white shadow-sm'
-                        : 'text-text-tertiary hover:text-text-secondary'
-                    }`}
-                  >
-                    {tab.icon}
-                    <span>{tab.label}</span>
-                  </button>
-                ))}
-              </div>
+              <button
+                type="button"
+                onClick={() => { setIsModalOpen(false); resetForm(); }}
+                className="p-1.5 rounded-lg text-text-tertiary hover:text-text-primary hover:bg-background-secondary transition-colors"
+                title="关闭"
+              >
+                <X className="w-4 h-4" />
+              </button>
             </div>
             <form onSubmit={handleSubmit} className="flex flex-col flex-1 overflow-hidden">
               <div className="p-5 overflow-y-auto scrollbar-thin space-y-3.5">
+                {/* ── 连接协议显式选择区 ── */}
+                <div>
+                  <label className="block text-sm font-medium text-text-secondary mb-1.5">连接协议</label>
+                  <div className="grid grid-cols-3 gap-2">
+                    {([
+                      { id: 'ssh', label: 'SSH 远程', sub: 'TCP / SFTP', icon: <Server className="w-4 h-4" /> },
+                      { id: 'serial', label: '串口 (Serial)', sub: 'COM / UART', icon: <Cpu className="w-4 h-4" /> },
+                      { id: 'local', label: '本地 (Local)', sub: '本机终端', icon: <Monitor className="w-4 h-4" /> },
+                    ] as const).map(tab => {
+                      const active = formData.protocol === tab.id;
+                      return (
+                        <button
+                          key={tab.id}
+                          type="button"
+                          onClick={() => {
+                            setFormData(prev => ({ ...prev, protocol: tab.id }));
+                            setFormError('');
+                          }}
+                          className={`flex items-center gap-2.5 px-3 py-2 rounded-lg border text-left transition-all ${
+                            active
+                              ? 'bg-primary/15 border-primary text-primary shadow-sm'
+                              : 'bg-background-secondary/50 border-border text-text-secondary hover:border-border-hover hover:text-text-primary'
+                          }`}
+                        >
+                          <div className={`flex-shrink-0 ${active ? 'text-primary' : 'text-text-tertiary'}`}>
+                            {tab.icon}
+                          </div>
+                          <div className="min-w-0">
+                            <div className="text-xs font-semibold truncate">{tab.label}</div>
+                            <div className="text-[10px] opacity-75 truncate">{tab.sub}</div>
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {formError && (
+                  <div className="flex items-start gap-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-xs">
+                    <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+                    <span>{formError}</span>
+                  </div>
+                )}
+
                 <div>
                   <label className="block text-sm font-medium text-text-secondary mb-1.5">
                     名称 {formData.protocol !== 'ssh' && <span className="text-xs text-text-tertiary font-normal">（可选，留空自动生成）</span>}
@@ -1617,7 +1781,7 @@ const SSHPage: React.FC = () => {
                     className="input-base"
                     placeholder={
                       formData.protocol === 'serial'
-                        ? `例如: 开发板调试 (${formData.serialPort || 'COM1'})`
+                        ? `例如: 开发板调试 (${formData.serialPort || (window.electronAPI?.platform === 'win32' ? 'COM3' : '/dev/cu.usbserial-1410')})`
                         : formData.protocol === 'local'
                           ? '例如: 本地 PowerShell / Zsh'
                           : '例如: 生产服务器-01'
@@ -1630,76 +1794,155 @@ const SSHPage: React.FC = () => {
                 {formData.protocol === 'serial' && (
                   <div className="space-y-3.5 bg-background-secondary/40 border border-border/60 rounded-xl p-4">
                     {/* 1. 端口号(P) */}
-                    <div className="grid grid-cols-3 items-center gap-3">
-                      <label className="text-sm font-medium text-text-secondary">端口号(P):</label>
-                      <div className="col-span-2 flex items-center gap-2">
-                        {customSerialPortMode ? (
-                          <input
-                            type="text"
-                            value={formData.serialPort}
-                            onChange={(e) => setFormData({ ...formData, serialPort: e.target.value })}
-                            className="input-base flex-1 font-mono"
-                            placeholder="如 COM1 或 /dev/cu.usbserial-1410"
-                            required
-                          />
-                        ) : (
-                          <select
-                            value={formData.serialPort}
-                            onChange={(e) => {
-                              if (e.target.value === '__custom__') {
-                                setCustomSerialPortMode(true);
-                              } else {
-                                setFormData({ ...formData, serialPort: e.target.value });
-                              }
-                            }}
-                            className="input-base flex-1 font-mono"
-                          >
-                            {availableSerialPorts.map(p => (
-                              <option key={p.portName} value={p.portName}>
-                                {p.portName} {p.description ? `(${p.description})` : ''}
-                              </option>
-                            ))}
-                            {/* Fallback common port options if not already in availableSerialPorts */}
-                            {(['COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8'].filter(
-                              c => !availableSerialPorts.some(p => p.portName === c)
-                            )).map(c => (
-                              <option key={c} value={c}>{c}</option>
-                            ))}
-                            {formData.serialPort &&
-                              !availableSerialPorts.some(p => p.portName === formData.serialPort) &&
-                              !['COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8'].includes(formData.serialPort) && (
-                                <option value={formData.serialPort}>{formData.serialPort}</option>
+                    <div className="space-y-1.5">
+                      <div className="grid grid-cols-3 items-center gap-3">
+                        <label className="text-sm font-medium text-text-secondary">端口号(P):</label>
+                        <div className="col-span-2 flex items-center gap-2">
+                          {usefulSerialPorts.length > 0 && !customSerialPortMode ? (
+                            <select
+                              value={formData.serialPort}
+                              onChange={(e) => {
+                                if (e.target.value === '__custom__') {
+                                  setCustomSerialPortMode(true);
+                                  setFormError('');
+                                } else {
+                                  setFormData({ ...formData, serialPort: e.target.value });
+                                  setFormError('');
+                                }
+                              }}
+                              className="input-base flex-1 font-mono"
+                            >
+                              {!formData.serialPort && (
+                                <option value="">请选择串口...</option>
                               )}
-                            <option value="__custom__">手动输入其他端口...</option>
-                          </select>
-                        )}
-                        <button
-                          type="button"
-                          onClick={() => {
-                            if (customSerialPortMode) setCustomSerialPortMode(false);
-                            refreshSerialPorts();
-                          }}
-                          className="p-2 bg-background-secondary hover:bg-background-tertiary border border-border rounded-lg text-text-secondary hover:text-text-primary transition-colors flex-shrink-0"
-                          title="刷新检测本机串口列表"
-                        >
-                          <RefreshCw className={`w-4 h-4 ${loadingSerialPorts ? 'animate-spin text-primary' : ''}`} />
-                        </button>
+                              {usefulSerialPorts.map(p => (
+                                <option key={p.portName} value={p.portName}>
+                                  {p.portName} {p.description ? `(${p.description})` : ''}{p.isSystem ? ' [系统]' : ''}
+                                </option>
+                              ))}
+                              {formData.serialPort &&
+                                !usefulSerialPorts.some(p => p.portName === formData.serialPort) && (
+                                  <option value={formData.serialPort}>{formData.serialPort} (当前未连接)</option>
+                                )}
+                              <option value="__custom__">手动输入其他端口...</option>
+                            </select>
+                          ) : (
+                            <input
+                              type="text"
+                              value={formData.serialPort}
+                              onChange={(e) => {
+                                setFormData({ ...formData, serialPort: e.target.value });
+                                setFormError('');
+                              }}
+                              className="input-base flex-1 font-mono"
+                              placeholder={window.electronAPI?.platform === 'win32' ? '如 COM3 或 \\\\.\\COM12' : '如 /dev/cu.usbserial-1410'}
+                              required
+                            />
+                          )}
+                          {customSerialPortMode && usefulSerialPorts.length > 0 && (
+                            <button
+                              type="button"
+                              onClick={() => setCustomSerialPortMode(false)}
+                              className="px-2.5 py-2 text-xs bg-background-secondary hover:bg-background-tertiary border border-border rounded-lg text-text-secondary hover:text-text-primary transition-colors flex-shrink-0"
+                            >
+                              选择列表
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (customSerialPortMode) setCustomSerialPortMode(false);
+                              refreshSerialPorts(false);
+                            }}
+                            className="p-2 bg-background-secondary hover:bg-background-tertiary border border-border rounded-lg text-text-secondary hover:text-text-primary transition-colors flex-shrink-0"
+                            title="刷新检测本机串口列表"
+                          >
+                            <RefreshCw className={`w-4 h-4 ${loadingSerialPorts ? 'animate-spin text-primary' : ''}`} />
+                          </button>
+                        </div>
                       </div>
+                      {(usefulSerialPorts.length === 0 || systemSerialPortCount > 0) && (
+                        <div className="grid grid-cols-3 gap-3">
+                          <div />
+                          <div className="col-span-2 flex flex-wrap items-center justify-between gap-2 text-[11px] text-text-tertiary">
+                            {usefulSerialPorts.length === 0 && (
+                              <span className="text-amber-400/90">
+                                未检测到可用 USB/硬件串口，请插入设备后点击右侧刷新，或直接手动输入端口路径
+                              </span>
+                            )}
+                            {systemSerialPortCount > 0 && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const next = !showSystemSerialPorts;
+                                  setShowSystemSerialPorts(next);
+                                  if (!next && !editingSSH) {
+                                    const current = availableSerialPorts.find(p => p.portName === formData.serialPort);
+                                    if (current?.isSystem) {
+                                      const firstUseful = availableSerialPorts.find(p => !p.isSystem && p.portName);
+                                      setFormData(prev => ({ ...prev, serialPort: firstUseful ? firstUseful.portName : '' }));
+                                    }
+                                  }
+                                }}
+                                className="text-primary hover:underline ml-auto"
+                              >
+                                {showSystemSerialPorts ? '隐藏蓝牙/系统端口' : `显示蓝牙/系统端口 (${systemSerialPortCount})`}
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      )}
                     </div>
 
                     {/* 2. 波特率(B) */}
                     <div className="grid grid-cols-3 items-center gap-3">
                       <label className="text-sm font-medium text-text-secondary">波特率(B):</label>
                       <div className="col-span-2">
-                        <select
-                          value={formData.baudRate}
-                          onChange={(e) => setFormData({ ...formData, baudRate: e.target.value })}
-                          className="input-base font-mono"
-                        >
-                          {['4800', '9600', '19200', '38400', '57600', '115200', '230400', '460800', '921600', '1500000'].map(rate => (
-                            <option key={rate} value={rate}>{rate}</option>
-                          ))}
-                        </select>
+                        {!customBaudRateMode ? (
+                          <select
+                            value={formData.baudRate}
+                            onChange={(e) => {
+                              if (e.target.value === '__custom__') {
+                                setCustomBaudRateMode(true);
+                              } else {
+                                setFormData({ ...formData, baudRate: e.target.value });
+                                setFormError('');
+                              }
+                            }}
+                            className="input-base font-mono"
+                          >
+                            {PRESET_BAUD_RATES.map(rate => (
+                              <option key={rate} value={rate}>{rate}</option>
+                            ))}
+                            {formData.baudRate && !PRESET_BAUD_RATES.includes(formData.baudRate) && (
+                              <option value={formData.baudRate}>{formData.baudRate} (自定义)</option>
+                            )}
+                            <option value="__custom__">自定义波特率...</option>
+                          </select>
+                        ) : (
+                          <div className="flex items-center gap-2">
+                            <input
+                              type="number"
+                              min={1}
+                              step={1}
+                              value={formData.baudRate}
+                              onChange={(e) => {
+                                setFormData({ ...formData, baudRate: e.target.value });
+                                setFormError('');
+                              }}
+                              className="input-base flex-1 font-mono"
+                              placeholder="输入波特率，如 115200"
+                              required
+                            />
+                            <button
+                              type="button"
+                              onClick={() => setCustomBaudRateMode(false)}
+                              className="px-2.5 py-2 text-xs bg-background-secondary hover:bg-background-tertiary border border-border rounded-lg text-text-secondary hover:text-text-primary transition-colors flex-shrink-0"
+                            >
+                              预设列表
+                            </button>
+                          </div>
+                        )}
                       </div>
                     </div>
 
@@ -2060,8 +2303,16 @@ const SSHPage: React.FC = () => {
 
               </div>
               <div className="px-5 py-3 border-t border-border/50 flex-shrink-0 flex justify-end space-x-3 bg-background rounded-b-xl">
-                <button type="button" onClick={() => { setIsModalOpen(false); resetForm(); }} className="btn-secondary px-6">取消</button>
-                <button type="submit" className="btn-primary px-6">保存</button>
+                <button type="button" onClick={() => { setIsModalOpen(false); resetForm(); }} className="btn-secondary px-5">取消</button>
+                <button type="submit" className="btn-secondary px-5">保存</button>
+                <button
+                  type="button"
+                  onClick={() => { void saveConnection(true); }}
+                  className="btn-primary px-5 flex items-center space-x-1.5"
+                >
+                  <Play className="w-3.5 h-3.5" />
+                  <span>保存并连接</span>
+                </button>
               </div>
             </form>
           </div>

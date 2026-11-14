@@ -56,6 +56,7 @@ export interface SerialPortDevice {
   product?: string;
   vid?: number;
   pid?: number;
+  isSystem?: boolean;
 }
 
 export interface SSHInfo {

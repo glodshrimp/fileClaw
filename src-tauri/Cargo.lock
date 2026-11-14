@@ -974,6 +974,10 @@ name = "fileclaw-app"
 version = "0.2.9"
 dependencies = [
  "base64 0.21.7",
+ "core-foundation",
+ "core-foundation-sys",
+ "io-kit-sys",
+ "mach2",
  "portable-pty",
  "serde",
  "serde_json",
@@ -987,6 +991,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-plugin-shell",
  "tokio",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
