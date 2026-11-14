@@ -213,7 +213,7 @@ export const BranchesDialog: React.FC<BranchesDialogProps> = ({
 
   const [branches, setBranches] = useState<BranchItem[]>([]);
   const [tags, setTags] = useState<string[]>([]);
-  const [showTagsSection, setShowTagsSection] = useState(false);
+  const [showTagsSection, setShowTagsSection] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -701,43 +701,43 @@ export const BranchesDialog: React.FC<BranchesDialogProps> = ({
             )}
           </div>
         </div>
-      </ModalDialog>
 
-      {activePopover && (
-        <BranchActionPopover
-          anchorRect={activePopover.rect}
-          branch={activePopover.branch}
-          onClose={() => setActivePopover(null)}
-          onCheckout={() => handleCheckout(activePopover.branch.name)}
-          onMerge={() => handleMerge(activePopover.branch.name)}
-          onNewBranch={() =>
-            setNewBranchModal({
-              open: true,
-              base: activePopover.branch.name,
-              name: '',
-              checkout: true,
-              overwriteExisting: false,
-            })
-          }
-          onRename={() =>
-            setRenameModal({
-              open: true,
-              oldName: activePopover.branch.name,
-              newName: activePopover.branch.name,
-            })
-          }
-          onCreateTag={() =>
-            setTagModal({
-              open: true,
-              commit: activePopover.branch.name,
-              name: '',
-              message: '',
-              force: false,
-            })
-          }
-          onDelete={() => handleDeleteBranch(activePopover.branch.name)}
-        />
-      )}
+        {activePopover && (
+          <BranchActionPopover
+            anchorRect={activePopover.rect}
+            branch={activePopover.branch}
+            onClose={() => setActivePopover(null)}
+            onCheckout={() => handleCheckout(activePopover.branch.name)}
+            onMerge={() => handleMerge(activePopover.branch.name)}
+            onNewBranch={() =>
+              setNewBranchModal({
+                open: true,
+                base: activePopover.branch.name,
+                name: '',
+                checkout: true,
+                overwriteExisting: false,
+              })
+            }
+            onRename={() =>
+              setRenameModal({
+                open: true,
+                oldName: activePopover.branch.name,
+                newName: activePopover.branch.name,
+              })
+            }
+            onCreateTag={() =>
+              setTagModal({
+                open: true,
+                commit: activePopover.branch.name,
+                name: '',
+                message: '',
+                force: false,
+              })
+            }
+            onDelete={() => handleDeleteBranch(activePopover.branch.name)}
+          />
+        )}
+      </ModalDialog>
 
       {/* New Branch Sub-Modal */}
       <ModalDialog

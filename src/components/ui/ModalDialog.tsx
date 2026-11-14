@@ -1,4 +1,4 @@
-import React, { useEffect, useId, useRef } from 'react';
+import React, { useEffect, useId, useLayoutEffect, useRef } from 'react';
 import { create } from 'zustand';
 import { X, AlertTriangle, HelpCircle } from 'lucide-react';
 
@@ -44,8 +44,9 @@ export const ModalDialog: React.FC<ModalDialogProps> = ({
   const dialogRef = useRef<HTMLDialogElement>(null);
   const pointerDownOutsideRef = useRef(false);
   const titleId = useId();
+  const isFull = size === 'full';
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const dialog = dialogRef.current;
     if (!dialog) return;
 
@@ -93,10 +94,12 @@ export const ModalDialog: React.FC<ModalDialogProps> = ({
           onClose();
         }
       }}
-      className={`m-auto p-0 bg-card text-text-primary border border-border-primary rounded-xl shadow-2xl overflow-hidden max-h-[90vh] open:flex open:flex-col ${SIZE_CLASSES[size]} ${className}`}
+      className={`m-auto p-0 bg-card text-text-primary border border-border-primary rounded-xl shadow-2xl max-h-[90vh] ${
+        isFull ? 'open:flex open:flex-col overflow-hidden' : ''
+      } ${SIZE_CLASSES[size]} ${className}`}
     >
       {title !== undefined && (
-        <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-border-primary bg-background-secondary/70 flex-shrink-0 select-none">
+        <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-border-primary bg-background-secondary/70 rounded-t-xl flex-shrink-0 select-none">
           <div className="flex items-center gap-2.5 min-w-0">
             {icon && <span className="flex-shrink-0">{icon}</span>}
             <div className="min-w-0">
@@ -130,10 +133,18 @@ export const ModalDialog: React.FC<ModalDialogProps> = ({
         </div>
       )}
 
-      <div className={`flex-1 min-h-0 overflow-hidden ${bodyClassName}`}>{children}</div>
+      <div
+        className={
+          isFull
+            ? `flex-1 min-h-0 overflow-y-auto scrollbar-thin ${bodyClassName}`
+            : `max-h-[calc(88vh-7rem)] overflow-y-auto scrollbar-thin ${bodyClassName}`
+        }
+      >
+        {children}
+      </div>
 
       {footer && (
-        <div className="flex items-center justify-end gap-2 px-4 py-3 border-t border-border-primary bg-background-secondary/60 flex-shrink-0">
+        <div className="flex items-center justify-end gap-2 px-4 py-3 border-t border-border-primary bg-background-secondary/60 rounded-b-xl flex-shrink-0">
           {footer}
         </div>
       )}

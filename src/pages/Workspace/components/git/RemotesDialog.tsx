@@ -187,7 +187,7 @@ export const RemotesDialog: React.FC<RemotesDialogProps> = ({
         </button>
       }
     >
-      <div className="p-4 space-y-3 text-xs max-h-[65vh] overflow-y-auto scrollbar-thin">
+      <div className="p-4 space-y-3 text-xs">
         {Boolean(error) && <GitErrorBanner error={error} onDismiss={() => setError(null)} />}
 
         {fetchSummary && (

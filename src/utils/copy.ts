@@ -19,7 +19,10 @@ export const copyToClipboard = (text: string, e: React.MouseEvent | MouseEvent) 
     tip.style.left = `${x}px`;
     tip.style.top = `${y - 12}px`;
     tip.innerText = '已复制 ✓';
-    document.body.appendChild(tip);
+    const mountTarget =
+      ((e?.target as HTMLElement | null)?.closest?.('dialog[open]') as HTMLElement | null) ||
+      document.body;
+    mountTarget.appendChild(tip);
 
     // Force layout engine reflow to trigger animation
     tip.offsetHeight;
@@ -33,9 +36,7 @@ export const copyToClipboard = (text: string, e: React.MouseEvent | MouseEvent) 
       tip.style.opacity = '0';
       tip.style.transform = 'translate(-50%, -120%) scale(0.85)';
       setTimeout(() => {
-        if (tip.parentNode) {
-          document.body.removeChild(tip);
-        }
+        tip.remove();
       }, 300);
     }, 1000);
   }).catch((err) => {

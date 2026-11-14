@@ -464,7 +464,7 @@ export const PushDialog: React.FC<PushDialogProps> = ({
         </div>
       }
     >
-      <div className="flex flex-col h-[520px] max-h-[70vh] p-4 gap-3 overflow-hidden">
+      <div className="flex flex-col h-[520px] max-h-[68vh] p-4 gap-3 overflow-hidden">
         {Boolean(error) && <GitErrorBanner error={error} onDismiss={() => setError(null)} />}
 
         {/* Target Bar */}
@@ -522,7 +522,7 @@ export const PushDialog: React.FC<PushDialogProps> = ({
         {/* Dual Pane: Commits vs Changed Files */}
         <div className="flex-1 min-h-0 grid grid-cols-1 md:grid-cols-2 gap-3 overflow-hidden">
           {/* Left: Unpushed Commits */}
-          <div className="flex flex-col border border-border-primary rounded-lg overflow-hidden bg-background-secondary/35">
+          <div className="flex flex-col min-h-0 border border-border-primary rounded-lg overflow-hidden bg-background-secondary/35">
             <div className="px-3 py-2 bg-background-secondary border-b border-border-primary text-xs font-medium text-text-primary flex items-center justify-between">
               <span>待推送提交 ({commits.length})</span>
               <span className="text-[10px] text-text-tertiary">点击查看变更文件</span>
@@ -565,7 +565,7 @@ export const PushDialog: React.FC<PushDialogProps> = ({
           </div>
 
           {/* Right: Files in selected commit */}
-          <div className="flex flex-col border border-border-primary rounded-lg overflow-hidden bg-background-secondary/35">
+          <div className="flex flex-col min-h-0 border border-border-primary rounded-lg overflow-hidden bg-background-secondary/35">
             <div className="px-3 py-1.5 bg-background-secondary border-b border-border-primary text-xs font-medium text-text-primary flex items-center justify-between">
               <span>变更文件 ({commitFiles.length})</span>
               <div className="flex items-center gap-1">
