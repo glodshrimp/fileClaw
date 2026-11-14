@@ -345,6 +345,7 @@ const electronAPI: any = {
   selectDirectory: () => invoke('select_directory'),
   selectFiles: () => invoke('select_files'),
   openDirectory: (path: string) => invoke('open_directory', { dirPath: path }),
+  revealInFolder: (path: string) => invoke('reveal_in_folder', { path }),
   openPath: (path: string) => invoke('open_directory', { dirPath: path }),
   executeBashCommand: (command: string, cwd?: string) => invoke('execute_bash_command', { command, cwd }),
   openExternal: (url: string) => invoke('opener_open_url', { url }), // Use tauri-plugin-opener standard command
@@ -804,32 +805,58 @@ const electronAPI: any = {
   gitInit: (repoPath: string) => invoke('git_init', { repoPath }),
   gitDiscoverRoots: (workspacePath: string) => invoke('git_discover_roots', { workspacePath }),
   gitUnstage: (repoPath: string, filePath: string) => invoke('git_unstage', { repoPath, filePath }),
-  gitCreateBranch: (repoPath: string, name: string, base: string | null, checkout: boolean) => invoke('git_create_branch', { repoPath, name, base, checkout }),
+  gitUnstageFiles: (repoPath: string, files: string[]) => invoke('git_unstage_files', { repoPath, files }),
+  gitCreateBranch: (repoPath: string, name: string, base: string | null, checkout: boolean, force?: boolean) =>
+    invoke('git_create_branch', { repoPath, name, base, checkout, force: force ?? null }),
   gitDeleteBranch: (repoPath: string, name: string, force: boolean) => invoke('git_delete_branch', { repoPath, name, force }),
   gitRenameBranch: (repoPath: string, oldName: string, newName: string) => invoke('git_rename_branch', { repoPath, oldName, newName }),
-  gitCreateTag: (repoPath: string, tagName: string, commit: string | null, message: string | null, force: boolean) => invoke('git_create_tag', { repoPath, tagName, commit, message, force }),
+  gitMergeBranch: (repoPath: string, branch: string) => invoke('git_merge_branch', { repoPath, branch }),
+  gitCreateTag: (repoPath: string, tagName: string, commit: string | null, message: string | null, force: boolean) =>
+    invoke('git_create_tag', { repoPath, tagName, commit, message, force }),
+  gitTags: (repoPath: string) => invoke('git_tags', { repoPath }),
+  gitDeleteTag: (repoPath: string, tagName: string) => invoke('git_delete_tag', { repoPath, tagName }),
   gitStatus: (repoPath: string) => invoke('git_status', { repoPath }),
   gitCurrentBranch: (repoPath: string) => invoke('git_current_branch', { repoPath }),
   gitBranches: (repoPath: string) => invoke('git_branches', { repoPath }),
   gitCheckout: (repoPath: string, branch: string) => invoke('git_checkout', { repoPath, branch }),
   gitAdd: (repoPath: string, filePath: string) => invoke('git_add', { repoPath, filePath }),
+  gitAddFiles: (repoPath: string, files: string[]) => invoke('git_add_files', { repoPath, files }),
   gitRestore: (repoPath: string, filePath: string) => invoke('git_restore', { repoPath, filePath }),
+  gitRestoreFiles: (repoPath: string, files: string[]) => invoke('git_restore_files', { repoPath, files }),
   gitCommit: (repoPath: string, files: string[], message: string) => invoke('git_commit', { repoPath, files, message }),
-  gitPush: (repoPath: string, remote: string, branch: string, force: boolean) => invoke('git_push', { repoPath, remote, branch, force }),
+  gitPush: (repoPath: string, remote: string, branch: string, force: boolean, pushTags?: boolean, setUpstream?: boolean) =>
+    invoke('git_push', {
+      repoPath,
+      remote,
+      branch,
+      force,
+      pushTags: pushTags ?? null,
+      setUpstream: setUpstream ?? null,
+    }),
   gitPull: (repoPath: string, remote: string, branch: string, rebase: boolean) => invoke('git_pull', { repoPath, remote, branch, rebase }),
   gitFetch: (repoPath: string) => invoke('git_fetch', { repoPath }),
   gitRemotes: (repoPath: string) => invoke('git_remotes', { repoPath }),
   gitSetRemoteUrl: (repoPath: string, name: string, url: string) => invoke('git_set_remote_url', { repoPath, name, url }),
   gitAddRemote: (repoPath: string, name: string, url: string) => invoke('git_add_remote', { repoPath, name, url }),
-  gitHistory: (repoPath: string, filePath?: string) => invoke('git_history', { repoPath, filePath }),
-  gitLogGraph: (repoPath: string) => invoke('git_log_graph', { repoPath }),
+  gitRemoveRemote: (repoPath: string, name: string) => invoke('git_remove_remote', { repoPath, name }),
+  gitHistory: (repoPath: string, filePath?: string, limit?: number, skip?: number) =>
+    invoke('git_history', { repoPath, filePath: filePath ?? null, limit: limit ?? null, skip: skip ?? null }),
+  gitLogGraph: (repoPath: string, branch?: string, limit?: number, skip?: number) =>
+    invoke('git_log_graph', { repoPath, branch: branch ?? null, limit: limit ?? null, skip: skip ?? null }),
   gitUnpushedCommits: (repoPath: string, remote: string, branch: string) => invoke('git_unpushed_commits', { repoPath, remote, branch }),
   gitCommitFiles: (repoPath: string, hash: string) => invoke('git_commit_files', { repoPath, hash }),
   gitShowFile: (repoPath: string, hash: string, filePath: string) => invoke('git_show_file', { repoPath, hash, filePath }),
-  gitStashPush: (repoPath: string, message?: string) => invoke('git_stash_push', { repoPath, message }),
+  gitStashPush: (repoPath: string, message?: string, includeUntracked?: boolean) =>
+    invoke('git_stash_push', { repoPath, message: message ?? null, includeUntracked: includeUntracked ?? null }),
   gitStashList: (repoPath: string) => invoke('git_stash_list', { repoPath }),
   gitStashPop: (repoPath: string, index: number) => invoke('git_stash_pop', { repoPath, index }),
-  gitRefreshStatus: (workspacePath: string, gitRoots: string[] | null, activeTabPath: string | null) => 
+  gitStashApply: (repoPath: string, index: number) => invoke('git_stash_apply', { repoPath, index }),
+  gitStashDrop: (repoPath: string, index: number) => invoke('git_stash_drop', { repoPath, index }),
+  gitStashFiles: (repoPath: string, index: number) => invoke('git_stash_files', { repoPath, index }),
+  gitCherryPick: (repoPath: string, hash: string) => invoke('git_cherry_pick', { repoPath, hash }),
+  gitRevertCommit: (repoPath: string, hash: string) => invoke('git_revert_commit', { repoPath, hash }),
+  gitReset: (repoPath: string, target: string, mode: 'soft' | 'mixed' | 'hard') => invoke('git_reset', { repoPath, target, mode }),
+  gitRefreshStatus: (workspacePath: string, gitRoots: string[] | null, activeTabPath: string | null) =>
     invoke('git_refresh_status', { workspacePath, gitRoots, activeTabPath }),
 
 

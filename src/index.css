@@ -1,6 +1,7 @@
 @import "tailwindcss";
 
 :root {
+  color-scheme: light;
   --background: #FFFFFF;
   --background-secondary: #F8FAFC;
   --background-tertiary: #F1F5F9;
@@ -17,6 +18,7 @@
 }
 
 .dark {
+  color-scheme: dark;
   --background: #0F172A;
   --background-secondary: #1E293B;
   --background-tertiary: #334155;
@@ -246,5 +248,16 @@
     background: linear-gradient(135deg, rgba(239, 68, 68, 0.15), rgba(239, 68, 68, 0.04));
     color: #EF4444;
   }
+}
+
+/* Native <dialog> modal scrolling & backdrop safety (never set display unconditionally) */
+dialog:modal {
+  overscroll-behavior: contain;
+}
+
+dialog::backdrop {
+  overscroll-behavior: contain;
+  background: rgb(15 23 42 / 0.55);
+  backdrop-filter: blur(2px);
 }
 

@@ -36,6 +36,17 @@ interface TabContextMenuProps {
 
 const TabContextMenu: React.FC<TabContextMenuProps> = ({ x, y, items, onClose }) => {
   const ref = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = React.useState({ left: x, top: y });
+
+  React.useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const pad = 8;
+    const left = Math.max(pad, Math.min(x, window.innerWidth - rect.width - pad));
+    const top = Math.max(pad, Math.min(y, window.innerHeight - rect.height - pad));
+    setPos({ left, top });
+  }, [x, y, items.length]);
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -43,31 +54,44 @@ const TabContextMenu: React.FC<TabContextMenuProps> = ({ x, y, items, onClose })
         onClose();
       }
     };
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        onClose();
+      }
+    };
     document.addEventListener('mousedown', handleClickOutside, true);
-    return () => document.removeEventListener('mousedown', handleClickOutside, true);
+    document.addEventListener('keydown', handleKeyDown, true);
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside, true);
+      document.removeEventListener('keydown', handleKeyDown, true);
+    };
   }, [onClose]);
 
   return (
     <div
       ref={ref}
-      className="fixed z-[9999] bg-[#151b26] rounded-xl shadow-2xl border border-white/10 py-1.5 min-w-[180px] select-none"
-      style={{ left: x, top: y }}
+      role="menu"
+      className="fixed z-[9999] bg-card text-text-primary rounded-xl shadow-2xl border border-border-primary py-1.5 min-w-[180px] select-none"
+      style={{ left: pos.left, top: pos.top }}
     >
       {items.map((it, i) =>
         it.divider ? (
-          <div key={i} className="my-1 border-t border-white/5" />
+          <hr key={i} className="my-1 border-0 border-t border-border-primary" />
         ) : (
           <button
             key={i}
+            type="button"
+            role="menuitem"
             onClick={(e) => {
               e.stopPropagation();
               it.onClick?.(e);
               onClose();
             }}
-            className={`w-full text-left px-4 py-1.5 text-xs transition-colors ${
+            className={`w-full text-left px-3.5 py-1.5 text-xs transition-colors cursor-pointer ${
               it.danger
-                ? 'text-[#f87171] hover:bg-[#ef4444]/10'
-                : 'text-slate-200 hover:bg-white/5'
+                ? 'text-functional-error hover:bg-functional-error/10'
+                : 'text-text-primary hover:bg-background-tertiary'
             }`}
           >
             {it.label}

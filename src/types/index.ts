@@ -265,31 +265,44 @@ declare global {
       gitInit: (repoPath: string) => Promise<void>;
       gitDiscoverRoots: (workspacePath: string) => Promise<string[]>;
       gitUnstage: (repoPath: string, filePath: string) => Promise<void>;
-      gitCreateBranch: (repoPath: string, name: string, base: string | null, checkout: boolean) => Promise<void>;
+      gitUnstageFiles: (repoPath: string, files: string[]) => Promise<void>;
+      gitCreateBranch: (repoPath: string, name: string, base: string | null, checkout: boolean, force?: boolean) => Promise<void>;
       gitDeleteBranch: (repoPath: string, name: string, force: boolean) => Promise<void>;
       gitRenameBranch: (repoPath: string, oldName: string, newName: string) => Promise<void>;
+      gitMergeBranch: (repoPath: string, branch: string) => Promise<string>;
       gitCreateTag: (repoPath: string, tagName: string, commit: string | null, message: string | null, force: boolean) => Promise<void>;
+      gitTags: (repoPath: string) => Promise<string[]>;
+      gitDeleteTag: (repoPath: string, tagName: string) => Promise<void>;
       gitStatus: (repoPath: string) => Promise<Record<string, string>>;
       gitCurrentBranch: (repoPath: string) => Promise<string>;
       gitBranches: (repoPath: string) => Promise<{ name: string; is_remote: boolean; is_current: boolean }[]>;
       gitCheckout: (repoPath: string, branch: string) => Promise<void>;
       gitAdd: (repoPath: string, filePath: string) => Promise<void>;
+      gitAddFiles: (repoPath: string, files: string[]) => Promise<void>;
       gitRestore: (repoPath: string, filePath: string) => Promise<void>;
+      gitRestoreFiles: (repoPath: string, files: string[]) => Promise<void>;
       gitCommit: (repoPath: string, files: string[], message: string) => Promise<void>;
-      gitPush: (repoPath: string, remote: string, branch: string, force: boolean) => Promise<void>;
-      gitPull: (repoPath: string, remote: string, branch: string, rebase: boolean) => Promise<void>;
-      gitFetch: (repoPath: string) => Promise<void>;
+      gitPush: (repoPath: string, remote: string, branch: string, force: boolean, pushTags?: boolean, setUpstream?: boolean) => Promise<string>;
+      gitPull: (repoPath: string, remote: string, branch: string, rebase: boolean) => Promise<string>;
+      gitFetch: (repoPath: string) => Promise<string>;
       gitRemotes: (repoPath: string) => Promise<Array<[string, string]>>;
       gitSetRemoteUrl: (repoPath: string, name: string, url: string) => Promise<void>;
       gitAddRemote: (repoPath: string, name: string, url: string) => Promise<void>;
-      gitHistory: (repoPath: string, filePath?: string) => Promise<any[]>;
-      gitLogGraph: (repoPath: string) => Promise<any[]>;
+      gitRemoveRemote: (repoPath: string, name: string) => Promise<void>;
+      gitHistory: (repoPath: string, filePath?: string, limit?: number, skip?: number) => Promise<{ hash: string; author: string; date: string; message: string }[]>;
+      gitLogGraph: (repoPath: string, branch?: string, limit?: number, skip?: number) => Promise<any[]>;
       gitUnpushedCommits: (repoPath: string, remote: string, branch: string) => Promise<{ hash: string; author: string; date: string; message: string }[]>;
-      gitCommitFiles: (repoPath: string, hash: string) => Promise<{ path: string; status: string }[]>;
+      gitCommitFiles: (repoPath: string, hash: string) => Promise<{ path: string; status: string; oldPath?: string }[]>;
       gitShowFile: (repoPath: string, hash: string, filePath: string) => Promise<string>;
-      gitStashPush: (repoPath: string, message?: string) => Promise<void>;
+      gitStashPush: (repoPath: string, message?: string, includeUntracked?: boolean) => Promise<void>;
       gitStashList: (repoPath: string) => Promise<string[]>;
       gitStashPop: (repoPath: string, index: number) => Promise<void>;
+      gitStashApply: (repoPath: string, index: number) => Promise<void>;
+      gitStashDrop: (repoPath: string, index: number) => Promise<void>;
+      gitStashFiles: (repoPath: string, index: number) => Promise<{ path: string; status: string; oldPath?: string }[]>;
+      gitCherryPick: (repoPath: string, hash: string) => Promise<string>;
+      gitRevertCommit: (repoPath: string, hash: string) => Promise<string>;
+      gitReset: (repoPath: string, target: string, mode: 'soft' | 'mixed' | 'hard') => Promise<void>;
       gitRefreshStatus: (
         workspacePath: string,
         gitRoots: string[] | null,
@@ -300,6 +313,7 @@ declare global {
         gitRepoBranches: Record<string, string>;
         gitFileStatuses: Record<string, string>;
         gitDirtyFolders: Record<string, { modified: boolean; added: boolean; untracked: boolean; notAdded: boolean }>;
+        gitAheadBehind?: Record<string, [number, number]>;
       }>;
 
 
@@ -348,6 +362,7 @@ declare global {
       saveChatSession: (session: any) => Promise<boolean>;
       deleteChatSession: (id: string) => Promise<boolean>;
       openDirectory: (path: string) => Promise<void>;
+      revealInFolder: (path: string) => Promise<void>;
       openPath: (path: string) => Promise<void>;
       executeBashCommand: (command: string, cwd?: string) => Promise<string>;
       openExternal: (url: string) => Promise<void>;

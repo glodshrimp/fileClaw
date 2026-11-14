@@ -4,8 +4,9 @@ import { useApp } from '../../contexts/AppContext';
 import { useWorkspaceStore } from '../../contexts/useWorkspaceStore';
 import { FileExplorer } from './components/FileExplorer';
 import { CodeEditor } from './components/CodeEditor';
-import { ArrowLeft, PanelLeftClose, GitBranch } from 'lucide-react';
+import { ArrowLeft, PanelLeftClose, GitBranch, GitCommit, Loader2 } from 'lucide-react';
 import { BranchesDialog } from './components/git/BranchesDialog';
+import { findGitRootForPath, getBasename, getRelativePathInRepo } from '../../utils/path';
 import ChatPage from '../ChatPage';
 
 const WorkspacePage: React.FC = () => {
@@ -22,24 +23,28 @@ const WorkspacePage: React.FC = () => {
   const gitBranch = useWorkspaceStore((s) => s.gitBranch);
   const gitRoots = useWorkspaceStore((s) => s.gitRoots);
   const gitRepoBranches = useWorkspaceStore((s) => s.gitRepoBranches);
+  const gitAheadBehind = useWorkspaceStore((s) => s.gitAheadBehind);
+  const gitSyncLabel = useWorkspaceStore((s) => s.gitSyncLabel);
+  const openGitGraph = useWorkspaceStore((s) => s.openGitGraph);
+  const openTabs = useWorkspaceStore((s) => s.openTabs);
   const [showBranchModal, setShowBranchModal] = React.useState(false);
   const showAiSidebar = useWorkspaceStore((s) => s.isAiSidebarOpen);
   const setShowAiSidebar = useWorkspaceStore((s) => s.setAiSidebarOpen);
   const [aiSidebarWidth, setAiSidebarWidth] = React.useState(400);
 
+  const activeRepoRoot = React.useMemo(() => {
+    if (gitRoots.length === 0) return null;
+    return findGitRootForPath(activeTabPath, gitRoots, gitRoots[0]);
+  }, [gitRoots, activeTabPath]);
+
   const branchLabel = React.useMemo(() => {
     if (!gitBranch || gitRoots.length === 0) return null;
-    let activeRoot = gitRoots[0];
-    if (activeTabPath) {
-      const sorted = [...gitRoots].sort((a, b) => b.length - a.length);
-      const matched = sorted.find(r => activeTabPath.startsWith(r));
-      if (matched) activeRoot = matched;
-    }
-    const isWindows = activeRoot.includes('\\') || (!activeRoot.startsWith('/') && activeRoot.includes(':'));
-    const sep = isWindows ? '\\' : '/';
-    const folderName = activeRoot.substring(activeRoot.lastIndexOf(sep) + 1) || activeRoot;
-    return `${folderName}: ${gitBranch}`;
-  }, [gitBranch, gitRoots, gitRepoBranches, activeTabPath]);
+    const activeRoot = activeRepoRoot || gitRoots[0];
+    const folderName = getBasename(activeRoot) || activeRoot;
+    const ab = gitAheadBehind[activeRoot];
+    const abText = ab && (ab[0] > 0 || ab[1] > 0) ? ` ${ab[0] > 0 ? `↑${ab[0]}` : ''}${ab[1] > 0 ? ` ↓${ab[1]}` : ''}`.trimEnd() : '';
+    return `${folderName}: ${gitBranch}${abText ? ` (${abText.trim()})` : ''}`;
+  }, [gitBranch, gitRoots, gitRepoBranches, gitAheadBehind, activeRepoRoot]);
 
   const handleMouseDown = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -155,28 +160,38 @@ const WorkspacePage: React.FC = () => {
 
   // Generate breadcrumbs segments matching the reference image layout
   const getBreadcrumbs = () => {
-    const rootFolder = rootPath.split(/[\/\\]/).filter(Boolean).pop() || currentProject.name;
+    const rootFolder = getBasename(rootPath) || currentProject.name;
     if (!activeTabPath) {
       return ['Home', rootFolder];
     }
-    
-    let relPath = activeTabPath.substring(rootPath.length);
-    if (relPath.startsWith('/') || relPath.startsWith('\\')) {
-      relPath = relPath.substring(1);
+
+    if (activeTabPath === 'git-graph') {
+      return ['Home', rootFolder, 'Git 提交图谱'];
     }
-    
+
+    if (activeTabPath.startsWith('diff://')) {
+      const activeTab = openTabs.find((t) => t.path === activeTabPath);
+      return ['Home', rootFolder, '差异对比', activeTab?.name || 'Diff'];
+    }
+
+    if (activeTabPath.startsWith('preview://')) {
+      const srcPath = activeTabPath.slice('preview://'.length);
+      const rel = getRelativePathInRepo(srcPath, rootPath);
+      const relSegments = rel ? rel.split('/').filter(Boolean) : [getBasename(srcPath)];
+      return ['Home', rootFolder, ...relSegments, 'Markdown 预览'];
+    }
+
     // Ignore terminal tab IDs
     if (activeTabPath.startsWith('terminal-')) {
       const parts = activeTabPath.split('-');
-      // terminal-path-timestamp: parts[1] is the working directory of terminal
       const termPath = parts[1] || rootPath;
-      const termRelPath = termPath.substring(rootPath.length);
-      const termRelClean = (termRelPath.startsWith('/') || termRelPath.startsWith('\\')) ? termRelPath.substring(1) : termRelPath;
-      const relSegments = termRelClean.split(/[\/\\]/).filter(Boolean);
+      const termRel = getRelativePathInRepo(termPath, rootPath);
+      const relSegments = termRel ? termRel.split('/').filter(Boolean) : [];
       return ['Home', rootFolder, ...relSegments, 'Terminal'];
     }
 
-    const relSegments = relPath.split(/[\/\\]/).filter(Boolean);
+    const relPath = getRelativePathInRepo(activeTabPath, rootPath);
+    const relSegments = relPath ? relPath.split('/').filter(Boolean) : [getBasename(activeTabPath)];
     return ['Home', rootFolder, ...relSegments];
   };
 
@@ -256,13 +271,33 @@ const WorkspacePage: React.FC = () => {
             ))}
           </div>
 
-          {/* Right side: Branch Widget + Open AI Agent shortcut */}
-          <div className="flex items-center space-x-2.5 flex-shrink-0">
+          {/* Right side: Sync Status + Graph + Branch Widget + Open AI Agent shortcut */}
+          <div className="flex items-center space-x-2 flex-shrink-0">
+            {gitSyncLabel && (
+              <div className="flex items-center space-x-1.5 px-2.5 py-1 rounded-full bg-primary/10 border border-primary/25 text-primary text-[10px] font-medium">
+                <Loader2 className="w-3 h-3 animate-spin" />
+                <span>{gitSyncLabel}</span>
+              </div>
+            )}
+
+            {gitRoots.length > 0 && (
+              <button
+                type="button"
+                onClick={() => openGitGraph(activeRepoRoot || gitRoots[0])}
+                className="flex items-center space-x-1.5 px-2.5 py-1 bg-background-primary border border-border-primary hover:border-text-secondary rounded-full hover:bg-background-tertiary text-text-secondary hover:text-text-primary transition-all duration-150 font-medium text-[10px] cursor-pointer shadow-sm"
+                title="打开 Git 提交图谱 (Log)"
+              >
+                <GitCommit className="w-3 h-3 text-emerald-500" />
+                <span>Git 图谱</span>
+              </button>
+            )}
+
             {branchLabel && (
               <button
+                type="button"
                 onClick={() => setShowBranchModal(true)}
-                className="flex items-center space-x-1.5 px-3 py-1 bg-background-primary border border-border-primary hover:border-text-secondary rounded-full hover:bg-background-tertiary text-text-secondary hover:text-text-primary transition-all duration-150 font-semibold text-[10px] cursor-pointer shadow-lg shadow-black/5 font-mono"
-                title="切换 Git 分支"
+                className="flex items-center space-x-1.5 px-3 py-1 bg-background-primary border border-border-primary hover:border-text-secondary rounded-full hover:bg-background-tertiary text-text-secondary hover:text-text-primary transition-all duration-150 font-semibold text-[10px] cursor-pointer shadow-sm font-mono"
+                title="管理 / 切换 Git 分支与标签"
               >
                 <GitBranch className="w-3 h-3 text-primary" />
                 <span>{branchLabel}</span>
@@ -308,6 +343,7 @@ const WorkspacePage: React.FC = () => {
 
       {showBranchModal && (
         <BranchesDialog
+          projectPath={activeRepoRoot || rootPath}
           path={activeTabPath || rootPath}
           onClose={() => setShowBranchModal(false)}
         />

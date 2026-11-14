@@ -1,6 +1,12 @@
 import { create } from 'zustand';
 import { Project } from '../types';
-import { getProjectRootPath, normalizePath } from '../utils/path';
+import {
+  findGitRootForPath,
+  getProjectRootPath,
+  getRelativePathInRepo,
+  isPathEqualOrInside,
+  normalizePath,
+} from '../utils/path';
 
 export interface OpenFileTab {
   path: string;
@@ -27,8 +33,7 @@ let refreshGitTimeout: ReturnType<typeof setTimeout> | null = null;
 const getBranchForPath = (path: string | null, roots: string[], repoBranches: Record<string, string>): string | null => {
   if (roots.length === 0) return null;
   if (!path) return repoBranches[roots[0]] || 'HEAD';
-  const sortedRoots = [...roots].sort((a, b) => b.length - a.length);
-  const matched = sortedRoots.find(r => path.startsWith(r));
+  const matched = findGitRootForPath(path, roots);
   return matched ? repoBranches[matched] || 'HEAD' : (repoBranches[roots[0]] || 'HEAD');
 };
 
@@ -50,6 +55,11 @@ interface WorkspaceState {
   gitRepoBranches: Record<string, string>;
   gitFileStatuses: Record<string, string>; // absolutePath -> status XY
   gitDirtyFolders: Record<string, { modified: boolean; added: boolean; untracked: boolean; notAdded: boolean }>;
+  gitAheadBehind: Record<string, [number, number]>;
+  gitGraphRepoPath: string | null;
+  gitSyncLabel: string | null;
+  setGitSyncLabel: (label: string | null) => void;
+  setGitGraphRepoPath: (repoPath: string | null) => void;
 
   // Actions
   setCurrentProject: (project: Project | null) => void;
@@ -71,7 +81,7 @@ interface WorkspaceState {
     originalLabel: string, 
     modifiedLabel: string
   ) => void;
-  openGitGraph: () => void;
+  openGitGraph: (repoPath?: string) => void;
   openMarkdownPreview: (sourcePath: string, name: string) => void;
   closeOthers: (path: string) => void;
   closeLeft: (path: string) => void;
@@ -80,13 +90,16 @@ interface WorkspaceState {
   renameNode: (oldPath: string, newPath: string) => Promise<void>;
   
   // Git Actions
-  refreshGitStatus: () => Promise<void>;
-  runGitCheckout: (branch: string) => Promise<void>;
-  runGitAdd: (filePath: string) => Promise<void>;
+  refreshGitStatus: (forceRediscover?: boolean) => Promise<void>;
+  syncWorkspaceAfterGitChange: (options?: { rediscoverRoots?: boolean }) => Promise<void>;
+  runGitCheckout: (branch: string, repoPath?: string) => Promise<void>;
+  runGitAdd: (filePaths: string | string[]) => Promise<void>;
+  runGitUnstage: (filePaths: string | string[]) => Promise<void>;
   runGitRestore: (filePath: string) => Promise<void>;
-  runGitInit: () => Promise<void>;
+  runGitInit: (targetDir?: string) => Promise<void>;
 
   fileExplorerRefreshKey: number;
+  fileExplorerClearCacheKey: number;
   refreshFileExplorer: () => void;
 
   copiedFilePath: string | null;
@@ -141,8 +154,14 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   gitRepoBranches: {},
   gitFileStatuses: {},
   gitDirtyFolders: {},
+  gitAheadBehind: {},
+  gitGraphRepoPath: null,
+  gitSyncLabel: null,
+  setGitSyncLabel: (label) => set({ gitSyncLabel: label }),
+  setGitGraphRepoPath: (repoPath) => set({ gitGraphRepoPath: repoPath }),
 
   fileExplorerRefreshKey: 0,
+  fileExplorerClearCacheKey: 0,
   refreshFileExplorer: () => set((state) => ({ fileExplorerRefreshKey: (state.fileExplorerRefreshKey || 0) + 1 })),
 
   setCurrentProject: (project) => {
@@ -158,6 +177,9 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       gitRepoBranches: {},
       gitFileStatuses: {},
       gitDirtyFolders: {},
+      gitAheadBehind: {},
+      gitGraphRepoPath: null,
+      gitSyncLabel: null,
     });
     if (project) {
       const refresh = () => get().refreshGitStatus();
@@ -351,13 +373,22 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     }));
   },
 
-  openGitGraph: () => {
-    const { openTabs } = get();
+  openGitGraph: (repoPath?: string) => {
+    const { openTabs, activeTabPath, gitRoots, currentProject, gitGraphRepoPath } = get();
+    const fallbackRoot = currentProject ? getProjectRootPath(currentProject) : '';
+    const resolvedRepo =
+      repoPath && gitRoots.includes(repoPath)
+        ? repoPath
+        : findGitRootForPath(repoPath || activeTabPath, gitRoots, gitGraphRepoPath || fallbackRoot);
+
     const tabId = 'git-graph';
     const existingTab = openTabs.find((t) => t.path === tabId);
-    
+
     if (existingTab) {
-      set({ activeTabPath: tabId });
+      set({
+        activeTabPath: tabId,
+        gitGraphRepoPath: resolvedRepo || gitGraphRepoPath || null,
+      });
       return;
     }
 
@@ -366,12 +397,13 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       name: 'Git Graph',
       content: '',
       isDirty: false,
-      isGitGraph: true
+      isGitGraph: true,
     };
 
     set((state) => ({
       openTabs: [...state.openTabs, newTab],
-      activeTabPath: tabId
+      activeTabPath: tabId,
+      gitGraphRepoPath: resolvedRepo || state.gitGraphRepoPath || null,
     }));
   },
 
@@ -446,14 +478,14 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     }));
   },
 
-  refreshGitStatus: async () => {
+  refreshGitStatus: async (forceRediscover = false) => {
     if (refreshGitTimeout) {
       clearTimeout(refreshGitTimeout);
     }
-    return new Promise((resolve) => {
+    return new Promise<void>((resolve) => {
       refreshGitTimeout = setTimeout(async () => {
         refreshGitTimeout = null;
-        const { currentProject, activeTabPath, gitRoots } = get();
+        const { currentProject, activeTabPath, gitRoots, gitGraphRepoPath } = get();
         if (!currentProject) {
           resolve();
           return;
@@ -463,25 +495,34 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         try {
           const result = await window.electronAPI.gitRefreshStatus(
             projectPath,
-            gitRoots.length > 0 ? gitRoots : null,
+            !forceRediscover && gitRoots.length > 0 ? gitRoots : null,
             activeTabPath
           );
 
+          const nextRoots = result.gitRoots || [];
+          const nextGraphRepo =
+            gitGraphRepoPath && nextRoots.includes(gitGraphRepoPath)
+              ? gitGraphRepoPath
+              : nextRoots[0] || null;
+
           set({
-            gitBranch: result.gitBranch || 'HEAD',
-            gitRoots: result.gitRoots,
-            gitRepoBranches: result.gitRepoBranches,
-            gitFileStatuses: result.gitFileStatuses,
-            gitDirtyFolders: result.gitDirtyFolders,
+            gitBranch: result.gitBranch ?? (nextRoots.length > 0 ? 'HEAD' : null),
+            gitRoots: nextRoots,
+            gitRepoBranches: result.gitRepoBranches || {},
+            gitFileStatuses: result.gitFileStatuses || {},
+            gitDirtyFolders: result.gitDirtyFolders || {},
+            gitAheadBehind: result.gitAheadBehind || {},
+            gitGraphRepoPath: nextGraphRepo,
           });
         } catch (err) {
-          console.error("Failed to refresh git status:", err);
+          console.error('Failed to refresh git status:', err);
           set({
             gitBranch: null,
             gitRoots: [],
             gitRepoBranches: {},
             gitFileStatuses: {},
-            gitDirtyFolders: {}
+            gitDirtyFolders: {},
+            gitAheadBehind: {},
           });
         }
         resolve();
@@ -489,53 +530,132 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     });
   },
 
-  runGitCheckout: async (branch: string) => {
-    const { currentProject, activeTabPath, gitRoots, refreshGitStatus } = get();
+  syncWorkspaceAfterGitChange: async (options) => {
+    set((state) => ({
+      fileExplorerClearCacheKey: (state.fileExplorerClearCacheKey || 0) + 1,
+    }));
+
+    await get().refreshGitStatus(Boolean(options?.rediscoverRoots));
+
+    const { openTabs } = get();
+    const regularTabs = openTabs.filter(
+      (t) => !t.isGitGraph && !t.isDiff && !t.isTerminal && !t.isMarkdownPreview && !t.unsupported
+    );
+    if (regularTabs.length === 0) return;
+
+    const deletedPaths = new Set<string>();
+    const updatedContents = new Map<string, { content: string; size?: number }>();
+
+    await Promise.all(
+      regularTabs.map(async (tab) => {
+        try {
+          const stat = await window.electronAPI.localStat(tab.path);
+          if (!tab.isDirty) {
+            const res = await window.electronAPI.readFileBase64(tab.path);
+            if (res && typeof res.data === 'string' && res.data !== tab.content) {
+              updatedContents.set(tab.path, { content: res.data, size: stat.size });
+            }
+          }
+        } catch {
+          if (!tab.isDirty) {
+            deletedPaths.add(tab.path);
+          }
+        }
+      })
+    );
+
+    if (deletedPaths.size === 0 && updatedContents.size === 0) return;
+
+    set((state) => {
+      const nextTabs = state.openTabs
+        .filter((t) => !deletedPaths.has(t.path))
+        .map((t) => {
+          const upd = updatedContents.get(t.path);
+          return upd ? { ...t, content: upd.content, size: upd.size ?? t.size, isDirty: false } : t;
+        });
+
+      let nextActive = state.activeTabPath;
+      if (nextActive && deletedPaths.has(nextActive)) {
+        nextActive = nextTabs.length > 0 ? nextTabs[nextTabs.length - 1].path : null;
+      }
+
+      return {
+        openTabs: nextTabs,
+        activeTabPath: nextActive,
+        gitBranch: getBranchForPath(nextActive, state.gitRoots, state.gitRepoBranches),
+      };
+    });
+  },
+
+  runGitCheckout: async (branch: string, repoPath?: string) => {
+    const { currentProject, activeTabPath, gitRoots, syncWorkspaceAfterGitChange } = get();
     if (!currentProject) return;
-    let targetRoot = currentProject.codePath || currentProject.path;
-    if (activeTabPath && gitRoots.length > 0) {
-      const sorted = [...gitRoots].sort((a, b) => b.length - a.length);
-      const matched = sorted.find(r => activeTabPath.startsWith(r));
-      if (matched) targetRoot = matched;
-    }
+    const fallback = currentProject.codePath || currentProject.path;
+    const targetRoot = findGitRootForPath(repoPath || activeTabPath, gitRoots, fallback);
     await window.electronAPI.gitCheckout(targetRoot, branch);
+    await syncWorkspaceAfterGitChange();
+  },
+
+  runGitAdd: async (filePaths: string | string[]) => {
+    const { currentProject, gitRoots, refreshGitStatus } = get();
+    if (!currentProject) return;
+    const fallback = currentProject.codePath || currentProject.path;
+    const list = Array.isArray(filePaths) ? filePaths : [filePaths];
+    const grouped = new Map<string, string[]>();
+
+    for (const absPath of list) {
+      const root = findGitRootForPath(absPath, gitRoots, fallback);
+      if (!isPathEqualOrInside(absPath, root)) continue;
+      const rel = getRelativePathInRepo(absPath, root) || '.';
+      const arr = grouped.get(root) || [];
+      arr.push(rel);
+      grouped.set(root, arr);
+    }
+
+    for (const [root, rels] of grouped.entries()) {
+      await window.electronAPI.gitAddFiles(root, rels);
+    }
     await refreshGitStatus();
   },
 
-  runGitAdd: async (filePath: string) => {
+  runGitUnstage: async (filePaths: string | string[]) => {
     const { currentProject, gitRoots, refreshGitStatus } = get();
     if (!currentProject) return;
-    let targetRoot = currentProject.codePath || currentProject.path;
-    if (gitRoots.length > 0) {
-      const sorted = [...gitRoots].sort((a, b) => b.length - a.length);
-      const matched = sorted.find(r => filePath.startsWith(r));
-      if (matched) targetRoot = matched;
+    const fallback = currentProject.codePath || currentProject.path;
+    const list = Array.isArray(filePaths) ? filePaths : [filePaths];
+    const grouped = new Map<string, string[]>();
+
+    for (const absPath of list) {
+      const root = findGitRootForPath(absPath, gitRoots, fallback);
+      if (!isPathEqualOrInside(absPath, root)) continue;
+      const rel = getRelativePathInRepo(absPath, root) || '.';
+      const arr = grouped.get(root) || [];
+      arr.push(rel);
+      grouped.set(root, arr);
     }
-    const relPath = filePath.substring(targetRoot.length).replace(/^[\\\/]/, '').replace(/\\/g, '/');
-    await window.electronAPI.gitAdd(targetRoot, relPath);
+
+    for (const [root, rels] of grouped.entries()) {
+      await window.electronAPI.gitUnstageFiles(root, rels);
+    }
     await refreshGitStatus();
   },
 
   runGitRestore: async (filePath: string) => {
-    const { currentProject, gitRoots, refreshGitStatus } = get();
+    const { currentProject, gitRoots, syncWorkspaceAfterGitChange } = get();
     if (!currentProject) return;
-    let targetRoot = currentProject.codePath || currentProject.path;
-    if (gitRoots.length > 0) {
-      const sorted = [...gitRoots].sort((a, b) => b.length - a.length);
-      const matched = sorted.find(r => filePath.startsWith(r));
-      if (matched) targetRoot = matched;
-    }
-    const relPath = filePath.substring(targetRoot.length).replace(/^[\\\/]/, '').replace(/\\/g, '/');
+    const fallback = currentProject.codePath || currentProject.path;
+    const targetRoot = findGitRootForPath(filePath, gitRoots, fallback);
+    const relPath = getRelativePathInRepo(filePath, targetRoot) || '.';
     await window.electronAPI.gitRestore(targetRoot, relPath);
-    await refreshGitStatus();
+    await syncWorkspaceAfterGitChange();
   },
 
-  runGitInit: async () => {
-    const { currentProject, refreshGitStatus } = get();
+  runGitInit: async (targetDir?: string) => {
+    const { currentProject, syncWorkspaceAfterGitChange } = get();
     if (!currentProject) return;
-    const projectPath = currentProject.codePath || currentProject.path;
+    const projectPath = targetDir || currentProject.codePath || currentProject.path;
     await window.electronAPI.gitInit(projectPath);
-    await refreshGitStatus();
+    await syncWorkspaceAfterGitChange({ rediscoverRoots: true });
   },
 
   closeTabsUnderPath: (targetPath: string) => {

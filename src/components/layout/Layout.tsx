@@ -5,6 +5,8 @@ import Header from './Header';
 import Footer from './Footer';
 import SSHPage from '../../pages/SSHPage';
 import ChatPage from '../../pages/ChatPage/index';
+import { ToastViewport } from '../ui/ToastViewport';
+import { GlobalConfirmModal } from '../ui/ModalDialog';
 
 interface LayoutProps {
   children: ReactNode;
@@ -60,6 +62,8 @@ const Layout: React.FC<LayoutProps> = ({ children }) => {
 
       {/* ── Bottom: Footer ── */}
       <Footer />
+      <ToastViewport />
+      <GlobalConfirmModal />
     </div>
   );
 };

@@ -530,6 +530,60 @@ pub fn open_directory(app_handle: tauri::AppHandle, dir_path: String) -> Result<
 }
 
 #[tauri::command]
+pub async fn reveal_in_folder(app_handle: tauri::AppHandle, path: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let target = path.clone();
+        let status = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("open")
+                .arg("-R")
+                .arg(&target)
+                .status()
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("Failed to reveal path in Finder: {}", e))?;
+
+        if status.success() {
+            return Ok(());
+        }
+        return open_directory(app_handle, path);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let win_path = path.replace('/', "\\");
+        let spawn_res = tokio::task::spawn_blocking(move || {
+            use std::os::windows::process::CommandExt;
+            let mut cmd = std::process::Command::new("explorer.exe");
+            cmd.arg(format!("/select,{}", win_path));
+            cmd.creation_flags(0x08000000);
+            cmd.status()
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+        if spawn_res.is_ok() {
+            return Ok(());
+        }
+        return open_directory(app_handle, path);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let p = std::path::Path::new(&path);
+        let dir_to_open = if p.is_file() {
+            p.parent()
+                .map(|parent| parent.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.clone())
+        } else {
+            path.clone()
+        };
+        open_directory(app_handle, dir_to_open)
+    }
+}
+
+#[tauri::command]
 pub fn execute_bash_command(command: String, cwd: Option<String>) -> Result<String, String> {
     let mut cmd = if cfg!(target_os = "windows") {
         let mut c = std::process::Command::new("powershell");

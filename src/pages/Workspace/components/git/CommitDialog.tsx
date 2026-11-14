@@ -1,256 +1,455 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import {
+  GitCommit,
+  RefreshCw,
+  Check,
+  Loader2,
+  FileText,
+  ArrowUpCircle,
+  Filter,
+} from 'lucide-react';
 import { useWorkspaceStore } from '../../../../contexts/useWorkspaceStore';
-import { X, Check, GitCommit, AlertTriangle } from 'lucide-react';
+import { ModalDialog } from '../../../../components/ui/ModalDialog';
+import { toast } from '../../../../contexts/useToastStore';
+import { parseGitError } from '../../../../utils/gitError';
+import {
+  findGitRootForPath,
+  getBasename,
+  getRelativePathInRepo,
+  isPathEqualOrInside,
+} from '../../../../utils/path';
+import { GitErrorBanner } from './GitErrorBanner';
 
 interface CommitDialogProps {
   path: string;
+  projectPath?: string;
+  targetPaths?: string[];
   onClose: () => void;
 }
 
-export const CommitDialog: React.FC<CommitDialogProps> = ({ path, onClose }) => {
-  const gitRoots = useWorkspaceStore((s) => s.gitRoots);
-  const openDiff = useWorkspaceStore((s) => s.openDiff);
-  const projectPath = React.useMemo(() => {
-    if (!gitRoots || gitRoots.length === 0) return '';
-    const sorted = [...gitRoots].sort((a, b) => b.length - a.length);
-    return sorted.find(r => path.startsWith(r)) || gitRoots[0];
-  }, [path, gitRoots]);
-  
-  const [loading, setLoading] = useState(false);
-  const [message, setMessage] = useState('');
-  const [fileList, setFileList] = useState<Array<{ path: string; status: string; checked: boolean }>>([]);
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+interface StatusEntry {
+  relPath: string;
+  absPath: string;
+  rawStatus: string;
+  isStaged: boolean;
+  isUntracked: boolean;
+  isDeleted: boolean;
+}
 
-  const fetchStatus = async () => {
-    if (!projectPath) return;
+export const CommitDialog: React.FC<CommitDialogProps> = ({
+  path,
+  projectPath: explicitProjectPath,
+  targetPaths,
+  onClose,
+}) => {
+  const { currentProject, gitRoots, gitRepoBranches, openDiff, syncWorkspaceAfterGitChange, setGitSyncLabel } =
+    useWorkspaceStore();
+
+  const repoPath = useMemo(
+    () =>
+      explicitProjectPath ||
+      findGitRootForPath(path, gitRoots, currentProject?.codePath || currentProject?.path || path),
+    [explicitProjectPath, path, gitRoots, currentProject]
+  );
+
+  const currentBranch = gitRepoBranches[repoPath] || 'HEAD';
+
+  const scopedPaths = useMemo(() => {
+    const raw = targetPaths && targetPaths.length > 0 ? targetPaths : [path];
+    return raw.filter((p) => {
+      const rel = getRelativePathInRepo(p, repoPath);
+      return rel !== '' && rel !== '.';
+    });
+  }, [targetPaths, path, repoPath]);
+
+  const hasScopedFilter = scopedPaths.length > 0;
+
+  const [files, setFiles] = useState<StatusEntry[]>([]);
+  const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set());
+  const [onlyShowScoped, setOnlyShowScoped] = useState<boolean>(false);
+  const [message, setMessage] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [submittingMode, setSubmittingMode] = useState<'commit' | 'commit-push' | null>(null);
+  const [error, setError] = useState<unknown>(null);
+
+  const loadStatus = useCallback(async () => {
+    if (!repoPath) return;
     setLoading(true);
+    setError(null);
     try {
-      const statuses = await window.electronAPI.gitStatus(projectPath);
-      const list = Object.entries(statuses).map(([filePath, statusXY]) => {
-        // XY status: check if it represents added/modified/untracked etc.
-        const isUntracked = statusXY === '??' || statusXY === '?';
-        // Auto-check modified/added, leave untracked unchecked by default
-        return {
-          path: filePath,
-          status: statusXY,
-          checked: !isUntracked
-        };
+      const statuses = await window.electronAPI.gitStatus(repoPath);
+      const entries: StatusEntry[] = Object.entries(statuses).map(([relPath, rawStatus]) => {
+        const clean = rawStatus || '';
+        const x = clean[0] || ' ';
+        const absPath = `${repoPath.replace(/[\\/]+$/, '')}/${relPath}`;
+        const isUntracked = clean.trim() === '??' || clean.trim() === '?';
+        const isStaged = !isUntracked && x !== ' ' && x !== '?';
+        const isDeleted = clean.includes('D');
+        return { relPath, absPath, rawStatus: clean, isStaged, isUntracked, isDeleted };
       });
-      setFileList(list);
-    } catch (err: any) {
-      setErrorMsg('获取 Git 状态失败: ' + err.message);
+      entries.sort((a, b) => a.relPath.localeCompare(b.relPath));
+      setFiles(entries);
+
+      if (hasScopedFilter) {
+        const matched = entries
+          .filter((entry) => scopedPaths.some((sel) => isPathEqualOrInside(entry.absPath, sel)))
+          .map((e) => e.relPath);
+        setSelectedFiles(new Set(matched.length > 0 ? matched : entries.map((e) => e.relPath)));
+      } else {
+        setSelectedFiles(new Set(entries.map((e) => e.relPath)));
+      }
+    } catch (err) {
+      setError(err);
     } finally {
       setLoading(false);
     }
-  };
+  }, [repoPath, hasScopedFilter, scopedPaths]);
 
   useEffect(() => {
-    fetchStatus();
-  }, [projectPath]);
+    loadStatus();
+  }, [loadStatus]);
 
-  const handleFileDoubleClick = async (e: React.MouseEvent, filePath: string) => {
-    e.stopPropagation();
-    if (!projectPath) return;
+  const visibleFiles = useMemo(() => {
+    if (!hasScopedFilter || !onlyShowScoped) return files;
+    return files.filter((entry) => scopedPaths.some((sel) => isPathEqualOrInside(entry.absPath, sel)));
+  }, [files, hasScopedFilter, onlyShowScoped, scopedPaths]);
+
+  const toggleFile = (relPath: string) => {
+    setSelectedFiles((prev) => {
+      const next = new Set(prev);
+      if (next.has(relPath)) next.delete(relPath);
+      else next.add(relPath);
+      return next;
+    });
+  };
+
+  const toggleAllVisible = () => {
+    if (visibleFiles.length === 0) return;
+    const allSelected = visibleFiles.every((f) => selectedFiles.has(f.relPath));
+    setSelectedFiles((prev) => {
+      const next = new Set(prev);
+      for (const f of visibleFiles) {
+        if (allSelected) next.delete(f.relPath);
+        else next.add(f.relPath);
+      }
+      return next;
+    });
+  };
+
+  const handleOpenDiff = async (entry: StatusEntry) => {
+    if (!repoPath) return;
     try {
-      const fileStatus = fileList.find(f => f.path === filePath)?.status;
-      const trimmed = fileStatus?.trim() || '';
-      const isUntracked = trimmed === '??' || trimmed === '?';
-      const isAdded = trimmed.includes('A');
-      const isDeleted = trimmed.includes('D');
-
-      const originalContent = (isUntracked || isAdded)
-        ? ''
-        : await window.electronAPI.gitShowFile(projectPath, 'HEAD', filePath);
-
-      let modifiedContent = '';
-      if (!isDeleted) {
+      let originalContent = '';
+      if (!entry.isUntracked) {
         try {
-          const absolutePath = `${projectPath}/${filePath}`.replace(/\\/g, '/');
-          const localFile = await window.electronAPI.readFileBase64(absolutePath);
-          if (localFile && localFile.data) {
-            modifiedContent = localFile.data;
+          originalContent = await window.electronAPI.gitShowFile(repoPath, 'HEAD', entry.relPath);
+        } catch (err: any) {
+          const parsed = parseGitError(err);
+          if (parsed.raw.startsWith('BINARY_FILE:') || parsed.raw.startsWith('FILE_TOO_LARGE:')) {
+            setError(err);
+            return;
           }
-        } catch (err) {
-          console.error('Failed to read local file:', err);
+          originalContent = '';
         }
       }
 
-      const absoluteFilePath = `${projectPath}/${filePath}`.replace(/\\/g, '/');
-      const fileName = filePath.split('/').pop() || 'file';
+      let modifiedContent = '';
+      if (!entry.isDeleted) {
+        const readRes = await window.electronAPI.readFileBase64(entry.absPath);
+        if (readRes.type !== 'text') {
+          setError('当前文件为二进制或图片格式，暂不支持文本差异预览');
+          return;
+        }
+        modifiedContent = readRes.data || '';
+      }
 
+      const fileName = getBasename(entry.relPath);
       openDiff(
-        absoluteFilePath,
-        fileName,
+        `diff://${entry.relPath}-worktree`,
+        `${fileName} (工作区差异)`,
         originalContent,
         modifiedContent,
-        'HEAD',
-        'Current'
+        entry.isUntracked ? '未创建' : 'HEAD',
+        '当前工作区'
       );
       onClose();
-    } catch (err: any) {
-      console.error('Failed to open diff in commit dialog:', err);
-      alert('无法打开版本比对: ' + err.message);
+    } catch (err) {
+      setError(err);
     }
   };
 
-  const handleToggleFile = (filePath: string) => {
-    setFileList((prev) =>
-      prev.map((f) => (f.path === filePath ? { ...f, checked: !f.checked } : f))
-    );
-  };
-
-  const handleToggleAll = () => {
-    const allChecked = fileList.every((f) => f.checked);
-    setFileList((prev) => prev.map((f) => ({ ...f, checked: !allChecked })));
-  };
-
-  const handleCommit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (loading) return;
-    setErrorMsg(null);
-
-    const selectedFiles = fileList.filter((f) => f.checked).map((f) => f.path);
-    if (selectedFiles.length === 0) {
-      setErrorMsg('请选择至少一个文件进行提交');
+  const handleSubmit = async (alsoPush: boolean) => {
+    if (!repoPath) return;
+    if (selectedFiles.size === 0) {
+      setError('请至少勾选一个要提交的文件');
       return;
     }
     if (!message.trim()) {
-      setErrorMsg('请输入提交信息 (Commit Message)');
+      setError('请输入提交说明 (Commit Message)');
       return;
     }
 
-    setLoading(true);
+    setSubmittingMode(alsoPush ? 'commit-push' : 'commit');
+    setError(null);
+    const list = Array.from(selectedFiles);
+
     try {
-      await window.electronAPI.gitCommit(projectPath, selectedFiles, message.trim());
+      await window.electronAPI.gitCommit(repoPath, list, message.trim());
+
+      if (alsoPush) {
+        setGitSyncLabel('正在推送提交...');
+        try {
+          const remotes = await window.electronAPI.gitRemotes(repoPath);
+          const remoteName = remotes[0]?.[0] || 'origin';
+          const branchName = currentBranch.startsWith('HEAD') ? 'HEAD' : currentBranch;
+          await window.electronAPI.gitPush(repoPath, remoteName, branchName, false, false, true);
+          await syncWorkspaceAfterGitChange();
+          toast.success(`已提交并推送到 ${remoteName}/${branchName}`, `${list.length} 个文件`);
+        } finally {
+          setGitSyncLabel(null);
+        }
+      } else {
+        await syncWorkspaceAfterGitChange();
+        toast.success(`已成功提交 ${list.length} 个文件到 ${currentBranch}`);
+      }
       onClose();
-    } catch (err: any) {
-      setErrorMsg('提交失败: ' + err.message);
+    } catch (err) {
+      await syncWorkspaceAfterGitChange();
+      setError(err);
     } finally {
-      setLoading(false);
+      setSubmittingMode(null);
     }
   };
 
-  const getStatusBadge = (status: string) => {
-    const trimmed = status.trim();
-    if (trimmed === '??' || trimmed === '?') {
-      return <span className="px-1.5 py-0.5 text-[9px] bg-amber-500/10 text-amber-500 border border-amber-500/20 rounded">Untracked</span>;
+  const renderStatusBadge = (entry: StatusEntry) => {
+    const trimmed = entry.rawStatus.trim();
+    if (entry.isUntracked) {
+      return (
+        <span className="text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-600 dark:text-amber-400">
+          U 未跟踪
+        </span>
+      );
     }
-    if (trimmed.includes('M')) {
-      return <span className="px-1.5 py-0.5 text-[9px] bg-blue-500/10 text-blue-500 border border-blue-500/20 rounded">Modified</span>;
+    if (entry.isDeleted) {
+      return (
+        <span className="text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded bg-rose-500/15 text-rose-600 dark:text-rose-400">
+          D 删除
+        </span>
+      );
     }
-    if (trimmed.includes('A')) {
-      return <span className="px-1.5 py-0.5 text-[9px] bg-emerald-500/10 text-emerald-500 border border-emerald-500/20 rounded">Added</span>;
+    if (trimmed.startsWith('A')) {
+      return (
+        <span className="text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-600 dark:text-emerald-400">
+          A 新增
+        </span>
+      );
     }
-    if (trimmed.includes('D')) {
-      return <span className="px-1.5 py-0.5 text-[9px] bg-red-500/10 text-red-500 border border-red-500/20 rounded line-through">Deleted</span>;
+    if (trimmed.startsWith('R')) {
+      return (
+        <span className="text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded bg-purple-500/15 text-purple-600 dark:text-purple-400">
+          R 重命名
+        </span>
+      );
     }
-    return <span className="px-1.5 py-0.5 text-[9px] bg-slate-500/10 text-slate-400 border border-slate-500/20 rounded">{trimmed}</span>;
+    return (
+      <span
+        className={`text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded ${
+          entry.isStaged
+            ? 'bg-sky-500/15 text-sky-600 dark:text-sky-400'
+            : 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
+        }`}
+      >
+        M {entry.isStaged ? '已暂存' : '已修改'}
+      </span>
+    );
   };
+
+  const isMac =
+    typeof navigator !== 'undefined' && navigator.platform.toUpperCase().includes('MAC');
+  const submitShortcutLabel = isMac ? '⌘+Enter' : 'Ctrl+Enter';
+  const allVisibleChecked =
+    visibleFiles.length > 0 && visibleFiles.every((f) => selectedFiles.has(f.relPath));
 
   return (
-    <div className="fixed inset-0 z-[10000] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
-      <div className="bg-[#111622] border border-white/10 w-full max-w-2xl rounded-xl shadow-2xl flex flex-col overflow-hidden max-h-[90vh]">
-        {/* Header */}
-        <div className="p-4 border-b border-white/5 flex items-center justify-between bg-slate-950/20">
-          <div className="flex items-center space-x-2 text-slate-200">
-            <GitCommit className="w-4 h-4 text-primary" />
-            <span className="text-sm font-bold font-mono">提交变更 (Commit Changes)</span>
-          </div>
-          <button onClick={onClose} className="p-1 rounded hover:bg-white/5 text-slate-400 hover:text-white transition-colors">
-            <X className="w-4 h-4" />
-          </button>
-        </div>
-
-        {/* Error message */}
-        {errorMsg && (
-          <div className="m-4 p-3 bg-red-500/10 border border-red-500/20 rounded-lg flex items-center space-x-2 text-xs text-red-400">
-            <AlertTriangle className="w-4 h-4 flex-shrink-0" />
-            <span className="font-mono">{errorMsg}</span>
-          </div>
-        )}
-
-        {/* Content */}
-        <form onSubmit={handleCommit} className="flex-1 overflow-y-auto p-4 flex flex-col space-y-4">
-          <div className="flex flex-col flex-1 min-h-[200px]">
-            <div className="flex items-center justify-between text-xs text-slate-400 font-mono mb-2">
-              <span>选择文件 ({fileList.filter(f => f.checked).length} / {fileList.length})</span>
-              {fileList.length > 0 && (
-                <button
-                  type="button"
-                  onClick={handleToggleAll}
-                  className="text-primary hover:underline"
-                >
-                  {fileList.every(f => f.checked) ? '全不选' : '全选'}
-                </button>
-              )}
-            </div>
-
-            {/* Changed Files Checkbox List */}
-            <div className="flex-1 bg-slate-950/50 border border-white/5 rounded-lg overflow-y-auto max-h-[300px] min-h-[150px] p-2 space-y-0.5 scrollbar-thin">
-              {loading && fileList.length === 0 ? (
-                <div className="h-full flex items-center justify-center text-slate-500 font-mono text-xs">
-                  正在读取 Git 变更...
-                </div>
-              ) : fileList.length === 0 ? (
-                <div className="h-full flex items-center justify-center text-slate-500 font-mono text-xs">
-                  没有检测到任何已修改的文件
-                </div>
-              ) : (
-                fileList.map((file) => (
-                  <div
-                    key={file.path}
-                    onClick={() => handleToggleFile(file.path)}
-                    onDoubleClick={(e) => handleFileDoubleClick(e, file.path)}
-                    className="flex items-center space-x-2 px-2 py-1.5 hover:bg-white/5 rounded cursor-pointer transition-colors text-[11px] font-mono text-slate-300 hover:text-white select-none"
-                    title="Double click to compare with HEAD"
-                  >
-                    <input
-                      type="checkbox"
-                      checked={file.checked}
-                      onChange={() => {}} // handled by div click
-                      className="rounded border-white/10 text-primary focus:ring-0 focus:ring-offset-0 cursor-pointer bg-slate-900"
-                    />
-                    <span className="flex-1 truncate">{file.path}</span>
-                    {getStatusBadge(file.status)}
-                  </div>
-                ))
-              )}
-            </div>
-          </div>
-
-          {/* Commit Message Box */}
-          <div className="flex flex-col">
-            <label className="text-xs text-slate-400 font-mono mb-2">提交说明 (Commit Message)</label>
-            <textarea
-              value={message}
-              onChange={(e) => setMessage(e.target.value)}
-              placeholder="请输入本次提交的修改说明..."
-              rows={4}
-              required
-              className="w-full bg-slate-905 border border-white/10 focus:border-primary/50 text-xs text-white rounded-lg p-2.5 focus:outline-none placeholder-slate-500 font-mono transition-all resize-none"
-            />
-          </div>
-
-          {/* Actions */}
-          <div className="pt-2 flex items-center justify-end space-x-2">
+    <ModalDialog
+      isOpen={true}
+      onClose={onClose}
+      size="lg"
+      preventClose={Boolean(submittingMode)}
+      icon={<GitCommit className="w-4 h-4 text-emerald-500" />}
+      title="提交更改 (Git Commit)"
+      subtitle={`${getBasename(repoPath)} · 分支: ${currentBranch}`}
+      headerExtra={
+        <button
+          type="button"
+          onClick={loadStatus}
+          disabled={loading || Boolean(submittingMode)}
+          title="刷新更改列表"
+          className="p-1.5 rounded-lg text-text-secondary hover:text-text-primary hover:bg-background-tertiary transition-colors cursor-pointer"
+        >
+          <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
+        </button>
+      }
+      footer={
+        <div className="w-full flex items-center justify-between gap-3">
+          <span className="text-[11px] text-text-tertiary">
+            已选择 {selectedFiles.size} / {files.length} 个文件
+          </span>
+          <div className="flex items-center gap-2">
             <button
               type="button"
               onClick={onClose}
-              className="px-4 py-2 bg-slate-850 hover:bg-slate-800 text-xs font-mono text-slate-300 hover:text-white rounded-lg border border-white/5 transition-colors"
+              disabled={Boolean(submittingMode)}
+              className="px-3.5 py-1.5 rounded-lg text-xs font-medium text-text-secondary bg-background-tertiary hover:bg-background-secondary border border-border-primary transition-colors cursor-pointer"
             >
               取消
             </button>
             <button
-              type="submit"
-              disabled={loading || fileList.length === 0}
-              className="px-4 py-2 bg-primary hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed text-xs font-mono font-medium text-white rounded-lg transition-all flex items-center space-x-1.5 shadow-lg shadow-primary/10"
+              type="button"
+              onClick={() => handleSubmit(false)}
+              disabled={Boolean(submittingMode) || selectedFiles.size === 0 || !message.trim()}
+              className="px-4 py-1.5 rounded-lg text-xs font-medium bg-emerald-600 hover:bg-emerald-500 disabled:opacity-45 text-white flex items-center gap-1.5 transition-colors shadow-sm cursor-pointer"
             >
-              <Check className="w-3.5 h-3.5" />
-              <span>提交 (Commit)</span>
+              {submittingMode === 'commit' ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Check className="w-3.5 h-3.5" />
+              )}
+              <span>提交 ({submitShortcutLabel})</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => handleSubmit(true)}
+              disabled={Boolean(submittingMode) || selectedFiles.size === 0 || !message.trim()}
+              className="px-4 py-1.5 rounded-lg text-xs font-medium bg-primary hover:bg-primary/90 disabled:opacity-45 text-white flex items-center gap-1.5 transition-colors shadow-sm cursor-pointer"
+            >
+              {submittingMode === 'commit-push' ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <ArrowUpCircle className="w-3.5 h-3.5" />
+              )}
+              <span>提交并推送</span>
             </button>
           </div>
-        </form>
+        </div>
+      }
+    >
+      <div className="flex flex-col h-[500px] max-h-[68vh] p-4 gap-3 overflow-hidden">
+        {Boolean(error) && <GitErrorBanner error={error} onDismiss={() => setError(null)} />}
+
+        {/* Changes list */}
+        <div className="flex-1 min-h-0 flex flex-col border border-border-primary rounded-lg overflow-hidden bg-background-secondary/40">
+          <div className="flex items-center justify-between px-3 py-2 bg-background-secondary border-b border-border-primary text-xs">
+            <label className="flex items-center gap-2 cursor-pointer font-medium text-text-primary select-none">
+              <input
+                type="checkbox"
+                checked={allVisibleChecked}
+                onChange={toggleAllVisible}
+                disabled={visibleFiles.length === 0}
+                className="rounded border-border-primary text-primary focus:ring-primary"
+              />
+              <span>全选可见更改 ({visibleFiles.length})</span>
+            </label>
+
+            {hasScopedFilter && (
+              <button
+                type="button"
+                onClick={() => setOnlyShowScoped((v) => !v)}
+                className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md border text-[11px] transition-colors cursor-pointer ${
+                  onlyShowScoped
+                    ? 'bg-primary/15 border-primary/40 text-primary font-medium'
+                    : 'bg-background-primary border-border-primary text-text-secondary hover:text-text-primary'
+                }`}
+              >
+                <Filter className="w-3 h-3" />
+                <span>{onlyShowScoped ? '仅显示当前选中路径' : '显示全仓库更改'}</span>
+              </button>
+            )}
+          </div>
+
+          <div className="flex-1 overflow-y-auto scrollbar-thin divide-y divide-border-primary/60">
+            {loading ? (
+              <div className="flex items-center justify-center h-full text-xs text-text-secondary gap-2">
+                <Loader2 className="w-4 h-4 animate-spin text-primary" />
+                <span>正在扫描工作区状态...</span>
+              </div>
+            ) : visibleFiles.length === 0 ? (
+              <div className="flex flex-col items-center justify-center h-full text-xs text-text-tertiary gap-1.5 py-8">
+                <Check className="w-6 h-6 text-emerald-500/60" />
+                <span>工作区很干净，当前范围内没有可提交的更改</span>
+              </div>
+            ) : (
+              visibleFiles.map((entry) => {
+                const checked = selectedFiles.has(entry.relPath);
+                return (
+                  <div
+                    key={entry.relPath}
+                    className={`flex items-center justify-between gap-3 px-3 py-1.5 text-xs transition-colors hover:bg-background-tertiary/70 ${
+                      checked ? 'bg-primary/5' : ''
+                    }`}
+                  >
+                    <label className="flex items-center gap-2.5 min-w-0 flex-1 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={() => toggleFile(entry.relPath)}
+                        className="rounded border-border-primary text-primary focus:ring-primary flex-shrink-0"
+                      />
+                      <FileText className="w-3.5 h-3.5 text-text-tertiary flex-shrink-0" />
+                      <span
+                        className="font-mono text-[11px] text-text-primary truncate cursor-pointer hover:underline"
+                        title={`点击查看差异: ${entry.relPath}`}
+                        onClick={(e) => {
+                          e.preventDefault();
+                          handleOpenDiff(entry);
+                        }}
+                      >
+                        {entry.relPath}
+                      </span>
+                    </label>
+                    <div className="flex items-center gap-2 flex-shrink-0">
+                      {renderStatusBadge(entry)}
+                      <button
+                        type="button"
+                        onClick={() => handleOpenDiff(entry)}
+                        className="px-2 py-0.5 rounded border border-border-primary bg-background-primary hover:bg-background-tertiary text-[10px] text-text-secondary hover:text-text-primary transition-colors cursor-pointer"
+                      >
+                        对比
+                      </button>
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
+
+        {/* Commit Message */}
+        <div className="space-y-1.5 flex-shrink-0">
+          <div className="flex items-center justify-between text-xs">
+            <label htmlFor="commit-message-input" className="font-medium text-text-primary">
+              提交说明 (Commit Message)
+            </label>
+            <span className="text-[11px] text-text-tertiary">
+              按 {submitShortcutLabel} 快捷提交
+            </span>
+          </div>
+          <textarea
+            id="commit-message-input"
+            value={message}
+            onChange={(e) => setMessage(e.target.value)}
+            onKeyDown={(e) => {
+              if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !submittingMode) {
+                e.preventDefault();
+                handleSubmit(false);
+              }
+            }}
+            rows={4}
+            placeholder="简明描述本次提交的改动内容，例如：feat: 优化文件树 Git 右键菜单与主题适配"
+            className="w-full rounded-lg border border-border-primary bg-background-primary px-3 py-2 text-xs text-text-primary placeholder:text-text-tertiary focus:outline-none focus:border-primary resize-none scrollbar-thin"
+          />
+        </div>
       </div>
-    </div>
+    </ModalDialog>
   );
 };
