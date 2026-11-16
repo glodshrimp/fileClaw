@@ -132,6 +132,8 @@ export interface TerminalPaneProps {
   onInputData?: (data: string) => void;
   /** Whether to automatically strip line numbers when copying */
   autoStripLineNumbers?: boolean;
+  /** Normalize fullwidth IME punctuation (e.g. ： → :, ｜ → |) to ASCII in terminal */
+  asciiPunctuation?: boolean;
   /** Whether the pane is currently maximized */
   isMaximized?: boolean;
   /** Callback to toggle maximize/restore state */
@@ -148,11 +150,53 @@ export interface TerminalPaneProps {
   lineEnding?: 'cr' | 'lf' | 'crlf';
 }
 
+const SHIFT_SYMBOL_BY_CODE: Record<string, string> = {
+  Backquote: '~',
+  Digit1: '!',
+  Digit2: '@',
+  Digit3: '#',
+  Digit4: '$',
+  Digit5: '%',
+  Digit6: '^',
+  Digit7: '&',
+  Digit8: '*',
+  Digit9: '(',
+  Digit0: ')',
+  Minus: '_',
+  Equal: '+',
+  BracketLeft: '{',
+  BracketRight: '}',
+  Backslash: '|',
+  Semicolon: ':',
+  Quote: '"',
+  Comma: '<',
+  Period: '>',
+  Slash: '?',
+};
+
+const FULLWIDTH_TO_ASCII: Record<string, string> = {
+  '：': ':',
+  '｜': '|',
+  '！': '!',
+  '？': '?',
+  '（': '(',
+  '）': ')',
+  '｛': '{',
+  '｝': '}',
+  '《': '<',
+  '》': '>',
+  '“': '"',
+  '”': '"',
+  '￥': '$',
+  '—': '_',
+  '～': '~',
+};
+
 // ── Component ─────────────────────────────────────────────────────────────────
 
 const TerminalPane: React.FC<TerminalPaneProps> = ({
   sshId, shellId, isFocused, isDefaultShell, onFocus, onClose, showClose,
-  mode = 'ssh', onInputData, autoStripLineNumbers = false,
+  mode = 'ssh', onInputData, autoStripLineNumbers = false, asciiPunctuation = true,
   isMaximized = false, onToggleMaximize, isDragging = false, cwd,
   shell, localEcho = false, lineEnding = 'cr',
 }) => {
@@ -162,6 +206,8 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
   localEchoRef.current = localEcho;
   const lineEndingRef = useRef(lineEnding);
   lineEndingRef.current = lineEnding;
+  const asciiPunctuationRef = useRef(asciiPunctuation);
+  asciiPunctuationRef.current = asciiPunctuation;
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermRef = useRef<XTerm | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
@@ -366,16 +412,19 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
       term.focus();
     }, 100);
 
-    // ── Font scaling ──────────────────────────────────────────────────────────
+    // ── Font scaling & IME/Shift normalization ────────────────────────────────
     const MIN_FONT_SIZE = 10;
     const MAX_FONT_SIZE = 24;
 
-    // Boolean flag to suppress the very next onData event after we directly
-    // sent a character from the keydown handler.  This prevents the duplicate
-    // that occurs when WKWebView's hidden textarea still fires an input event
-    // despite our event.preventDefault().
-    let suppressOnData = false;
     const isMac = /mac|iphone|ipod|ipad/i.test(navigator.platform || navigator.userAgent);
+    let isComposing = false;
+    let lastShiftBackslashAt = 0;
+    let clearTextareaTimer: ReturnType<typeof setTimeout> | null = null;
+    let pendingImeShift: {
+      expected: string;
+      code: string;
+      timer: ReturnType<typeof setTimeout>;
+    } | null = null;
 
     const sendSerialData = (raw: string) => {
       let out = raw;
@@ -396,12 +445,49 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
       window.electronAPI.serialWrite(sshId, out);
     };
 
+    const dispatchInput = (data: string) => {
+      if (!isSerial && !isLocal && !isDefaultShell && !shellReadyRef.current) return;
+      if (isSerial) {
+        sendSerialData(data);
+      } else if (isLocal) {
+        window.electronAPI.ptyWrite(shellId, data);
+      } else if (isDefaultShell) {
+        window.electronAPI.sshWrite(sshId, data);
+      } else {
+        window.electronAPI.sshWriteShell(sshId, shellId, data);
+      }
+      onInputData?.(data);
+    };
+
+    const scheduleClearTextarea = () => {
+      if (clearTextareaTimer) clearTimeout(clearTextareaTimer);
+      clearTextareaTimer = setTimeout(() => {
+        clearTextareaTimer = null;
+        if (!isComposing && term.textarea && term.textarea.value.length > 0) {
+          term.textarea.value = '';
+        }
+      }, 15);
+    };
+
+    const clearPendingImeShift = () => {
+      if (pendingImeShift) {
+        clearTimeout(pendingImeShift.timer);
+        pendingImeShift = null;
+      }
+    };
+
+    const handleCompositionStart = () => {
+      isComposing = true;
+    };
+    const handleCompositionEnd = () => {
+      isComposing = false;
+      scheduleClearTextarea();
+    };
+    const helperTextarea = term.textarea;
+    helperTextarea?.addEventListener('compositionstart', handleCompositionStart);
+    helperTextarea?.addEventListener('compositionend', handleCompositionEnd);
+
     term.attachCustomKeyEventHandler((event) => {
-      // ── Bypass macOS IME composition for Escape and Shift+key characters ────
-      // On macOS with Chinese IME (e.g. Pinyin), the Shift key doubles as an
-      // input-method toggle.  The first Shift+<key> press is consumed by the
-      // IME to switch modes, so the character never reaches xterm's hidden
-      // textarea.  We intercept at keydown and write directly to the backend.
       if (event.type === 'keydown') {
         if (shellExitedRef.current && event.key === 'Enter') {
           event.preventDefault();
@@ -411,50 +497,41 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
           return false;
         }
 
-        // 1. Escape – always intercept (when not in IME composition)
-        if (event.key === 'Escape' && !event.isComposing) {
-          event.preventDefault();
-          event.stopPropagation();
-          suppressOnData = true;
-          setTimeout(() => { suppressOnData = false; }, 0);
-          const data = '\x1b';
-          if (isSerial) {
-            sendSerialData(data);
-          } else if (isLocal) {
-            window.electronAPI.ptyWrite(shellId, data);
-          } else if (isDefaultShell) {
-            window.electronAPI.sshWrite(sshId, data);
-          } else {
-            window.electronAPI.sshWriteShell(sshId, shellId, data);
-          }
-          onInputData?.(data);
-          return false;
+        if (event.shiftKey && event.code === 'Backslash' && !event.ctrlKey && !event.metaKey && !event.altKey) {
+          lastShiftBackslashAt = performance.now();
         }
 
-        // 2. macOS-only: Shift + printable character (e.g. Shift+; → ":", Shift+1 → "!")
-        //    Restricted to macOS so Windows WebView2 IME composition is not disrupted.
-        if (isMac && !event.isComposing && event.keyCode !== 229
-            && event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey
-            && event.key.length === 1) {
-          event.preventDefault();
-          event.stopPropagation();
-          suppressOnData = true;
-          setTimeout(() => { suppressOnData = false; }, 0);
-          const data = event.key;  // already the shifted character (e.g. ":", "!", "A")
-          if (isSerial) {
-            sendSerialData(data);
-          } else if (isLocal) {
-            window.electronAPI.ptyWrite(shellId, data);
-          } else if (isDefaultShell) {
-            window.electronAPI.sshWrite(sshId, data);
-          } else {
-            window.electronAPI.sshWriteShell(sshId, shellId, data);
+        // On macOS with Chinese IME active, Shift+symbol (e.g. Shift+; → ":", Shift+\ → "|")
+        // often arrives with keyCode=229 and may either emit fullwidth punctuation (：/、/｜)
+        // or be swallowed if Shift toggles the IME mode. Track the physical Shift+symbol and
+        // let xterm/IME run normally; onData normalizes fullwidth output, and a 40ms fallback
+        // recovers swallowed keystrokes without duplicating or dropping subsequent keys.
+        if (isMac && asciiPunctuationRef.current && !isComposing && !event.isComposing
+            && event.keyCode === 229 && event.shiftKey
+            && !event.ctrlKey && !event.metaKey && !event.altKey) {
+          const expected = SHIFT_SYMBOL_BY_CODE[event.code];
+          if (expected) {
+            if (pendingImeShift) {
+              const prevExpected = pendingImeShift.expected;
+              clearPendingImeShift();
+              dispatchInput(prevExpected);
+            }
+            const code = event.code;
+            const timer = setTimeout(() => {
+              if (pendingImeShift && pendingImeShift.code === code) {
+                pendingImeShift = null;
+                if (!isComposing && !shellExitedRef.current) {
+                  if (term.textarea) term.textarea.value = '';
+                  dispatchInput(expected);
+                }
+              }
+            }, 40);
+            pendingImeShift = { expected, code, timer };
+            return true;
           }
-          onInputData?.(data);
-          return false;
         }
 
-        // 3. Windows / Linux copy & paste shortcuts (Ctrl+Shift+C/V, Ctrl+C with selection, Ctrl+V)
+        // Windows / Linux copy & paste shortcuts (Ctrl+Shift+C/V, Ctrl+C with selection, Ctrl+V)
         if (!isMac && event.ctrlKey && !event.altKey && !event.metaKey) {
           const lowerKey = event.key.toLowerCase();
           if (lowerKey === 'c' && (event.shiftKey || term.hasSelection())) {
@@ -532,43 +609,52 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
 
     // ── I/O wiring ────────────────────────────────────────────────────────────
     const onDataDisposable = term.onData((data) => {
-      // Suppress duplicate character from WKWebView/IME after we already
-      // sent it directly from the keydown handler above.
-      if (suppressOnData) {
-        suppressOnData = false;
-        return;
-      }
       if (shellExitedRef.current) {
+        clearPendingImeShift();
         if (data === '\r' || data === '\n') {
           shellExitedRef.current = false;
           setReconnectTrigger(prev => prev + 1);
         }
         return;
       }
-      if (!isSerial && !isLocal && !isDefaultShell && !shellReadyRef.current) return;
-      if (isSerial) {
-        sendSerialData(data);
-      } else if (isLocal) {
-        window.electronAPI.ptyWrite(shellId, data);
-      } else if (isDefaultShell) {
-        window.electronAPI.sshWrite(sshId, data);
-      } else {
-        window.electronAPI.sshWriteShell(sshId, shellId, data);
+
+      let out = data;
+      if (pendingImeShift) {
+        const { expected, code } = pendingImeShift;
+        clearPendingImeShift();
+
+        const normalizedFromIme =
+          (code === 'Backslash' && out === '、')
+            ? '|'
+            : (code === 'Digit6' && out === '……')
+              ? '^'
+              : (FULLWIDTH_TO_ASCII[out] ?? out);
+
+        if (normalizedFromIme === expected) {
+          out = expected;
+        } else if (out.length === 1 && out !== '\x1b' && !/[\u4e00-\u9fff]/.test(out)) {
+          // IME swallowed the previous Shift+symbol and moved directly to the next key
+          dispatchInput(expected);
+        }
       }
-      onInputData?.(data);
+
+      if (asciiPunctuationRef.current) {
+        if (out === '、' && performance.now() - lastShiftBackslashAt < 80) {
+          out = '|';
+          lastShiftBackslashAt = 0;
+        } else if (out.length === 1 && FULLWIDTH_TO_ASCII[out]) {
+          out = FULLWIDTH_TO_ASCII[out];
+        }
+      }
+
+      if (!isComposing) {
+        scheduleClearTextarea();
+      }
+
+      dispatchInput(out);
     });
     const onBinaryDisposable = term.onBinary((data) => {
-      if (!isSerial && !isLocal && !isDefaultShell && !shellReadyRef.current) return;
-      if (isSerial) {
-        sendSerialData(data);
-      } else if (isLocal) {
-        window.electronAPI.ptyWrite(shellId, data);
-      } else if (isDefaultShell) {
-        window.electronAPI.sshWrite(sshId, data);
-      } else {
-        window.electronAPI.sshWriteShell(sshId, shellId, data);
-      }
-      onInputData?.(data);
+      dispatchInput(data);
     });
 
     // ── Resize observers ──────────────────────────────────────────────────────
@@ -622,6 +708,10 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
     // Context menu click-outside is handled by a separate useEffect below
 
     return () => {
+      clearPendingImeShift();
+      if (clearTextareaTimer) clearTimeout(clearTextareaTimer);
+      helperTextarea?.removeEventListener('compositionstart', handleCompositionStart);
+      helperTextarea?.removeEventListener('compositionend', handleCompositionEnd);
       onDataDisposable.dispose();
       onBinaryDisposable.dispose();
       removeOutputListener();

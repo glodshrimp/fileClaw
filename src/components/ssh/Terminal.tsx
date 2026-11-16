@@ -250,6 +250,10 @@ const Terminal: React.FC<TerminalProps> = ({ sshId, isConnected, mode = 'ssh', c
   const [showToolbar, setShowToolbar] = useState(false);
   const [isSyncInput, setIsSyncInput] = useState(false);
   const [autoStripLineNumbers, setAutoStripLineNumbers] = useState(false);
+  const [asciiPunctuation, setAsciiPunctuation] = useState<boolean>(() => {
+    const saved = localStorage.getItem('termAsciiPunctuation');
+    return saved === null ? true : saved === 'true';
+  });
   const [maximizedPaneId, setMaximizedPaneId] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [showSnippets, setShowSnippets] = useState(false);
@@ -453,6 +457,7 @@ const Terminal: React.FC<TerminalProps> = ({ sshId, isConnected, mode = 'ssh', c
               showClose={totalPanes > 1}
               mode={mode}
               autoStripLineNumbers={autoStripLineNumbers}
+              asciiPunctuation={asciiPunctuation}
               isDragging={isDragging}
               cwd={cwd}
               shell={shell}
@@ -538,7 +543,7 @@ const Terminal: React.FC<TerminalProps> = ({ sshId, isConnected, mode = 'ssh', c
         </div>
       );
     },
-    [sshId, focusedPaneId, closePane, totalPanes, refitAllPanes, mode, autoStripLineNumbers, isDragging, tree, isSyncInput, cwd, shell, serialLocalEcho, serialLineEnding]
+    [sshId, focusedPaneId, closePane, totalPanes, refitAllPanes, mode, autoStripLineNumbers, asciiPunctuation, isDragging, tree, isSyncInput, cwd, shell, serialLocalEcho, serialLineEnding]
   );
 
   // ── Render ──────────────────────────────────────────────────────────────────
@@ -718,6 +723,24 @@ const Terminal: React.FC<TerminalProps> = ({ sshId, isConnected, mode = 'ssh', c
           <span>{autoStripLineNumbers ? '过滤行号开' : '过滤行号'}</span>
         </button>
 
+        {/* 中文输入法半角标点自动规范化开关 */}
+        <button
+          onClick={() => setAsciiPunctuation(prev => {
+            const next = !prev;
+            localStorage.setItem('termAsciiPunctuation', String(next));
+            return next;
+          })}
+          className={`flex items-center gap-1 px-2 py-1 rounded-xl text-[10px] font-mono font-bold transition-all ${
+            asciiPunctuation
+              ? 'bg-blue-500/20 text-blue-400 border border-blue-500/30'
+              : 'hover:bg-white/10 text-slate-400 hover:text-white border border-transparent'
+          }`}
+          title="中文输入法下自动将 Shift 组合标点（如 ： ｜ 、）转为终端半角符号 (: |)，方便 Vim 与 Shell 操作"
+        >
+          <span>:|</span>
+          <span>{asciiPunctuation ? '半角开' : '半角关'}</span>
+        </button>
+
         <div className="w-px h-3 bg-white/10 mx-1" />
 
         {/* 常用命令速记抽屉开关 */}
@@ -772,6 +795,7 @@ const Terminal: React.FC<TerminalProps> = ({ sshId, isConnected, mode = 'ssh', c
                   showClose={false}
                   mode={mode}
                   autoStripLineNumbers={autoStripLineNumbers}
+                  asciiPunctuation={asciiPunctuation}
                   isDragging={false}
                   isMaximized={true}
                   cwd={cwd}

@@ -473,14 +473,18 @@ pub async fn ssh_open_shell(
                 }
             }
 
-            // Set the timeout to 25ms for responsive, low-latency interaction
-            _session.set_timeout(25);
+            // Adaptive read timeout: 2ms while actively typing/receiving so keystrokes flush
+            // immediately, relaxing to 10ms after 500ms of idle time.
+            let mut last_activity = std::time::Instant::now();
+            let mut current_timeout_ms: u32 = 2;
+            _session.set_timeout(current_timeout_ms);
             
             loop {
                 // 1. Handle any pending resize requests
                 loop {
                     match resize_rx.try_recv() {
                         Ok((cols, rows)) => {
+                            last_activity = std::time::Instant::now();
                             let _ = channel.request_pty_size(cols as u32, rows as u32, None, None);
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -491,9 +495,11 @@ pub async fn ssh_open_shell(
                 }
 
                 // 2. Handle any pending write requests
+                let mut wrote_any = false;
                 loop {
                     match write_rx.try_recv() {
                         Ok(data) => {
+                            last_activity = std::time::Instant::now();
                             let bytes = data.as_slice();
                             let mut written = 0;
                             let mut write_failed = false;
@@ -501,6 +507,7 @@ pub async fn ssh_open_shell(
                                 match channel.write(&bytes[written..]) {
                                     Ok(n) if n > 0 => {
                                         written += n;
+                                        wrote_any = true;
                                     }
                                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock 
                                                || e.kind() == std::io::ErrorKind::TimedOut => {
@@ -515,13 +522,22 @@ pub async fn ssh_open_shell(
                             if write_failed {
                                 break;
                             }
-                            let _ = channel.flush();
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                             return;
                         }
                     }
+                }
+                if wrote_any {
+                    let _ = channel.flush();
+                }
+
+                // Keep timeout tight during active interaction, relax when idle
+                let desired_timeout_ms = if last_activity.elapsed() < Duration::from_millis(500) { 2 } else { 10 };
+                if desired_timeout_ms != current_timeout_ms {
+                    current_timeout_ms = desired_timeout_ms;
+                    _session.set_timeout(current_timeout_ms);
                 }
 
                 // 3. Read from channel (coalescing high-throughput output up to 64KB or 8ms window)
@@ -546,11 +562,14 @@ pub async fn ssh_open_shell(
                         break;
                     }
                     Ok(n) => {
+                        last_activity = std::time::Instant::now();
                         utf8_remainder.extend_from_slice(&buffer[..n]);
                         // If buffer was nearly full, drain available burst chunks up to 64KB within 8ms
                         if n >= 4096 {
                             let burst_start = std::time::Instant::now();
-                            _session.set_timeout(2);
+                            if current_timeout_ms != 2 {
+                                _session.set_timeout(2);
+                            }
                             while utf8_remainder.len() < 65536 && burst_start.elapsed() < Duration::from_millis(8) {
                                 match reader.read(&mut buffer) {
                                     Ok(more) if more > 0 => {
@@ -559,7 +578,8 @@ pub async fn ssh_open_shell(
                                     _ => break,
                                 }
                             }
-                            _session.set_timeout(25);
+                            current_timeout_ms = 2;
+                            _session.set_timeout(current_timeout_ms);
                         }
                         flush_utf8(&mut utf8_remainder, &app_handle_clone, &shell_id_clone);
                     }
