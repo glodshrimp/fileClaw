@@ -220,6 +220,7 @@ const SSHPage: React.FC = () => {
   const reconnectAttemptsRef = React.useRef<Record<string, number>>({});
   const reconnectTimersRef = React.useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const hasConnectedRef = React.useRef<Set<string>>(new Set());
+  const closingKeysRef = React.useRef<Set<string>>(new Set());
   const sessionsRef = React.useRef(sessions);
   sessionsRef.current = sessions;
 
@@ -256,6 +257,7 @@ const SSHPage: React.FC = () => {
   };
 
   const autoSilentReconnect = (key: string, fromChain = false) => {
+    if (closingKeysRef.current.has(key)) return;
     const s = sessionsRef.current.find(ss => ss.key === key);
     if (!s || s.localMode || getProtocol(s.ssh) === 'local') return;
     const isSerial = getProtocol(s.ssh) === 'serial';
@@ -306,7 +308,7 @@ const SSHPage: React.FC = () => {
     reconnectTimersRef.current[key] = setTimeout(() => {
       delete reconnectTimersRef.current[key];
       const sLatest = sessionsRef.current.find(ss => ss.key === key);
-      if (!sLatest || sLatest.localMode || closingKey === key) {
+      if (!sLatest || sLatest.localMode || closingKey === key || closingKeysRef.current.has(key)) {
         return;
       }
 
@@ -485,10 +487,11 @@ const SSHPage: React.FC = () => {
   // ── Close / disconnect session ───────────────
   const requestClose = (key: string) => setClosingKey(key);
 
-  const confirmClose = async () => {
+  const confirmClose = () => {
     if (!closingKey) return;
     const key = closingKey;
     const closingSession = sessions.find(s => s.key === key);
+    closingKeysRef.current.add(key);
     setClosingKey(null);
     clearReconnectTimer(key);
     delete reconnectAttemptsRef.current[key];
@@ -501,21 +504,28 @@ const SSHPage: React.FC = () => {
       return next;
     });
 
-    if (closingSession?.localMode || (closingSession && getProtocol(closingSession.ssh) === 'local')) {
-      // Local terminal mode: destroy all PTY processes (including split panes)
-      await window.electronAPI.ptyDestroySession(key);
-    } else if (closingSession && getProtocol(closingSession.ssh) === 'serial') {
-      await window.electronAPI.serialDisconnect(key);
-    } else {
-      await window.electronAPI.sshDisconnect(key);
-    }
-
+    // Optimistically remove session from UI immediately so TerminalPane and StatusFooter
+    // unmount at once (stopping metrics polling) without waiting on dead-network I/O.
     const remaining = sessions.filter(s => s.key !== key);
+    dispatch({ type: 'ABORT_SESSION_TRANSFER_JOBS', payload: { sshId: key } });
     dispatch({ type: 'DELETE_SSH_SESSION', payload: key });
 
     if (activeSessionKey === key) {
       setActiveSessionKey(remaining.length > 0 ? remaining[remaining.length - 1].key : null);
     }
+
+    const disconnectPromise =
+      closingSession?.localMode || (closingSession && getProtocol(closingSession.ssh) === 'local')
+        ? window.electronAPI.ptyDestroySession(key)
+        : closingSession && getProtocol(closingSession.ssh) === 'serial'
+          ? window.electronAPI.serialDisconnect(key)
+          : window.electronAPI.sshDisconnect(key);
+
+    Promise.resolve(disconnectPromise)
+      .catch(err => console.error(`Failed to disconnect session ${key}:`, err))
+      .finally(() => {
+        closingKeysRef.current.delete(key);
+      });
   };
 
   const setSessionTab = (key: string, tab: 'terminal' | 'sftp') => {
@@ -801,15 +811,19 @@ const SSHPage: React.FC = () => {
       if ((s.connStatus === 'connected' || s.connStatus === 'connecting' || s.connStatus === 'reconnecting') && !s.localMode && proto !== 'local') {
         if (proto === 'serial') {
           const u1 = window.electronAPI.onSerialClosed(s.key, () => {
-            if (closingKey === s.key) {
-              dispatch({ type: 'UPDATE_SSH_SESSION', payload: { ...s, connStatus: 'error', connError: '串口已关闭' } });
+            if (closingKey === s.key || closingKeysRef.current.has(s.key)) {
+              if (!closingKeysRef.current.has(s.key)) {
+                dispatch({ type: 'UPDATE_SSH_SESSION', payload: { ...s, connStatus: 'error', connError: '串口已关闭' } });
+              }
             } else {
               autoSilentReconnect(s.key);
             }
           });
           const u2 = window.electronAPI.onSerialError(s.key, (err: string) => {
-            if (closingKey === s.key) {
-              dispatch({ type: 'UPDATE_SSH_SESSION', payload: { ...s, connStatus: 'error', connError: err || '串口异常断开' } });
+            if (closingKey === s.key || closingKeysRef.current.has(s.key)) {
+              if (!closingKeysRef.current.has(s.key)) {
+                dispatch({ type: 'UPDATE_SSH_SESSION', payload: { ...s, connStatus: 'error', connError: err || '串口异常断开' } });
+              }
             } else {
               autoSilentReconnect(s.key);
             }
@@ -817,17 +831,21 @@ const SSHPage: React.FC = () => {
           unlisteners.push(u1, u2);
         } else {
           const u1 = window.electronAPI.onSshClosed(s.key, () => {
-            if (closingKey === s.key) {
-              dispatch({ type: 'UPDATE_SSH_SESSION', payload: { ...s, connStatus: 'error', connError: '连接意外断开等 (Session Closed)' } });
-              dispatch({ type: 'ABORT_SESSION_TRANSFER_JOBS', payload: { sshId: s.key } });
+            if (closingKey === s.key || closingKeysRef.current.has(s.key)) {
+              if (!closingKeysRef.current.has(s.key)) {
+                dispatch({ type: 'UPDATE_SSH_SESSION', payload: { ...s, connStatus: 'error', connError: '连接意外断开等 (Session Closed)' } });
+                dispatch({ type: 'ABORT_SESSION_TRANSFER_JOBS', payload: { sshId: s.key } });
+              }
             } else {
               autoSilentReconnect(s.key);
             }
           });
           const u2 = window.electronAPI.onSshError(s.key, (err: string) => {
-            if (closingKey === s.key) {
-              dispatch({ type: 'UPDATE_SSH_SESSION', payload: { ...s, connStatus: 'error', connError: err || '连接异常断开' } });
-              dispatch({ type: 'ABORT_SESSION_TRANSFER_JOBS', payload: { sshId: s.key } });
+            if (closingKey === s.key || closingKeysRef.current.has(s.key)) {
+              if (!closingKeysRef.current.has(s.key)) {
+                dispatch({ type: 'UPDATE_SSH_SESSION', payload: { ...s, connStatus: 'error', connError: err || '连接异常断开' } });
+                dispatch({ type: 'ABORT_SESSION_TRANSFER_JOBS', payload: { sshId: s.key } });
+              }
             } else {
               autoSilentReconnect(s.key);
             }

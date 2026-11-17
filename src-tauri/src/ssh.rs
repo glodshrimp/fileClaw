@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use socket2::{Socket, Domain, Type, Protocol};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -14,6 +15,15 @@ use tauri::{AppHandle, Emitter};
 pub struct SshShell {
     write_tx: std::sync::mpsc::Sender<Vec<u8>>,
     resize_tx: std::sync::mpsc::Sender<(u16, u16)>,
+    cancelled: Arc<AtomicBool>,
+    tcp: Arc<TcpStream>,
+}
+
+impl SshShell {
+    fn abort(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        let _ = self.tcp.shutdown(Shutdown::Both);
+    }
 }
 
 pub struct SshTunnel {
@@ -24,7 +34,6 @@ pub struct SshSession {
     session: ssh2::Session,
     _tcp: TcpStream,
     shells: HashMap<String, SshShell>,
-    tunnels: HashMap<String, SshTunnel>,
     sftp: Option<ssh2::Sftp>,
     
     // Connection parameters to lazy-connect dedicated sessions
@@ -41,9 +50,96 @@ pub struct SshSession {
     connecting_shells: HashSet<String>,
 }
 
+pub struct SessionEntry {
+    pub closing: AtomicBool,
+    pub sockets: Mutex<Vec<TcpStream>>,
+    pub tunnels: Mutex<HashMap<String, SshTunnel>>,
+    pub inner: Mutex<SshSession>,
+}
+
+impl SessionEntry {
+    fn new(ssh_session: SshSession) -> Self {
+        let mut sockets = Vec::new();
+        if let Ok(cloned) = ssh_session._tcp.try_clone() {
+            sockets.push(cloned);
+        }
+        Self {
+            closing: AtomicBool::new(false),
+            sockets: Mutex::new(sockets),
+            tunnels: Mutex::new(HashMap::new()),
+            inner: Mutex::new(ssh_session),
+        }
+    }
+
+    fn register_socket(&self, tcp: &TcpStream) {
+        if let Ok(cloned) = tcp.try_clone() {
+            if let Ok(mut socks) = self.sockets.lock() {
+                socks.push(cloned);
+            }
+        }
+    }
+
+    /// Immediately mark closing, stop tunnels, and shut down all tracked TCP sockets
+    /// without waiting for `inner` (which may be blocked in SFTP/exec I/O).
+    fn begin_close(&self) {
+        self.closing.store(true, Ordering::SeqCst);
+        if let Ok(mut tunnels) = self.tunnels.lock() {
+            for (_, tunnel) in tunnels.drain() {
+                let _ = tunnel.shutdown_tx.send(());
+            }
+        }
+        if let Ok(mut socks) = self.sockets.lock() {
+            for sock in socks.drain(..) {
+                let _ = sock.shutdown(Shutdown::Both);
+            }
+        }
+    }
+}
+
+fn spawn_drop_session(entry: Arc<SessionEntry>) {
+    entry.begin_close();
+    thread::spawn(move || {
+        if let Ok(mut inner) = entry.inner.lock() {
+            for (_, shell) in inner.shells.drain() {
+                shell.abort();
+            }
+            inner.connecting_shells.clear();
+            inner.sftp = None;
+            inner.session.set_blocking(false);
+            if let Some(ref s) = inner.shell_session {
+                s.set_blocking(false);
+            }
+            if let Some(ref s) = inner.tunnel_session {
+                s.set_blocking(false);
+            }
+            let _ = inner._tcp.shutdown(Shutdown::Both);
+            if let Some(ref t) = inner._shell_tcp {
+                let _ = t.shutdown(Shutdown::Both);
+            }
+            if let Some(ref t) = inner._tunnel_tcp {
+                let _ = t.shutdown(Shutdown::Both);
+            }
+        }
+    });
+}
+
+fn get_session_entry(
+    sessions_arc: &Arc<Mutex<HashMap<String, Arc<SessionEntry>>>>,
+    id: &str,
+) -> Result<Arc<SessionEntry>, String> {
+    let entry = {
+        let sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
+        sessions.get(id).cloned().ok_or_else(|| "No active SSH connection".to_string())?
+    };
+    if entry.closing.load(Ordering::SeqCst) {
+        return Err("Session closed".to_string());
+    }
+    Ok(entry)
+}
+
 #[derive(Default)]
 pub struct SshState {
-    pub sessions: Arc<Mutex<HashMap<String, SshSession>>>,
+    pub sessions: Arc<Mutex<HashMap<String, Arc<SessionEntry>>>>,
     /// Fast, non-blocking lookup table for shell write/resize channels so SFTP/exec never block typing
     pub fast_shells: Arc<Mutex<HashMap<String, SshShell>>>,
     pub cancelled_transfers: Arc<Mutex<HashSet<String>>>,
@@ -132,15 +228,25 @@ pub async fn ssh_connect(
         // Clean old session and its fast_shells entries if it exists
         {
             if let Ok(mut fast) = fast_shells_arc.lock() {
-                fast.remove(&id);
-                let split_prefix = format!("{}__split__", id);
-                fast.retain(|k, _| !k.starts_with(&split_prefix));
-            }
-            let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
-            if let Some(old_session) = sessions.remove(&id) {
-                for (_, tunnel) in old_session.tunnels {
-                    let _ = tunnel.shutdown_tx.send(());
+                if let Some(s) = fast.remove(&id) {
+                    s.abort();
                 }
+                let split_prefix = format!("{}__split__", id);
+                fast.retain(|k, s| {
+                    if k.starts_with(&split_prefix) {
+                        s.abort();
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+            let old_entry = {
+                let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
+                sessions.remove(&id)
+            };
+            if let Some(old) = old_entry {
+                spawn_drop_session(old);
             }
         }
 
@@ -149,6 +255,7 @@ pub async fn ssh_connect(
         let mut session = ssh2::Session::new()
             .map_err(|e| format!("Failed to initialize SSH session: {}", e))?;
         session.set_tcp_stream(tcp.try_clone().unwrap());
+        session.set_timeout(10000);
         session.handshake().map_err(|e| format!("SSH handshake failed: {}", e))?;
 
         // Authentication (with ~ home directory expansion for Windows & macOS)
@@ -192,7 +299,6 @@ pub async fn ssh_connect(
             session,
             _tcp: tcp,
             shells: HashMap::new(),
-            tunnels: HashMap::new(),
             sftp: None,
             host,
             port,
@@ -206,8 +312,9 @@ pub async fn ssh_connect(
             connecting_shells: HashSet::new(),
         };
         
+        let entry = Arc::new(SessionEntry::new(ssh_session));
         let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
-        sessions.insert(id, ssh_session);
+        sessions.insert(id, entry);
 
         Ok(SshConnectResult {
             success: true,
@@ -232,6 +339,7 @@ fn connect_session(
     let mut session = ssh2::Session::new()
         .map_err(|e| format!("Failed to initialize SSH session: {}", e))?;
     session.set_tcp_stream(tcp.try_clone().unwrap());
+    session.set_timeout((timeout_secs as u32) * 1000);
     session.handshake().map_err(|e| format!("SSH handshake failed: {}", e))?;
 
     if let Some(path_str) = key_path {
@@ -265,29 +373,42 @@ fn connect_session(
 }
 
 #[tauri::command]
-pub fn ssh_disconnect(state: tauri::State<'_, SshState>, id: String) -> Result<(), String> {
+pub async fn ssh_disconnect(state: tauri::State<'_, SshState>, id: String) -> Result<(), String> {
     if let Ok(mut fast) = state.fast_shells.lock() {
-        fast.remove(&id);
-        let split_prefix = format!("{}__split__", id);
-        fast.retain(|k, _| !k.starts_with(&split_prefix));
-    }
-    let mut sessions = state.sessions.lock().map_err(|e| e.to_string())?;
-    if let Some(old_session) = sessions.remove(&id) {
-        for (_, tunnel) in old_session.tunnels {
-            let _ = tunnel.shutdown_tx.send(());
+        if let Some(s) = fast.remove(&id) {
+            s.abort();
         }
+        let split_prefix = format!("{}__split__", id);
+        fast.retain(|k, s| {
+            if k.starts_with(&split_prefix) {
+                s.abort();
+                false
+            } else {
+                true
+            }
+        });
+    }
+    let old_entry = {
+        let mut sessions = state.sessions.lock().map_err(|e| e.to_string())?;
+        sessions.remove(&id)
+    };
+    if let Some(entry) = old_entry {
+        spawn_drop_session(entry);
     }
     Ok(())
 }
 
 fn get_or_create_dedicated_session(
     id: &str,
-    sessions_arc: &Arc<Mutex<HashMap<String, SshSession>>>,
+    sessions_arc: &Arc<Mutex<HashMap<String, Arc<SessionEntry>>>>,
     is_shell: bool,
 ) -> Result<ssh2::Session, String> {
+    let entry = get_session_entry(sessions_arc, id)?;
     let (host, port, username, password, key_path, existing_session) = {
-        let sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
-        let ssh_session = sessions.get(id).ok_or_else(|| "No active SSH connection".to_string())?;
+        let ssh_session = entry.inner.lock().map_err(|e| e.to_string())?;
+        if entry.closing.load(Ordering::SeqCst) {
+            return Err("Session closed".to_string());
+        }
         let sess = if is_shell { &ssh_session.shell_session } else { &ssh_session.tunnel_session };
         if let Some(ref s) = sess {
             (String::new(), 0, String::new(), None, None, Some(s.clone()))
@@ -314,19 +435,28 @@ fn get_or_create_dedicated_session(
             key_path.as_deref(),
             10
         )?;
+        if entry.closing.load(Ordering::SeqCst) {
+            session.set_blocking(false);
+            let _ = tcp.shutdown(Shutdown::Both);
+            return Err("Session closed".to_string());
+        }
         if !is_shell {
             session.set_blocking(false);
         }
-        
-        let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
-        if let Some(ssh_session) = sessions.get_mut(id) {
-            if is_shell {
-                ssh_session.shell_session = Some(session.clone());
-                ssh_session._shell_tcp = Some(tcp);
-            } else {
-                ssh_session.tunnel_session = Some(session.clone());
-                ssh_session._tunnel_tcp = Some(tcp);
-            }
+        entry.register_socket(&tcp);
+
+        let mut ssh_session = entry.inner.lock().map_err(|e| e.to_string())?;
+        if entry.closing.load(Ordering::SeqCst) {
+            session.set_blocking(false);
+            let _ = tcp.shutdown(Shutdown::Both);
+            return Err("Session closed".to_string());
+        }
+        if is_shell {
+            ssh_session.shell_session = Some(session.clone());
+            ssh_session._shell_tcp = Some(tcp);
+        } else {
+            ssh_session.tunnel_session = Some(session.clone());
+            ssh_session._tunnel_tcp = Some(tcp);
         }
         Ok(session)
     }
@@ -342,12 +472,15 @@ pub async fn ssh_open_shell(
     let sessions_arc = state.sessions.clone();
     let fast_shells_arc = state.fast_shells.clone();
     
-    // Acquire the lock to check if the shell is already registered or connecting.
+    // Acquire the lock briefly to check if the shell is already registered or connecting.
     // If it is, return early to prevent double execution.
     // Otherwise, mark it as connecting and fetch connection parameters.
+    let entry = get_session_entry(&sessions_arc, &id)?;
     let (host, port, username, password, key_path) = {
-        let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
-        let ssh_session = sessions.get_mut(&id).ok_or_else(|| "No active SSH connection".to_string())?;
+        let mut ssh_session = entry.inner.lock().map_err(|e| e.to_string())?;
+        if entry.closing.load(Ordering::SeqCst) {
+            return Err("Session closed".to_string());
+        }
         
         if ssh_session.shells.contains_key(&shell_id) || ssh_session.connecting_shells.contains(&shell_id) {
             return Ok(());
@@ -366,6 +499,7 @@ pub async fn ssh_open_shell(
 
     let shell_id_for_thread = shell_id.clone();
     let id_for_thread = id.clone();
+    let entry_for_connect = entry.clone();
     
     let connect_res = tokio::task::spawn_blocking(move || {
         // Connect a dedicated session just for this shell tab/pane
@@ -380,8 +514,8 @@ pub async fn ssh_open_shell(
         let (shell_session, tcp) = match connect_outcome {
             Ok(pair) => pair,
             Err(e) => {
-                if let Ok(mut sessions) = sessions_arc.lock() {
-                    if let Some(ssh_session) = sessions.get_mut(&id_for_thread) {
+                if !entry_for_connect.closing.load(Ordering::SeqCst) {
+                    if let Ok(mut ssh_session) = entry_for_connect.inner.lock() {
                         ssh_session.connecting_shells.remove(&shell_id_for_thread);
                     }
                 }
@@ -389,15 +523,24 @@ pub async fn ssh_open_shell(
             }
         };
         
-        // Double-check if the connection request was cancelled in the meantime
+        // Double-check if the session was closed or shell request was cancelled in the meantime
+        if entry_for_connect.closing.load(Ordering::SeqCst) {
+            shell_session.set_blocking(false);
+            let _ = tcp.shutdown(Shutdown::Both);
+            return Err("Session closed".to_string());
+        }
+        entry_for_connect.register_socket(&tcp);
         {
-            let sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
-            if let Some(ssh_session) = sessions.get(&id_for_thread) {
-                if !ssh_session.connecting_shells.contains(&shell_id_for_thread) {
-                    return Err("Cancelled".to_string());
-                }
-            } else {
+            let ssh_session = entry_for_connect.inner.lock().map_err(|e| e.to_string())?;
+            if entry_for_connect.closing.load(Ordering::SeqCst) {
+                shell_session.set_blocking(false);
+                let _ = tcp.shutdown(Shutdown::Both);
                 return Err("Session closed".to_string());
+            }
+            if !ssh_session.connecting_shells.contains(&shell_id_for_thread) {
+                shell_session.set_blocking(false);
+                let _ = tcp.shutdown(Shutdown::Both);
+                return Err("Cancelled".to_string());
             }
         }
         
@@ -419,15 +562,18 @@ pub async fn ssh_open_shell(
 
         let (write_tx, write_rx) = std::sync::mpsc::channel::<Vec<u8>>();
         let (resize_tx, resize_rx) = std::sync::mpsc::channel::<(u16, u16)>();
+        let shell_cancelled = Arc::new(AtomicBool::new(false));
 
         let shell_id_clone = shell_id_for_thread.clone();
         let id_clone = id_for_thread.clone();
         let app_handle_clone = app_handle.clone();
-        let sessions_cleanup_arc = sessions_arc.clone();
+        let entry_cleanup = entry_for_connect.clone();
         let fast_shells_cleanup_arc = fast_shells_arc.clone();
+        let cancelled_for_thread = shell_cancelled.clone();
         
         let shell_session_clone = shell_session.clone();
         let tcp_clone = tcp.try_clone().unwrap();
+        let tcp_for_handle = tcp.try_clone().unwrap();
 
         thread::spawn(move || {
             let mut buffer = [0u8; 16384];
@@ -480,6 +626,11 @@ pub async fn ssh_open_shell(
             _session.set_timeout(current_timeout_ms);
             
             loop {
+                if cancelled_for_thread.load(Ordering::SeqCst) || entry_cleanup.closing.load(Ordering::SeqCst) {
+                    _session.set_blocking(false);
+                    break;
+                }
+
                 // 1. Handle any pending resize requests
                 loop {
                     match resize_rx.try_recv() {
@@ -489,6 +640,7 @@ pub async fn ssh_open_shell(
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            _session.set_blocking(false);
                             return;
                         }
                     }
@@ -497,6 +649,10 @@ pub async fn ssh_open_shell(
                 // 2. Handle any pending write requests
                 let mut wrote_any = false;
                 loop {
+                    if cancelled_for_thread.load(Ordering::SeqCst) || entry_cleanup.closing.load(Ordering::SeqCst) {
+                        _session.set_blocking(false);
+                        return;
+                    }
                     match write_rx.try_recv() {
                         Ok(data) => {
                             last_activity = std::time::Instant::now();
@@ -504,6 +660,10 @@ pub async fn ssh_open_shell(
                             let mut written = 0;
                             let mut write_failed = false;
                             while written < bytes.len() {
+                                if cancelled_for_thread.load(Ordering::SeqCst) || entry_cleanup.closing.load(Ordering::SeqCst) {
+                                    _session.set_blocking(false);
+                                    return;
+                                }
                                 match channel.write(&bytes[written..]) {
                                     Ok(n) if n > 0 => {
                                         written += n;
@@ -525,6 +685,7 @@ pub async fn ssh_open_shell(
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            _session.set_blocking(false);
                             return;
                         }
                     }
@@ -544,15 +705,16 @@ pub async fn ssh_open_shell(
                 let mut reader = channel.stream(0);
                 match reader.read(&mut buffer) {
                     Ok(0) => {
-                        // Clean up dead shell registration so it can be reopened
                         if let Ok(mut fast) = fast_shells_cleanup_arc.lock() {
                             fast.remove(&shell_id_clone);
                         }
-                        if let Ok(mut sessions) = sessions_cleanup_arc.lock() {
-                            if let Some(ssh_session) = sessions.get_mut(&id_clone) {
-                                ssh_session.shells.remove(&shell_id_clone);
-                                ssh_session.connecting_shells.remove(&shell_id_clone);
-                            }
+                        if cancelled_for_thread.load(Ordering::SeqCst) || entry_cleanup.closing.load(Ordering::SeqCst) {
+                            _session.set_blocking(false);
+                            break;
+                        }
+                        if let Ok(mut ssh_session) = entry_cleanup.inner.lock() {
+                            ssh_session.shells.remove(&shell_id_clone);
+                            ssh_session.connecting_shells.remove(&shell_id_clone);
                         }
                         let _ = app_handle_clone.emit(
                             &format!("ssh-output-{}", shell_id_clone),
@@ -571,6 +733,9 @@ pub async fn ssh_open_shell(
                                 _session.set_timeout(2);
                             }
                             while utf8_remainder.len() < 65536 && burst_start.elapsed() < Duration::from_millis(8) {
+                                if cancelled_for_thread.load(Ordering::SeqCst) || entry_cleanup.closing.load(Ordering::SeqCst) {
+                                    break;
+                                }
                                 match reader.read(&mut buffer) {
                                     Ok(more) if more > 0 => {
                                         utf8_remainder.extend_from_slice(&buffer[..more]);
@@ -591,15 +756,17 @@ pub async fn ssh_open_shell(
                         // Expected timeout when no data is available
                     }
                     Err(ref e) => {
-                        let err_detail = format!("I/O Error: {}", e);
                         if let Ok(mut fast) = fast_shells_cleanup_arc.lock() {
                             fast.remove(&shell_id_clone);
                         }
-                        if let Ok(mut sessions) = sessions_cleanup_arc.lock() {
-                            if let Some(ssh_session) = sessions.get_mut(&id_clone) {
-                                ssh_session.shells.remove(&shell_id_clone);
-                                ssh_session.connecting_shells.remove(&shell_id_clone);
-                            }
+                        if cancelled_for_thread.load(Ordering::SeqCst) || entry_cleanup.closing.load(Ordering::SeqCst) {
+                            _session.set_blocking(false);
+                            break;
+                        }
+                        let err_detail = format!("I/O Error: {}", e);
+                        if let Ok(mut ssh_session) = entry_cleanup.inner.lock() {
+                            ssh_session.shells.remove(&shell_id_clone);
+                            ssh_session.connecting_shells.remove(&shell_id_clone);
                         }
                         let _ = app_handle_clone.emit(
                             &format!("ssh-output-{}", shell_id_clone),
@@ -615,17 +782,32 @@ pub async fn ssh_open_shell(
 
         // Register the active SshShell to the session and fast_shells, and remove from connecting set
         {
-            let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
-            if let Some(ssh_session) = sessions.get_mut(&id_for_thread) {
-                if ssh_session.connecting_shells.remove(&shell_id_for_thread) {
-                    let shell_handle = SshShell { write_tx, resize_tx };
-                    if let Ok(mut fast) = fast_shells_arc.lock() {
-                        fast.insert(shell_id_for_thread.clone(), shell_handle.clone());
-                    }
-                    ssh_session.shells.insert(shell_id_for_thread, shell_handle);
-                } else {
-                    return Err("Cancelled".to_string());
+            if entry_for_connect.closing.load(Ordering::SeqCst) {
+                shell_cancelled.store(true, Ordering::SeqCst);
+                let _ = tcp_for_handle.shutdown(Shutdown::Both);
+                return Err("Session closed".to_string());
+            }
+            let mut ssh_session = entry_for_connect.inner.lock().map_err(|e| e.to_string())?;
+            if entry_for_connect.closing.load(Ordering::SeqCst) {
+                shell_cancelled.store(true, Ordering::SeqCst);
+                let _ = tcp_for_handle.shutdown(Shutdown::Both);
+                return Err("Session closed".to_string());
+            }
+            if ssh_session.connecting_shells.remove(&shell_id_for_thread) {
+                let shell_handle = SshShell {
+                    write_tx,
+                    resize_tx,
+                    cancelled: shell_cancelled,
+                    tcp: Arc::new(tcp_for_handle),
+                };
+                if let Ok(mut fast) = fast_shells_arc.lock() {
+                    fast.insert(shell_id_for_thread.clone(), shell_handle.clone());
                 }
+                ssh_session.shells.insert(shell_id_for_thread, shell_handle);
+            } else {
+                shell_cancelled.store(true, Ordering::SeqCst);
+                let _ = tcp_for_handle.shutdown(Shutdown::Both);
+                return Err("Cancelled".to_string());
             }
         }
         
@@ -658,9 +840,9 @@ pub fn ssh_write_shell(
         }
     }
 
+    let entry = get_session_entry(&state.sessions, &id)?;
     let write_tx = {
-        let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
-        let ssh_session = sessions.get(&id).ok_or_else(|| "No active SSH connection".to_string())?;
+        let ssh_session = entry.inner.lock().map_err(|e| e.to_string())?;
         let shell = ssh_session.shells.get(&shell_id).ok_or_else(|| "Shell not found".to_string())?;
         shell.write_tx.clone()
     };
@@ -687,9 +869,9 @@ pub fn ssh_resize_shell(
         }
     }
 
+    let entry = get_session_entry(&state.sessions, &id)?;
     let resize_tx = {
-        let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
-        let ssh_session = sessions.get(&id).ok_or_else(|| "No active SSH connection".to_string())?;
+        let ssh_session = entry.inner.lock().map_err(|e| e.to_string())?;
         let shell = ssh_session.shells.get(&shell_id).ok_or_else(|| "Shell not found".to_string())?;
         shell.resize_tx.clone()
     };
@@ -699,18 +881,35 @@ pub fn ssh_resize_shell(
 }
 
 #[tauri::command]
-pub fn ssh_close_shell(
+pub async fn ssh_close_shell(
     state: tauri::State<'_, SshState>,
     id: String,
     shell_id: String,
 ) -> Result<(), String> {
     if let Ok(mut fast) = state.fast_shells.lock() {
-        fast.remove(&shell_id);
+        if let Some(shell) = fast.remove(&shell_id) {
+            shell.abort();
+        }
     }
-    let mut sessions = state.sessions.lock().map_err(|e| e.to_string())?;
-    let ssh_session = sessions.get_mut(&id).ok_or_else(|| "No active SSH connection".to_string())?;
-    ssh_session.shells.remove(&shell_id);
-    ssh_session.connecting_shells.remove(&shell_id);
+    let entry = {
+        let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
+        sessions.get(&id).cloned()
+    };
+    let Some(entry) = entry else {
+        return Ok(());
+    };
+    if entry.closing.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Ok(mut ssh_session) = entry.inner.lock() {
+            if let Some(shell) = ssh_session.shells.remove(&shell_id) {
+                shell.abort();
+            }
+            ssh_session.connecting_shells.remove(&shell_id);
+        }
+    })
+    .await;
     Ok(())
 }
 
@@ -742,19 +941,22 @@ pub async fn ssh_exec(
 
     tokio::task::spawn_blocking(move || {
         // Use dedicated shell_session (exec_session) without holding the global sessions Mutex during network I/O
+        let entry = get_session_entry(&sessions_arc, &id)?;
         let exec_session = get_or_create_dedicated_session(&id, &sessions_arc, true)?;
         match run_exec_on_session(&exec_session, &command) {
             Ok(res) => Ok(res),
-            Err(_) => {
+            Err(e) => {
+                if entry.closing.load(Ordering::SeqCst) {
+                    return Err(format!("Session closed: {}", e));
+                }
                 // Invalidate dead exec_session and retry once with a fresh connection
                 {
-                    let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
-                    if let Some(ssh_session) = sessions.get_mut(&id) {
-                        ssh_session.shell_session = None;
-                        ssh_session._shell_tcp = None;
-                    } else {
-                        return Err("No active SSH connection".to_string());
+                    let mut ssh_session = entry.inner.lock().map_err(|err| err.to_string())?;
+                    if entry.closing.load(Ordering::SeqCst) {
+                        return Err("Session closed".to_string());
                     }
+                    ssh_session.shell_session = None;
+                    ssh_session._shell_tcp = None;
                 }
                 let retry_session = get_or_create_dedicated_session(&id, &sessions_arc, true)?;
                 run_exec_on_session(&retry_session, &command)
@@ -766,7 +968,10 @@ pub async fn ssh_exec(
 }
 
 impl SshSession {
-    pub fn reset_and_reconnect(&mut self) -> Result<(), String> {
+    pub fn reset_and_reconnect(&mut self, entry: &SessionEntry) -> Result<(), String> {
+        if entry.closing.load(Ordering::SeqCst) {
+            return Err("Session closed".to_string());
+        }
         self.sftp = None;
         self.tunnel_session = None;
         self._tunnel_tcp = None;
@@ -780,19 +985,28 @@ impl SshSession {
             self.key_path.as_deref(),
             10,
         )?;
+        if entry.closing.load(Ordering::SeqCst) {
+            new_session.set_blocking(false);
+            let _ = new_tcp.shutdown(Shutdown::Both);
+            return Err("Session closed".to_string());
+        }
+        entry.register_socket(&new_tcp);
         self.session = new_session;
         self._tcp = new_tcp;
         Ok(())
     }
 
-    pub fn ensure_sftp<'a>(&'a mut self) -> Result<&'a ssh2::Sftp, String> {
+    pub fn ensure_sftp<'a>(&'a mut self, entry: &SessionEntry) -> Result<&'a ssh2::Sftp, String> {
+        if entry.closing.load(Ordering::SeqCst) {
+            return Err("Session closed".to_string());
+        }
         if self.sftp.is_none() {
             match self.session.sftp() {
                 Ok(sftp) => {
                     self.sftp = Some(sftp);
                 }
                 Err(_) => {
-                    self.reset_and_reconnect()?;
+                    self.reset_and_reconnect(entry)?;
                     let sftp = self.session.sftp()
                         .map_err(|e| format!("Failed to start SFTP session after reconnect: {}", e))?;
                     self.sftp = Some(sftp);
@@ -807,22 +1021,41 @@ impl SshSession {
     }
 }
 
-fn with_sftp<T, F>(ssh_session: &mut SshSession, f: F) -> Result<T, String>
+fn with_sftp<T, F>(entry: &SessionEntry, ssh_session: &mut SshSession, f: F) -> Result<T, String>
 where
     F: Fn(&ssh2::Sftp) -> Result<T, String>,
 {
-    let sftp = ssh_session.ensure_sftp()?;
+    let sftp = ssh_session.ensure_sftp(entry)?;
     match f(sftp) {
         Ok(res) => Ok(res),
         Err(err_msg) => {
             ssh_session.invalidate_sftp();
-            if let Err(reconnect_err) = ssh_session.reset_and_reconnect() {
+            if entry.closing.load(Ordering::SeqCst) {
+                return Err("Session closed".to_string());
+            }
+            if let Err(reconnect_err) = ssh_session.reset_and_reconnect(entry) {
                 return Err(format!("{}. Reconnect failed: {}", err_msg, reconnect_err));
             }
-            let sftp = ssh_session.ensure_sftp()?;
+            let sftp = ssh_session.ensure_sftp(entry)?;
             f(sftp)
         }
     }
+}
+
+fn with_entry_sftp<T, F>(
+    sessions_arc: &Arc<Mutex<HashMap<String, Arc<SessionEntry>>>>,
+    id: &str,
+    f: F,
+) -> Result<T, String>
+where
+    F: Fn(&ssh2::Sftp) -> Result<T, String>,
+{
+    let entry = get_session_entry(sessions_arc, id)?;
+    let mut ssh_session = entry.inner.lock().map_err(|e| e.to_string())?;
+    if entry.closing.load(Ordering::SeqCst) {
+        return Err("Session closed".to_string());
+    }
+    with_sftp(&entry, &mut ssh_session, f)
 }
 
 #[tauri::command]
@@ -833,10 +1066,7 @@ pub async fn sftp_list(
 ) -> Result<Vec<SftpFile>, String> {
     let sessions_arc = state.sessions.clone();
     tokio::task::spawn_blocking(move || {
-        let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
-        let ssh_session = sessions.get_mut(&id).ok_or_else(|| "No active SSH connection".to_string())?;
-
-        with_sftp(ssh_session, |sftp| {
+        with_entry_sftp(&sessions_arc, &id, |sftp| {
             let entries = sftp.readdir(Path::new(&path))
                 .map_err(|e| format!("Failed to read SFTP directory: {}", e))?;
 
@@ -885,9 +1115,7 @@ pub async fn sftp_list(
 pub async fn sftp_mkdir(state: tauri::State<'_, SshState>, id: String, path: String) -> Result<bool, String> {
     let sessions_arc = state.sessions.clone();
     tokio::task::spawn_blocking(move || {
-        let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
-        let ssh_session = sessions.get_mut(&id).ok_or_else(|| "No active SSH connection".to_string())?;
-        with_sftp(ssh_session, |sftp| {
+        with_entry_sftp(&sessions_arc, &id, |sftp| {
             sftp.mkdir(Path::new(&path), 0o755).map_err(|e| e.to_string())?;
             Ok(true)
         })
@@ -922,9 +1150,7 @@ fn sftp_remove_dir_all_recursive(sftp: &ssh2::Sftp, path: &Path) -> Result<(), S
 pub async fn sftp_rmdir(state: tauri::State<'_, SshState>, id: String, path: String) -> Result<bool, String> {
     let sessions_arc = state.sessions.clone();
     tokio::task::spawn_blocking(move || {
-        let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
-        let ssh_session = sessions.get_mut(&id).ok_or_else(|| "No active SSH connection".to_string())?;
-        with_sftp(ssh_session, |sftp| {
+        with_entry_sftp(&sessions_arc, &id, |sftp| {
             let p = Path::new(&path);
             if let Err(_) = sftp.rmdir(p) {
                 sftp_remove_dir_all_recursive(sftp, p)?;
@@ -940,9 +1166,7 @@ pub async fn sftp_rmdir(state: tauri::State<'_, SshState>, id: String, path: Str
 pub async fn sftp_unlink(state: tauri::State<'_, SshState>, id: String, path: String) -> Result<bool, String> {
     let sessions_arc = state.sessions.clone();
     tokio::task::spawn_blocking(move || {
-        let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
-        let ssh_session = sessions.get_mut(&id).ok_or_else(|| "No active SSH connection".to_string())?;
-        with_sftp(ssh_session, |sftp| {
+        with_entry_sftp(&sessions_arc, &id, |sftp| {
             sftp.unlink(Path::new(&path)).map_err(|e| e.to_string())?;
             Ok(true)
         })
@@ -960,9 +1184,7 @@ pub async fn sftp_rename(
 ) -> Result<bool, String> {
     let sessions_arc = state.sessions.clone();
     tokio::task::spawn_blocking(move || {
-        let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
-        let ssh_session = sessions.get_mut(&id).ok_or_else(|| "No active SSH connection".to_string())?;
-        with_sftp(ssh_session, |sftp| {
+        with_entry_sftp(&sessions_arc, &id, |sftp| {
             sftp.rename(Path::new(&old_path), Path::new(&new_path), None).map_err(|e| e.to_string())?;
             Ok(true)
         })
@@ -979,9 +1201,7 @@ pub async fn sftp_stat(
 ) -> Result<SftpFile, String> {
     let sessions_arc = state.sessions.clone();
     tokio::task::spawn_blocking(move || {
-        let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
-        let ssh_session = sessions.get_mut(&id).ok_or_else(|| "No active SSH connection".to_string())?;
-        with_sftp(ssh_session, |sftp| {
+        with_entry_sftp(&sessions_arc, &id, |sftp| {
             let path = Path::new(&file_path);
             let stat = sftp.stat(path).map_err(|e| e.to_string())?;
             let name = path.file_name()
@@ -1011,9 +1231,7 @@ pub async fn sftp_chmod(
 ) -> Result<bool, String> {
     let sessions_arc = state.sessions.clone();
     tokio::task::spawn_blocking(move || {
-        let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
-        let ssh_session = sessions.get_mut(&id).ok_or_else(|| "No active SSH connection".to_string())?;
-        with_sftp(ssh_session, |sftp| {
+        with_entry_sftp(&sessions_arc, &id, |sftp| {
             let mut stat = sftp.stat(Path::new(&file_path)).map_err(|e| e.to_string())?;
             stat.perm = Some(mode);
             sftp.setstat(Path::new(&file_path), stat).map_err(|e| e.to_string())?;
@@ -1232,16 +1450,19 @@ fn download_single_file_chunked(
 
 fn get_or_create_transfer_session(
     id: &str,
-    sessions_arc: &Arc<Mutex<HashMap<String, SshSession>>>,
+    sessions_arc: &Arc<Mutex<HashMap<String, Arc<SessionEntry>>>>,
 ) -> Result<ssh2::Session, String> {
-    let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
-    let ssh_session = sessions.get_mut(id).ok_or_else(|| "No active SSH connection".to_string())?;
+    let entry = get_session_entry(sessions_arc, id)?;
+    let mut ssh_session = entry.inner.lock().map_err(|e| e.to_string())?;
+    if entry.closing.load(Ordering::SeqCst) {
+        return Err("Session closed".to_string());
+    }
 
-    if ssh_session.ensure_sftp().is_ok() {
+    if ssh_session.ensure_sftp(&entry).is_ok() {
         return Ok(ssh_session.session.clone());
     }
 
-    ssh_session.reset_and_reconnect()?;
+    ssh_session.reset_and_reconnect(&entry)?;
     Ok(ssh_session.session.clone())
 }
 
@@ -1534,14 +1755,13 @@ pub async fn ssh_forward_local(
     
     tokio::task::spawn_blocking(move || {
         // Stop existing tunnel with the same ID if present
+        let entry = get_session_entry(&sessions_arc, &id)?;
         {
-            if let Ok(mut sessions) = sessions_arc.lock() {
-                if let Some(ssh_session) = sessions.get_mut(&id) {
-                    if let Some(old_tunnel) = ssh_session.tunnels.remove(&tunnel_id) {
-                        let _ = old_tunnel.shutdown_tx.send(());
-                        drop(sessions);
-                        thread::sleep(Duration::from_millis(60));
-                    }
+            if let Ok(mut tunnels) = entry.tunnels.lock() {
+                if let Some(old_tunnel) = tunnels.remove(&tunnel_id) {
+                    let _ = old_tunnel.shutdown_tx.send(());
+                    drop(tunnels);
+                    thread::sleep(Duration::from_millis(60));
                 }
             }
         }
@@ -1677,9 +1897,10 @@ pub async fn ssh_forward_local(
             }
         });
 
-        let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
-        if let Some(ssh_session) = sessions.get_mut(&id) {
-            ssh_session.tunnels.insert(tunnel_id, SshTunnel { shutdown_tx });
+        if !entry.closing.load(Ordering::SeqCst) {
+            if let Ok(mut tunnels) = entry.tunnels.lock() {
+                tunnels.insert(tunnel_id, SshTunnel { shutdown_tx });
+            }
         }
         Ok(true)
     })
@@ -1700,6 +1921,7 @@ pub async fn ssh_forward_remote(
     let sessions_arc = state.sessions.clone();
 
     tokio::task::spawn_blocking(move || {
+        let entry = get_session_entry(&sessions_arc, &id)?;
         let tunnel_session = get_or_create_dedicated_session(&id, &sessions_arc, false)?;
 
         tunnel_session.set_blocking(true);
@@ -1791,9 +2013,10 @@ pub async fn ssh_forward_remote(
             }
         });
 
-        let mut sessions = sessions_arc.lock().map_err(|e| e.to_string())?;
-        if let Some(ssh_session) = sessions.get_mut(&id) {
-            ssh_session.tunnels.insert(tunnel_id, SshTunnel { shutdown_tx });
+        if !entry.closing.load(Ordering::SeqCst) {
+            if let Ok(mut tunnels) = entry.tunnels.lock() {
+                tunnels.insert(tunnel_id, SshTunnel { shutdown_tx });
+            }
         }
         Ok(true)
     })
@@ -1802,15 +2025,22 @@ pub async fn ssh_forward_remote(
 }
 
 #[tauri::command]
-pub fn ssh_stop_tunnel(
+pub async fn ssh_stop_tunnel(
     state: tauri::State<'_, SshState>,
     id: String,
     tunnel_id: String,
 ) -> Result<(), String> {
-    let mut sessions = state.sessions.lock().map_err(|e| e.to_string())?;
-    let ssh_session = sessions.get_mut(&id).ok_or_else(|| "No active SSH connection".to_string())?;
-    if let Some(tunnel) = ssh_session.tunnels.remove(&tunnel_id) {
-        let _ = tunnel.shutdown_tx.send(());
+    let entry = {
+        let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
+        sessions.get(&id).cloned()
+    };
+    let Some(entry) = entry else {
+        return Ok(());
+    };
+    if let Ok(mut tunnels) = entry.tunnels.lock() {
+        if let Some(tunnel) = tunnels.remove(&tunnel_id) {
+            let _ = tunnel.shutdown_tx.send(());
+        }
     }
     Ok(())
 }

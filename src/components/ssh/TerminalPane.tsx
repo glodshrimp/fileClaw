@@ -356,8 +356,8 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
     })();
     return () => {
       cancelled = true;
-      // Close the shell when pane unmounts
-      window.electronAPI.sshCloseShell(sshId, shellId);
+      // Close the shell when pane unmounts (ignore errors if the whole session already closed)
+      Promise.resolve(window.electronAPI.sshCloseShell(sshId, shellId)).catch(() => {});
     };
   }, [sshId, shellId, isLocal, isSerial, cwd, shell, reconnectTrigger]);
 
