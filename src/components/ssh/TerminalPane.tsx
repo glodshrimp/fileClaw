@@ -148,6 +148,8 @@ export interface TerminalPaneProps {
   localEcho?: boolean;
   /** Line ending mapping for serial port mode */
   lineEnding?: 'cr' | 'lf' | 'crlf';
+  /** Whether SSH connection is authenticated and ready to open a shell */
+  canOpenShell?: boolean;
 }
 
 const SHIFT_SYMBOL_BY_CODE: Record<string, string> = {
@@ -198,7 +200,7 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
   sshId, shellId, isFocused, isDefaultShell, onFocus, onClose, showClose,
   mode = 'ssh', onInputData, autoStripLineNumbers = false, asciiPunctuation = true,
   isMaximized = false, onToggleMaximize, isDragging = false, cwd,
-  shell, localEcho = false, lineEnding = 'cr',
+  shell, localEcho = false, lineEnding = 'cr', canOpenShell = true,
 }) => {
   const isLocal = mode === 'local';
   const isSerial = mode === 'serial';
@@ -337,6 +339,10 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
       };
     }
 
+    if (!canOpenShell) {
+      return;
+    }
+
     let cancelled = false;
     (async () => {
       try {
@@ -359,7 +365,7 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
       // Close the shell when pane unmounts (ignore errors if the whole session already closed)
       Promise.resolve(window.electronAPI.sshCloseShell(sshId, shellId)).catch(() => {});
     };
-  }, [sshId, shellId, isLocal, isSerial, cwd, shell, reconnectTrigger]);
+  }, [sshId, shellId, isLocal, isSerial, cwd, shell, reconnectTrigger, canOpenShell]);
 
   // ── Initialize xterm ────────────────────────────────────────────────────────
 

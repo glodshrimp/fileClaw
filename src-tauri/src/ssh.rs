@@ -30,11 +30,16 @@ pub struct SshTunnel {
     shutdown_tx: std::sync::mpsc::Sender<()>,
 }
 
-pub struct SshSession {
-    session: ssh2::Session,
-    _tcp: TcpStream,
-    shells: HashMap<String, SshShell>,
+#[derive(Default)]
+pub struct SftpSessionState {
+    session: Option<ssh2::Session>,
+    _tcp: Option<TcpStream>,
     sftp: Option<ssh2::Sftp>,
+}
+
+pub struct SshSession {
+    pending_primary_shell: Option<(ssh2::Session, TcpStream)>,
+    shells: HashMap<String, SshShell>,
     
     // Connection parameters to lazy-connect dedicated sessions
     host: String,
@@ -54,19 +59,24 @@ pub struct SessionEntry {
     pub closing: AtomicBool,
     pub sockets: Mutex<Vec<TcpStream>>,
     pub tunnels: Mutex<HashMap<String, SshTunnel>>,
+    /// Dedicated SFTP connection lock so SFTP connect/I/O never blocks shell open, resize, or exec
+    pub sftp_state: Mutex<SftpSessionState>,
     pub inner: Mutex<SshSession>,
 }
 
 impl SessionEntry {
     fn new(ssh_session: SshSession) -> Self {
         let mut sockets = Vec::new();
-        if let Ok(cloned) = ssh_session._tcp.try_clone() {
-            sockets.push(cloned);
+        if let Some((_, ref tcp)) = ssh_session.pending_primary_shell {
+            if let Ok(cloned) = tcp.try_clone() {
+                sockets.push(cloned);
+            }
         }
         Self {
             closing: AtomicBool::new(false),
             sockets: Mutex::new(sockets),
             tunnels: Mutex::new(HashMap::new()),
+            sftp_state: Mutex::new(SftpSessionState::default()),
             inner: Mutex::new(ssh_session),
         }
     }
@@ -79,8 +89,19 @@ impl SessionEntry {
         }
     }
 
+    fn connection_params(&self) -> Result<(String, u16, String, Option<String>, Option<String>), String> {
+        let inner = self.inner.lock().map_err(|e| e.to_string())?;
+        Ok((
+            inner.host.clone(),
+            inner.port,
+            inner.username.clone(),
+            inner.password.clone(),
+            inner.key_path.clone(),
+        ))
+    }
+
     /// Immediately mark closing, stop tunnels, and shut down all tracked TCP sockets
-    /// without waiting for `inner` (which may be blocked in SFTP/exec I/O).
+    /// without waiting for `inner` or `sftp_state` (which may be blocked in I/O).
     fn begin_close(&self) {
         self.closing.store(true, Ordering::SeqCst);
         if let Ok(mut tunnels) = self.tunnels.lock() {
@@ -104,19 +125,29 @@ fn spawn_drop_session(entry: Arc<SessionEntry>) {
                 shell.abort();
             }
             inner.connecting_shells.clear();
-            inner.sftp = None;
-            inner.session.set_blocking(false);
+            if let Some((ref s, ref t)) = inner.pending_primary_shell {
+                s.set_blocking(false);
+                let _ = t.shutdown(Shutdown::Both);
+            }
             if let Some(ref s) = inner.shell_session {
                 s.set_blocking(false);
             }
             if let Some(ref s) = inner.tunnel_session {
                 s.set_blocking(false);
             }
-            let _ = inner._tcp.shutdown(Shutdown::Both);
             if let Some(ref t) = inner._shell_tcp {
                 let _ = t.shutdown(Shutdown::Both);
             }
             if let Some(ref t) = inner._tunnel_tcp {
+                let _ = t.shutdown(Shutdown::Both);
+            }
+        }
+        if let Ok(mut sftp_state) = entry.sftp_state.lock() {
+            sftp_state.sftp = None;
+            if let Some(ref s) = sftp_state.session {
+                s.set_blocking(false);
+            }
+            if let Some(ref t) = sftp_state._tcp {
                 let _ = t.shutdown(Shutdown::Both);
             }
         }
@@ -211,8 +242,111 @@ fn connect_tcp_with_timeout(host: &str, port: u16, timeout_secs: u64) -> Result<
     Ok(tcp)
 }
 
+struct PasswordPrompter<'a>(&'a str);
+
+impl<'a> ssh2::KeyboardInteractivePrompt for PasswordPrompter<'a> {
+    fn prompt<'b>(
+        &mut self,
+        _username: &str,
+        _instructions: &str,
+        prompts: &[ssh2::Prompt<'b>],
+    ) -> Vec<String> {
+        prompts.iter().map(|_| self.0.to_string()).collect()
+    }
+}
+
+fn emit_shell_status(progress: Option<&(AppHandle, String)>, line: &str) {
+    if let Some((app_handle, channel_id)) = progress {
+        let _ = app_handle.emit(&format!("ssh-output-{}", channel_id), line.to_string());
+    }
+}
+
+fn connect_session_with_progress(
+    host: &str,
+    port: u16,
+    username: &str,
+    password: Option<&str>,
+    key_path: Option<&str>,
+    tcp_timeout_secs: u64,
+    progress: Option<&(AppHandle, String)>,
+) -> Result<(ssh2::Session, TcpStream), String> {
+    emit_shell_status(
+        progress,
+        &format!("\x1b[90mConnecting to {}:{}...\x1b[0m\r\n", host, port),
+    );
+    let tcp = connect_tcp_with_timeout(host, port, tcp_timeout_secs)?;
+    emit_shell_status(
+        progress,
+        &format!(
+            "\x1b[32mConnection established.\x1b[0m\r\n\x1b[90mAuthenticating as {}...\x1b[0m\r\n",
+            username
+        ),
+    );
+
+    let mut session = ssh2::Session::new()
+        .map_err(|e| format!("Failed to initialize SSH session: {}", e))?;
+    session.set_tcp_stream(tcp.try_clone().unwrap());
+    // Allow up to 30s for handshake and authentication (covers servers with slow UseDNS/PAM)
+    session.set_timeout(30000);
+    session.handshake().map_err(|e| format!("SSH handshake failed: {}", e))?;
+
+    if let Some(path_str) = key_path.filter(|s| !s.trim().is_empty()) {
+        let expanded_path = expand_tilde(path_str);
+        session
+            .userauth_pubkey_file(username, None, &expanded_path, password)
+            .map_err(|e| format!("Public key authentication failed ({}): {}", expanded_path.display(), e))?;
+    } else if let Some(pass) = password {
+        if let Err(pw_err) = session.userauth_password(username, pass) {
+            // Fall back to keyboard-interactive only if password auth didn't time out and the
+            // server advertises keyboard-interactive support.
+            let is_timeout = pw_err.code() == ssh2::ErrorCode::Session(-30)
+                || pw_err.to_string().to_lowercase().contains("timeout");
+            let supports_kbd = !is_timeout
+                && session
+                    .auth_methods(username)
+                    .map(|m| m.contains("keyboard-interactive"))
+                    .unwrap_or(false);
+            if supports_kbd {
+                let mut prompter = PasswordPrompter(pass);
+                session
+                    .userauth_keyboard_interactive(username, &mut prompter)
+                    .map_err(|e| format!("Keyboard-interactive authentication failed: {}", e))?;
+            } else {
+                return Err(format!("Password authentication failed: {}", pw_err));
+            }
+        }
+    } else {
+        return Err("Authentication method missing".to_string());
+    }
+
+    if !session.authenticated() {
+        return Err("Authentication failed".to_string());
+    }
+
+    session.set_timeout(15000);
+    session.set_keepalive(true, 10);
+    emit_shell_status(
+        progress,
+        "\x1b[32mAuthentication succeeded. Opening shell...\x1b[0m\r\n",
+    );
+
+    Ok((session, tcp))
+}
+
+fn connect_session(
+    host: &str,
+    port: u16,
+    username: &str,
+    password: Option<&str>,
+    key_path: Option<&str>,
+    tcp_timeout_secs: u64,
+) -> Result<(ssh2::Session, TcpStream), String> {
+    connect_session_with_progress(host, port, username, password, key_path, tcp_timeout_secs, None)
+}
+
 #[tauri::command]
 pub async fn ssh_connect(
+    app_handle: AppHandle,
     state: tauri::State<'_, SshState>,
     id: String,
     host: String,
@@ -250,56 +384,33 @@ pub async fn ssh_connect(
             }
         }
 
-        let tcp = connect_tcp_with_timeout(&host, port, 10)?;
-
-        let mut session = ssh2::Session::new()
-            .map_err(|e| format!("Failed to initialize SSH session: {}", e))?;
-        session.set_tcp_stream(tcp.try_clone().unwrap());
-        session.set_timeout(10000);
-        session.handshake().map_err(|e| format!("SSH handshake failed: {}", e))?;
-
-        // Authentication (with ~ home directory expansion for Windows & macOS)
-        if let Some(ref path_str) = key_path {
-            if !path_str.trim().is_empty() {
-                let expanded_path = expand_tilde(path_str);
-                session.userauth_pubkey_file(&username, None, &expanded_path, password.as_deref())
-                    .map_err(|e| format!("Public key authentication failed ({}): {}", expanded_path.display(), e))?;
-            } else if let Some(ref pass) = password {
-                session.userauth_password(&username, pass)
-                    .map_err(|e| format!("Password authentication failed: {}", e))?;
-            } else {
+        let progress = (app_handle, id.clone());
+        let (session, tcp) = match connect_session_with_progress(
+            &host,
+            port,
+            &username,
+            password.as_deref(),
+            key_path.as_deref(),
+            10,
+            Some(&progress),
+        ) {
+            Ok(pair) => pair,
+            Err(err_msg) => {
+                emit_shell_status(
+                    Some(&progress),
+                    &format!("\r\n\x1b[31m[连接失败: {}]\x1b[0m\r\n", err_msg),
+                );
                 return Ok(SshConnectResult {
                     success: false,
-                    error: Some("Authentication method missing".to_string()),
+                    error: Some(err_msg),
                     message: None,
                 });
             }
-        } else if let Some(ref pass) = password {
-            session.userauth_password(&username, pass)
-                .map_err(|e| format!("Password authentication failed: {}", e))?;
-        } else {
-            return Ok(SshConnectResult {
-                success: false,
-                error: Some("Authentication method missing".to_string()),
-                message: None,
-            });
-        }
-
-        if !session.authenticated() {
-            return Ok(SshConnectResult {
-                success: false,
-                error: Some("Authentication failed".to_string()),
-                message: None,
-            });
-        }
-
-        session.set_keepalive(true, 10);
+        };
 
         let ssh_session = SshSession {
-            session,
-            _tcp: tcp,
+            pending_primary_shell: Some((session, tcp)),
             shells: HashMap::new(),
-            sftp: None,
             host,
             port,
             username,
@@ -324,52 +435,6 @@ pub async fn ssh_connect(
     })
     .await
     .map_err(|_| "Task panicked".to_string())?
-}
-
-fn connect_session(
-    host: &str,
-    port: u16,
-    username: &str,
-    password: Option<&str>,
-    key_path: Option<&str>,
-    timeout_secs: u64
-) -> Result<(ssh2::Session, TcpStream), String> {
-    let tcp = connect_tcp_with_timeout(host, port, timeout_secs)?;
-
-    let mut session = ssh2::Session::new()
-        .map_err(|e| format!("Failed to initialize SSH session: {}", e))?;
-    session.set_tcp_stream(tcp.try_clone().unwrap());
-    session.set_timeout((timeout_secs as u32) * 1000);
-    session.handshake().map_err(|e| format!("SSH handshake failed: {}", e))?;
-
-    if let Some(path_str) = key_path {
-        if !path_str.trim().is_empty() {
-            let expanded_path = expand_tilde(path_str);
-            session.userauth_pubkey_file(
-                username,
-                None,
-                &expanded_path,
-                password,
-            )
-            .map_err(|e| format!("Public key auth failed ({}): {}", expanded_path.display(), e))?;
-        } else if let Some(pass) = password {
-            session.userauth_password(username, pass)
-                .map_err(|e| format!("Password auth failed: {}", e))?;
-        }
-    } else if let Some(pass) = password {
-        session.userauth_password(username, pass)
-            .map_err(|e| format!("Password auth failed: {}", e))?;
-    } else {
-        return Err("Authentication method missing".to_string());
-    }
-
-    if !session.authenticated() {
-        return Err("Authentication failed".to_string());
-    }
-
-    session.set_keepalive(true, 10);
-    
-    Ok((session, tcp))
 }
 
 #[tauri::command]
@@ -472,54 +537,68 @@ pub async fn ssh_open_shell(
     let sessions_arc = state.sessions.clone();
     let fast_shells_arc = state.fast_shells.clone();
     
-    // Acquire the lock briefly to check if the shell is already registered or connecting.
-    // If it is, return early to prevent double execution.
-    // Otherwise, mark it as connecting and fetch connection parameters.
-    let entry = get_session_entry(&sessions_arc, &id)?;
-    let (host, port, username, password, key_path) = {
-        let mut ssh_session = entry.inner.lock().map_err(|e| e.to_string())?;
-        if entry.closing.load(Ordering::SeqCst) {
-            return Err("Session closed".to_string());
-        }
-        
-        if ssh_session.shells.contains_key(&shell_id) || ssh_session.connecting_shells.contains(&shell_id) {
-            return Ok(());
-        }
-        
-        ssh_session.connecting_shells.insert(shell_id.clone());
-        
-        (
-            ssh_session.host.clone(),
-            ssh_session.port,
-            ssh_session.username.clone(),
-            ssh_session.password.clone(),
-            ssh_session.key_path.clone(),
-        )
-    };
-
-    let shell_id_for_thread = shell_id.clone();
-    let id_for_thread = id.clone();
-    let entry_for_connect = entry.clone();
-    
     let connect_res = tokio::task::spawn_blocking(move || {
-        // Connect a dedicated session just for this shell tab/pane
-        let connect_outcome = connect_session(
-            &host,
-            port,
-            &username,
-            password.as_deref(),
-            key_path.as_deref(),
-            10
-        );
-        let (shell_session, tcp) = match connect_outcome {
-            Ok(pair) => pair,
-            Err(e) => {
-                if !entry_for_connect.closing.load(Ordering::SeqCst) {
-                    if let Ok(mut ssh_session) = entry_for_connect.inner.lock() {
-                        ssh_session.connecting_shells.remove(&shell_id_for_thread);
+        // Acquire the lock briefly to check if the shell is already registered or connecting.
+        // If it is, return early to prevent double execution.
+        // Otherwise, mark it as connecting and fetch connection parameters.
+        let entry = get_session_entry(&sessions_arc, &id)?;
+        let (host, port, username, password, key_path, pending_shell) = {
+            let mut ssh_session = entry.inner.lock().map_err(|e| e.to_string())?;
+            if entry.closing.load(Ordering::SeqCst) {
+                return Err("Session closed".to_string());
+            }
+            
+            if ssh_session.shells.contains_key(&shell_id) || ssh_session.connecting_shells.contains(&shell_id) {
+                return Ok(());
+            }
+            
+            ssh_session.connecting_shells.insert(shell_id.clone());
+            let pending = if shell_id == id {
+                ssh_session.pending_primary_shell.take()
+            } else {
+                None
+            };
+            
+            (
+                ssh_session.host.clone(),
+                ssh_session.port,
+                ssh_session.username.clone(),
+                ssh_session.password.clone(),
+                ssh_session.key_path.clone(),
+                pending,
+            )
+        };
+
+        let shell_id_for_thread = shell_id;
+        let id_for_thread = id;
+        let entry_for_connect = entry;
+        let reused_primary = pending_shell.is_some();
+
+        // Reuse the already-authenticated primary session for the initial shell when available,
+        // avoiding a duplicate TCP+auth roundtrip on login.
+        let (shell_session, tcp) = if let Some(pair) = pending_shell {
+            pair
+        } else {
+            let progress = (app_handle.clone(), shell_id_for_thread.clone());
+            let connect_outcome = connect_session_with_progress(
+                &host,
+                port,
+                &username,
+                password.as_deref(),
+                key_path.as_deref(),
+                10,
+                Some(&progress),
+            );
+            match connect_outcome {
+                Ok(pair) => pair,
+                Err(e) => {
+                    if !entry_for_connect.closing.load(Ordering::SeqCst) {
+                        if let Ok(mut ssh_session) = entry_for_connect.inner.lock() {
+                            ssh_session.connecting_shells.remove(&shell_id_for_thread);
+                        }
                     }
+                    return Err(e);
                 }
-                return Err(e);
             }
         };
         
@@ -529,7 +608,9 @@ pub async fn ssh_open_shell(
             let _ = tcp.shutdown(Shutdown::Both);
             return Err("Session closed".to_string());
         }
-        entry_for_connect.register_socket(&tcp);
+        if !reused_primary {
+            entry_for_connect.register_socket(&tcp);
+        }
         {
             let ssh_session = entry_for_connect.inner.lock().map_err(|e| e.to_string())?;
             if entry_for_connect.closing.load(Ordering::SeqCst) {
@@ -545,7 +626,7 @@ pub async fn ssh_open_shell(
         }
         
         shell_session.set_blocking(true);
-        shell_session.set_timeout(1000); // 1000ms timeout for initial shell handshake and prompt loading
+        shell_session.set_timeout(10000); // Allow up to 10s for channel/PTY/shell setup
 
         let mut channel = shell_session.channel_session()
             .map_err(|e| format!("Failed to create SSH channel: {}", e))?;
@@ -554,11 +635,12 @@ pub async fn ssh_open_shell(
         channel.shell()
             .map_err(|e| format!("Failed to open shell: {}", e))?;
 
-        // Print connection success message
-        let _ = app_handle.emit(
-            &format!("ssh-output-{}", shell_id_for_thread),
-            "\r\n\x1b[32m[系统提示: SSH 终端连接已建立!]\x1b[0m\r\n\r\n".to_string()
-        );
+        if !reused_primary {
+            let _ = app_handle.emit(
+                &format!("ssh-output-{}", shell_id_for_thread),
+                "\r\n".to_string(),
+            );
+        }
 
         let (write_tx, write_rx) = std::sync::mpsc::channel::<Vec<u8>>();
         let (resize_tx, resize_rx) = std::sync::mpsc::channel::<(u16, u16)>();
@@ -609,8 +691,9 @@ pub async fn ssh_open_shell(
                 }
             };
 
-            // Perform an initial blocking read with the 1000ms timeout
-            // to ensure we capture the login banner and initial prompt
+            // Perform an initial blocking read with a 1000ms timeout
+            // to capture the login banner and initial prompt
+            _session.set_timeout(1000);
             let mut reader = channel.stream(0);
             if let Ok(n) = reader.read(&mut buffer) {
                 if n > 0 {
@@ -826,11 +909,11 @@ pub async fn ssh_open_shell(
 #[tauri::command]
 pub fn ssh_write_shell(
     state: tauri::State<'_, SshState>,
-    id: String,
+    _id: String,
     shell_id: String,
     data: String,
 ) -> Result<(), String> {
-    // Fast path: lock only fast_shells (never blocked by SFTP or ssh_exec)
+    // Strictly use fast_shells so typing on the main thread can never block on session/SFTP locks
     if let Ok(fast) = state.fast_shells.lock() {
         if let Some(shell) = fast.get(&shell_id) {
             return shell
@@ -839,44 +922,24 @@ pub fn ssh_write_shell(
                 .map_err(|e| format!("Failed to send write request: {}", e));
         }
     }
-
-    let entry = get_session_entry(&state.sessions, &id)?;
-    let write_tx = {
-        let ssh_session = entry.inner.lock().map_err(|e| e.to_string())?;
-        let shell = ssh_session.shells.get(&shell_id).ok_or_else(|| "Shell not found".to_string())?;
-        shell.write_tx.clone()
-    };
-
-    write_tx.send(data.into_bytes()).map_err(|e| format!("Failed to send write request: {}", e))?;
     Ok(())
 }
 
 #[tauri::command]
 pub fn ssh_resize_shell(
     state: tauri::State<'_, SshState>,
-    id: String,
+    _id: String,
     shell_id: String,
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
-    // Fast path: lock only fast_shells (never blocked by SFTP or ssh_exec)
+    // Strictly use fast_shells so ResizeObserver on the main thread can never freeze the UI
+    // while a shell or SFTP connection is still opening; TerminalPane re-syncs size once open.
     if let Ok(fast) = state.fast_shells.lock() {
         if let Some(shell) = fast.get(&shell_id) {
-            return shell
-                .resize_tx
-                .send((cols, rows))
-                .map_err(|e| format!("Failed to send resize request: {}", e));
+            let _ = shell.resize_tx.send((cols, rows));
         }
     }
-
-    let entry = get_session_entry(&state.sessions, &id)?;
-    let resize_tx = {
-        let ssh_session = entry.inner.lock().map_err(|e| e.to_string())?;
-        let shell = ssh_session.shells.get(&shell_id).ok_or_else(|| "Shell not found".to_string())?;
-        shell.resize_tx.clone()
-    };
-
-    resize_tx.send((cols, rows)).map_err(|e| format!("Failed to send resize request: {}", e))?;
     Ok(())
 }
 
@@ -967,22 +1030,22 @@ pub async fn ssh_exec(
     .map_err(|_| "Task panicked".to_string())?
 }
 
-impl SshSession {
+impl SftpSessionState {
     pub fn reset_and_reconnect(&mut self, entry: &SessionEntry) -> Result<(), String> {
         if entry.closing.load(Ordering::SeqCst) {
             return Err("Session closed".to_string());
         }
         self.sftp = None;
-        self.tunnel_session = None;
-        self._tunnel_tcp = None;
-        self.shell_session = None;
-        self._shell_tcp = None;
+        self.session = None;
+        self._tcp = None;
+
+        let (host, port, username, password, key_path) = entry.connection_params()?;
         let (new_session, new_tcp) = connect_session(
-            &self.host,
-            self.port,
-            &self.username,
-            self.password.as_deref(),
-            self.key_path.as_deref(),
+            &host,
+            port,
+            &username,
+            password.as_deref(),
+            key_path.as_deref(),
             10,
         )?;
         if entry.closing.load(Ordering::SeqCst) {
@@ -991,8 +1054,8 @@ impl SshSession {
             return Err("Session closed".to_string());
         }
         entry.register_socket(&new_tcp);
-        self.session = new_session;
-        self._tcp = new_tcp;
+        self.session = Some(new_session);
+        self._tcp = Some(new_tcp);
         Ok(())
     }
 
@@ -1000,14 +1063,22 @@ impl SshSession {
         if entry.closing.load(Ordering::SeqCst) {
             return Err("Session closed".to_string());
         }
+        if self.session.is_none() {
+            self.reset_and_reconnect(entry)?;
+        }
         if self.sftp.is_none() {
-            match self.session.sftp() {
+            let sftp_res = self.session.as_ref().unwrap().sftp();
+            match sftp_res {
                 Ok(sftp) => {
                     self.sftp = Some(sftp);
                 }
                 Err(_) => {
                     self.reset_and_reconnect(entry)?;
-                    let sftp = self.session.sftp()
+                    let sftp = self
+                        .session
+                        .as_ref()
+                        .unwrap()
+                        .sftp()
                         .map_err(|e| format!("Failed to start SFTP session after reconnect: {}", e))?;
                     self.sftp = Some(sftp);
                 }
@@ -1021,22 +1092,22 @@ impl SshSession {
     }
 }
 
-fn with_sftp<T, F>(entry: &SessionEntry, ssh_session: &mut SshSession, f: F) -> Result<T, String>
+fn with_sftp<T, F>(entry: &SessionEntry, sftp_state: &mut SftpSessionState, f: F) -> Result<T, String>
 where
     F: Fn(&ssh2::Sftp) -> Result<T, String>,
 {
-    let sftp = ssh_session.ensure_sftp(entry)?;
+    let sftp = sftp_state.ensure_sftp(entry)?;
     match f(sftp) {
         Ok(res) => Ok(res),
         Err(err_msg) => {
-            ssh_session.invalidate_sftp();
+            sftp_state.invalidate_sftp();
             if entry.closing.load(Ordering::SeqCst) {
                 return Err("Session closed".to_string());
             }
-            if let Err(reconnect_err) = ssh_session.reset_and_reconnect(entry) {
+            if let Err(reconnect_err) = sftp_state.reset_and_reconnect(entry) {
                 return Err(format!("{}. Reconnect failed: {}", err_msg, reconnect_err));
             }
-            let sftp = ssh_session.ensure_sftp(entry)?;
+            let sftp = sftp_state.ensure_sftp(entry)?;
             f(sftp)
         }
     }
@@ -1051,11 +1122,11 @@ where
     F: Fn(&ssh2::Sftp) -> Result<T, String>,
 {
     let entry = get_session_entry(sessions_arc, id)?;
-    let mut ssh_session = entry.inner.lock().map_err(|e| e.to_string())?;
+    let mut sftp_state = entry.sftp_state.lock().map_err(|e| e.to_string())?;
     if entry.closing.load(Ordering::SeqCst) {
         return Err("Session closed".to_string());
     }
-    with_sftp(&entry, &mut ssh_session, f)
+    with_sftp(&entry, &mut sftp_state, f)
 }
 
 #[tauri::command]
@@ -1453,17 +1524,22 @@ fn get_or_create_transfer_session(
     sessions_arc: &Arc<Mutex<HashMap<String, Arc<SessionEntry>>>>,
 ) -> Result<ssh2::Session, String> {
     let entry = get_session_entry(sessions_arc, id)?;
-    let mut ssh_session = entry.inner.lock().map_err(|e| e.to_string())?;
+    let mut sftp_state = entry.sftp_state.lock().map_err(|e| e.to_string())?;
     if entry.closing.load(Ordering::SeqCst) {
         return Err("Session closed".to_string());
     }
 
-    if ssh_session.ensure_sftp(&entry).is_ok() {
-        return Ok(ssh_session.session.clone());
+    if sftp_state.ensure_sftp(&entry).is_ok() {
+        if let Some(ref s) = sftp_state.session {
+            return Ok(s.clone());
+        }
     }
 
-    ssh_session.reset_and_reconnect(&entry)?;
-    Ok(ssh_session.session.clone())
+    sftp_state.reset_and_reconnect(&entry)?;
+    sftp_state
+        .session
+        .clone()
+        .ok_or_else(|| "No active SFTP session".to_string())
 }
 
 // SFTP Upload with chunking, recursive dir and cancellation support

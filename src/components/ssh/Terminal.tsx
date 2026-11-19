@@ -233,6 +233,8 @@ const Divider: React.FC<DividerProps> = ({ direction, onDrag, onDragEnd }) => {
 interface TerminalProps {
   sshId: string;
   isConnected?: boolean;
+  /** Whether the underlying SSH connection is ready to open shell channels */
+  canOpenShell?: boolean;
   /** Terminal mode: 'ssh' for remote shell, 'local' for local PTY */
   mode?: 'ssh' | 'local' | 'serial';
   /** Custom working directory for local PTY */
@@ -244,7 +246,7 @@ interface TerminalProps {
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-const Terminal: React.FC<TerminalProps> = ({ sshId, isConnected, mode = 'ssh', cwd, shell, localEcho: initialLocalEcho = false, lineEnding: initialLineEnding = 'cr' }) => {
+const Terminal: React.FC<TerminalProps> = ({ sshId, isConnected, canOpenShell = true, mode = 'ssh', cwd, shell, localEcho: initialLocalEcho = false, lineEnding: initialLineEnding = 'cr' }) => {
   const [tree, setTree] = useState<TreeNode>(() => createDefaultLeaf(sshId));
   const [focusedPaneId, setFocusedPaneId] = useState<string>('default');
   const [showToolbar, setShowToolbar] = useState(false);
@@ -458,6 +460,7 @@ const Terminal: React.FC<TerminalProps> = ({ sshId, isConnected, mode = 'ssh', c
               mode={mode}
               autoStripLineNumbers={autoStripLineNumbers}
               asciiPunctuation={asciiPunctuation}
+              canOpenShell={canOpenShell}
               isDragging={isDragging}
               cwd={cwd}
               shell={shell}
@@ -543,7 +546,7 @@ const Terminal: React.FC<TerminalProps> = ({ sshId, isConnected, mode = 'ssh', c
         </div>
       );
     },
-    [sshId, focusedPaneId, closePane, totalPanes, refitAllPanes, mode, autoStripLineNumbers, asciiPunctuation, isDragging, tree, isSyncInput, cwd, shell, serialLocalEcho, serialLineEnding]
+    [sshId, focusedPaneId, closePane, totalPanes, refitAllPanes, mode, autoStripLineNumbers, asciiPunctuation, canOpenShell, isDragging, tree, isSyncInput, cwd, shell, serialLocalEcho, serialLineEnding]
   );
 
   // ── Render ──────────────────────────────────────────────────────────────────
@@ -796,6 +799,7 @@ const Terminal: React.FC<TerminalProps> = ({ sshId, isConnected, mode = 'ssh', c
                   mode={mode}
                   autoStripLineNumbers={autoStripLineNumbers}
                   asciiPunctuation={asciiPunctuation}
+                  canOpenShell={canOpenShell}
                   isDragging={false}
                   isMaximized={true}
                   cwd={cwd}

@@ -216,6 +216,7 @@ const SSHPage: React.FC = () => {
 
   const [closingKey, setClosingKey] = useState<string | null>(null); // for disconnect confirm
   const [activeTunnels, setActiveTunnels] = useState<Set<string>>(new Set());
+  const [openedSftpKeys, setOpenedSftpKeys] = useState<Set<string>>(new Set());
 
   const reconnectAttemptsRef = React.useRef<Record<string, number>>({});
   const reconnectTimersRef = React.useRef<Record<string, ReturnType<typeof setTimeout>>>({});
@@ -434,7 +435,10 @@ const SSHPage: React.FC = () => {
       keyPath: ssh.keyPath || undefined,
     };
 
-    window.electronAPI.sshConnect(key, options)
+    // Yield briefly so TerminalPane mounts and registers ssh-output listener before
+    // sshConnect streams "Connecting to ..." / "Connection established." lines.
+    new Promise<void>(resolve => requestAnimationFrame(() => setTimeout(resolve, 20)))
+      .then(() => window.electronAPI.sshConnect(key, options))
       .then(async (res) => {
         if (res.success) {
           hasConnectedRef.current.add(key);
@@ -503,6 +507,12 @@ const SSHPage: React.FC = () => {
       });
       return next;
     });
+    setOpenedSftpKeys(prev => {
+      if (!prev.has(key)) return prev;
+      const next = new Set(prev);
+      next.delete(key);
+      return next;
+    });
 
     // Optimistically remove session from UI immediately so TerminalPane and StatusFooter
     // unmount at once (stopping metrics polling) without waiting on dead-network I/O.
@@ -529,6 +539,14 @@ const SSHPage: React.FC = () => {
   };
 
   const setSessionTab = (key: string, tab: 'terminal' | 'sftp') => {
+    if (tab === 'sftp') {
+      setOpenedSftpKeys(prev => {
+        if (prev.has(key)) return prev;
+        const next = new Set(prev);
+        next.add(key);
+        return next;
+      });
+    }
     const s = sessions.find(ss => ss.key === key);
     if (s) {
       dispatch({ type: 'UPDATE_SSH_SESSION', payload: { ...s, activeTab: tab } });
@@ -1527,8 +1545,8 @@ const SSHPage: React.FC = () => {
 
             {/* Workspace */}
             <div className="flex-1 overflow-hidden relative">
-              {/* Connecting / error overlay */}
-              {(s.connStatus === 'connecting' || s.connStatus === 'error') && (
+              {/* Connecting (non-SSH) / error overlay */}
+              {((s.connStatus === 'connecting' && getProtocol(s.ssh) !== 'ssh') || s.connStatus === 'error') && (
                 <div className="absolute inset-0 z-20 bg-background-primary flex flex-col items-center justify-center">
                   {s.connStatus === 'connecting' && (
                     <>
@@ -1587,12 +1605,22 @@ const SSHPage: React.FC = () => {
                 </div>
               )}
 
-              {/* Terminal — stays mounted once connected so scrollback & split panes are preserved across reconnects */}
-              <div className={`absolute inset-0 transition-opacity duration-200 ${s.activeTab === 'terminal' && (s.connStatus === 'connected' || s.connStatus === 'reconnecting') ? 'opacity-100 z-10' : 'opacity-0 z-0 pointer-events-none'
+              {/* Terminal — mounted immediately for SSH so Xshell-style live progress shows while connecting */}
+              <div className={`absolute inset-0 transition-opacity duration-200 ${s.activeTab === 'terminal' && (s.connStatus === 'connected' || s.connStatus === 'reconnecting' || (s.connStatus === 'connecting' && getProtocol(s.ssh) === 'ssh')) ? 'opacity-100 z-10' : 'opacity-0 z-0 pointer-events-none'
                 }`}>
                 <Terminal
                   sshId={s.key}
-                  isConnected={s.connStatus === 'connected' || s.connStatus === 'reconnecting' || hasConnectedRef.current.has(s.key)}
+                  isConnected={
+                    getProtocol(s.ssh) === 'ssh'
+                      ? true
+                      : (s.connStatus === 'connected' || s.connStatus === 'reconnecting' || hasConnectedRef.current.has(s.key))
+                  }
+                  canOpenShell={
+                    s.localMode ||
+                    getProtocol(s.ssh) !== 'ssh' ||
+                    s.connStatus === 'connected' ||
+                    s.connStatus === 'reconnecting'
+                  }
                   mode={s.localMode || getProtocol(s.ssh) === 'local' ? 'local' : getProtocol(s.ssh) === 'serial' ? 'serial' : 'ssh'}
                   cwd={s.ssh.cwd}
                   shell={s.ssh.shell}
@@ -1664,8 +1692,8 @@ const SSHPage: React.FC = () => {
                 })()}
               </div>
 
-              {/* SFTP — persistently mounted once connected (SSH only), CSS-hidden when not active to preserve state */}
-              {!s.localMode && getProtocol(s.ssh) === 'ssh' && (s.connStatus === 'connected' || s.connStatus === 'reconnecting' || hasConnectedRef.current.has(s.key)) && (
+              {/* SFTP — lazy-mounted on first SFTP tab open so terminal login never triggers extra SFTP dial, then kept mounted */}
+              {!s.localMode && getProtocol(s.ssh) === 'ssh' && (s.activeTab === 'sftp' || openedSftpKeys.has(s.key)) && (s.connStatus === 'connected' || s.connStatus === 'reconnecting' || hasConnectedRef.current.has(s.key)) && (
                 <div className={`absolute inset-0 z-10 bg-background transition-opacity duration-200 ${
                   s.activeTab === 'sftp' && (s.connStatus === 'connected' || s.connStatus === 'reconnecting') ? 'opacity-100' : 'opacity-0 pointer-events-none'
                 }`}>
